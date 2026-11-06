@@ -8,6 +8,7 @@
       "binaryDir": "${sourceDir}/build/mingw-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "MEDIASTUDIO_ENABLE_MYSQL": "OFF",
         "MEDIASTUDIO_DEPLOY_RUNTIME": "ON"
       }
@@ -19,6 +20,7 @@
       "binaryDir": "${sourceDir}/build/mingw-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "MEDIASTUDIO_ENABLE_MYSQL": "OFF",
         "MEDIASTUDIO_DEPLOY_RUNTIME": "ON"
       }

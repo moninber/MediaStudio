@@ -1,3 +1,8 @@
+[CmdletBinding()]
+param(
+    [switch]$Fresh
+)
+
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
@@ -10,8 +15,12 @@ else {
 
 Push-Location $ProjectRoot
 try {
-    & cmake --preset $Preset
+    # 复用配置脚本的缓存重建和失败检查，配置失败时不继续使用旧产物构建。
+    & (Join-Path $PSScriptRoot "configure-mingw.ps1") -Fresh:$Fresh
     & cmake --build --preset $Preset
+    if ($LASTEXITCODE -ne 0) {
+        throw "CMake build failed for preset '$Preset' (exit code: $LASTEXITCODE)."
+    }
 }
 finally {
     Pop-Location
