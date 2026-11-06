@@ -121,12 +121,14 @@ MEDIASTUDIO_ENABLE_MYSQL=OFF
 - 生成 Release 构建
 - 在配置了依赖路径后调用 `windeployqt`
 - 复制 FFmpeg/GLEW 运行时 DLL 到输出目录
+- 检查 CMake 退出码，配置或构建失败时立即停止
 
-输出文件：
+输出文件随所选预设确定：
 
-```text
-build\mingw-release\MediaStudio.exe
-```
+| 预设 | 输出文件 |
+| --- | --- |
+| 本机 `mingw-release-local` | `build\mingw-release-local\MediaStudio.exe` |
+| 公共 `mingw-release` | `build\mingw-release\MediaStudio.exe` |
 
 ### 4.2 分步编译
 
@@ -134,6 +136,14 @@ build\mingw-release\MediaStudio.exe
 .\tools\configure-mingw.ps1
 .\tools\build-mingw.ps1
 ```
+
+项目目录移动、改名或缓存仍指向旧路径时，显式重新生成当前预设的缓存：
+
+```powershell
+.\tools\build-mingw.ps1 -Fresh
+```
+
+只配置而不构建时，使用 `.\tools\configure-mingw.ps1 -Fresh`。日常增量构建无需 `-Fresh`；重新生成缓存时以预设为准，本机额外配置应先写入 `CMakeUserPresets.json`。编译命令数据库 `compile_commands.json` 会随配置更新，其他预设的构建目录不受本次操作影响。
 
 ### 4.3 手动 CMake 命令
 
@@ -173,13 +183,21 @@ cmake --build --preset mingw-debug
 
 ### 5.2 直接运行
 
-双击或命令行运行：
+双击或命令行运行所选预设的产物。本机预设对应：
+
+```text
+build\mingw-release-local\MediaStudio.exe
+```
+
+公共预设对应：
 
 ```text
 build\mingw-release\MediaStudio.exe
 ```
 
 然后通过菜单 **文件 → 打开** 加载媒体。
+
+`run-mingw.ps1` 只在产物缺失时调用构建；已有 EXE 时直接运行。修改源码后应先执行构建脚本。
 
 ### 5.3 拖拽运行
 
@@ -416,4 +434,4 @@ qopenglfunctions.h is not compatible with GLEW
 1. `cmake`、`ninja` 和编译器是否可用
 2. `MEDIASTUDIO_QT_ROOT`、`MEDIASTUDIO_FFMPEG_ROOT`、`MEDIASTUDIO_GLEW_ROOT` 是否正确
 3. Qt、FFmpeg、GLEW 是否与当前编译器和平台架构兼容
-4. 输出目录 `build\mingw-release` 中是否已经部署运行时 DLL
+4. 当前预设的输出目录（`build\mingw-release-local` 或 `build\mingw-release`）中是否已经部署运行时 DLL
