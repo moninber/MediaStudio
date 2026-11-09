@@ -22,18 +22,9 @@
 #include "MediaDecoder.h"
 #include "AudioOutput.h"
 #include "PacketQueue.h"
+#include "PlaybackSnapshot.h"
 
 class VideoWidget;  // 前向声明，避免头文件依赖
-
-struct PlaybackStats {
-    double render_fps = 0.0;
-    double decode_fps = 0.0;
-    double av_diff_ms = 0.0;
-    int dropped_frames_total = 0;
-    int audio_queue_packets = 0;
-    int video_queue_packets = 0;
-    double audio_buffer_seconds = 0.0;
-};
 
 class PlayerController {
 public:
@@ -80,13 +71,17 @@ public:
     float getSpeed() const { return speed_.load(); }
     PlaybackStats getPlaybackStats() const;
     VideoEffect getEffect() const { return current_effect_; }
-    const MediaInfo& getMediaInfo() const { return media_info_; }
-    void setMediaInfo(const MediaInfo& info) { media_info_ = info; }
+
+    /** @brief 按值读取界面所需状态和媒体信息，不接触 FFmpeg I/O 或声卡接口。 */
+    PlaybackSnapshot getPlaybackSnapshot() const;
+
+    /** @brief 仅回写指定本地加载请求的数据库字段，丢弃过期或不属于该源的结果。 */
+    bool updateLocalLibraryInfo(std::uint64_t expected_request_id, const MediaInfo& info);
 
     /** @brief 切换播放/暂停 */
     void togglePlayPause();
 
-    /** @brief 异步停止（只设置标志，不等待线程结束，供UI线程调用） */
+    /** @brief 发布停止与 I/O 取消并唤醒队列，不等待播放线程退出。 */
     void stopAsync();
 
     /** @brief 切换可视化模式 */
@@ -94,8 +89,11 @@ public:
     bool isVisualizerShown() const { return show_visualizer_; }
 
 private:
-    /** @brief 单线程播放循环（顺序解复用/解码/输出） */
-    void playbackThread();
+    /** @brief 当前解复用循环，协调音视频工作线程和本次播放收尾。 */
+    void playbackThread(std::uint64_t request_id);
+
+    /** @brief 在状态锁内取消当前 I/O、更新停止标志并唤醒队列。 */
+    void requestStopLocked();
 
     // 核心组件
     std::unique_ptr<MediaDecoder> decoder_;
@@ -119,14 +117,21 @@ private:
     std::atomic<double> decode_fps_;
     std::atomic<double> av_diff_ms_;
     std::atomic<int> dropped_frames_total_;
+    std::atomic<double> audio_buffer_seconds_{0.0};
 
     // 线程控制
     std::thread playback_thread_;
     std::recursive_mutex lifecycle_mutex_;
     std::mutex seek_mutex_;  // 播放线程内部执行seek/解码时互斥
 
-    // 当前状态
-    MediaInfo media_info_;
+    // 加载编号、取消令牌与元信息在同一短临界区发布，不持锁打开、解码或等待工作线程。
+    mutable std::mutex snapshot_mutex_;
+    PlaybackSnapshot snapshot_;
+    std::shared_ptr<MediaIoControl> active_io_;
+    std::uint64_t stop_epoch_ = 0;
+    PlaybackState resume_state_ = PlaybackState::Playing;
+
+    // 当前显示状态
     VideoEffect current_effect_;
     bool show_visualizer_;
 };

@@ -167,6 +167,16 @@ cmake --preset mingw-debug `
 cmake --build --preset mingw-debug
 ```
 
+### 4.5 运行播放基础测试
+
+构建后，对所用预设的构建目录执行 CTest。例如本机 Release：
+
+```powershell
+ctest --test-dir build/mingw-release-local --output-on-failure
+```
+
+测试使用临时本地音频和回环 RTSP 服务，检查输入策略、快照、读结果及阻塞读取的取消和超时。无需启动虚拟机或准备视频素材；只构建播放器时可用 `-DBUILD_TESTING=OFF` 关闭测试目标。
+
 ## 5. 运行程序
 
 ### 5.1 使用脚本运行

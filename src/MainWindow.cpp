@@ -560,13 +560,16 @@ void MainWindow::setupShortcuts()
     sc_fav->setContext(Qt::ApplicationShortcut);
     connect(sc_fav, &QShortcut::activated, this, [this]() {
         if (db_connected_) {
-            MediaInfo info = player_->getMediaInfo();
-            if (info.db_id > 0) {
+            auto snapshot = player_->getPlaybackSnapshot();
+            auto& info = snapshot.media_info;
+            if (snapshot.source_kind == PlaybackSourceKind::LocalFile && info.db_id > 0) {
                 bool new_state = !info.is_favorite;
                 if (database_->setFavorite(info.db_id, new_state)) {
                     info.is_favorite = new_state;
-                    player_->setMediaInfo(info);
-                    statusBar()->showMessage(new_state ? "已添加收藏" : "已取消收藏");
+                    // 数据库操作完成时可能已经切源，只回写这次读取的本地源。
+                    if (player_->updateLocalLibraryInfo(snapshot.request_id, info)) {
+                        statusBar()->showMessage(new_state ? "已添加收藏" : "已取消收藏");
+                    }
                 }
             }
         }
@@ -638,6 +641,8 @@ void MainWindow::togglePlayPause()//暂停
 
 void MainWindow::stopPlayback()//停止
 {
+    // 使尚在等待的加载请求及其界面回调失效，再取消已经发布的 I/O。
+    ++load_request_id_;
     player_->stopAsync();
     btn_play_->setText("▶");
     video_widget_->clearFrame();
@@ -828,16 +833,18 @@ void MainWindow::playlistItemDoubleClicked(QListWidgetItem* item)
     requestLoadAndPlay(path, item->text());
 }
 
+// 每轮刷新读取一个值快照，元信息不引用加载线程正在改写的对象。
 void MainWindow::updatePlaybackInfo()
 {
-    if (!player_->isPlaying() && !player_->isPaused()) {
+    const auto snapshot = player_->getPlaybackSnapshot();
+    if (!snapshot.is_playing && !snapshot.is_paused) {
         label_debug_stats_->setText("FPS -- | A/V -- ms | Drop -- | A -- / V -- | Buf -- ms");
         return;
     }
 
-    double current = player_->getCurrentTime();
-    double duration = player_->getDuration();
-    PlaybackStats stats = player_->getPlaybackStats();
+    const double current = snapshot.current_seconds;
+    const double duration = snapshot.duration_seconds;
+    const auto& stats = snapshot.stats;
     label_debug_stats_->setText(QString("FPS %1/%2 | A/V %3 ms | Drop %4 | A %5 / V %6 | Buf %7 ms")
         .arg(stats.render_fps, 0, 'f', 1)
         .arg(stats.decode_fps, 0, 'f', 1)
@@ -855,7 +862,7 @@ void MainWindow::updatePlaybackInfo()
     };
 
     label_time_->setText(formatTime(current));
-    slider_progress_->setEnabled(duration > 0);
+    slider_progress_->setEnabled(snapshot.capabilities.can_seek && duration > 0);
 
     if (duration > 0) {
         // 避免在用户拖动进度条时更新
@@ -871,7 +878,7 @@ void MainWindow::updatePlaybackInfo()
     }
 
     // 更新媒体信息面板
-    const MediaInfo& info = player_->getMediaInfo();
+    const auto& info = snapshot.media_info;
     if (!info.file_name.empty()) {
         QString info_text;
         info_text += QString("<h3>%1</h3>").arg(QString::fromStdString(info.file_name));
@@ -957,29 +964,27 @@ void MainWindow::requestLoadAndPlay(const std::string& path, const QString& disp
             if (loaded && request_id == load_request_id_.load()) {
                 // 数据库同步逻辑
                 if (db_connected_) {
-                    MediaInfo info = player_->getMediaInfo();
-                    MediaInfo db_info;
-                    if (database_->getMediaByPath(path, db_info)) {
-                        // 已存在，同步数据库中的 ID 和收藏状态
-                        info.db_id = db_info.db_id;
-                        info.is_favorite = db_info.is_favorite;
-                        info.title = db_info.title;
-                        info.tags = db_info.tags;
-                    }
-                    else {
-                        // 不存在，添加到数据库
-                        int id = database_->addMedia(info);
-                        if (id > 0) {
-                            info.db_id = id;
+                    auto snapshot = player_->getPlaybackSnapshot();
+                    // 只有本地源同步媒体库，网络源不保存原始地址或历史。
+                    if (snapshot.source_kind == PlaybackSourceKind::LocalFile) {
+                        auto& info = snapshot.media_info;
+                        MediaInfo db_info;
+                        if (database_->getMediaByPath(path, db_info)) {
+                            info.db_id = db_info.db_id;
+                            info.is_favorite = db_info.is_favorite;
+                            info.title = db_info.title;
+                            info.tags = db_info.tags;
+                        } else {
+                            int id = database_->addMedia(info);
+                            if (id > 0) {
+                                info.db_id = id;
+                            }
                         }
-                    }
 
-                    // 更新 PlayerController 中的信息（包含 db_id）
-                    player_->setMediaInfo(info);
-
-                    // 记录播放历史
-                    if (info.db_id > 0) {
-                        database_->recordPlayHistory(info.db_id);
+                        // 按源请求编号合并库字段，不覆盖另一源的媒体元信息。
+                        if (player_->updateLocalLibraryInfo(snapshot.request_id, info) && info.db_id > 0) {
+                            database_->recordPlayHistory(info.db_id);
+                        }
                     }
                 }
 

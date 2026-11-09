@@ -15,7 +15,9 @@
 #include <iostream>
 #include <chrono>
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <utility>
 
 PlayerController::PlayerController()
     : video_widget_(nullptr)
@@ -48,30 +50,74 @@ PlayerController::~PlayerController()
 // ============================================================
 // 加载文件
 // ============================================================
+// 本地入口沿用现有加载线程；为本次尝试分配独立的取消令牌并发布元信息副本。
 bool PlayerController::loadFile(const std::string& filename)
 {
+    std::uint64_t observed_stop_epoch;
+    {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        observed_stop_epoch = stop_epoch_;
+    }
+    const auto source = PlaybackSource::localFile(filename);
+    const auto io = std::make_shared<MediaIoControl>();
     std::lock_guard<std::recursive_mutex> lifecycle_lock(lifecycle_mutex_);
 
-    // 必须等待旧线程完全退出再操作decoder_，避免数据竞争
-    // loadFile总是在后台线程中调用，所以这里的join不会阻塞主线程
-    stop();
+    {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        // 等待上一加载/收尾期间若已收到停止，不再开启这条旧请求。
+        if (observed_stop_epoch != stop_epoch_) return false;
+        requestStopLocked();
+        active_io_ = io;
+        ++snapshot_.request_id;
+        snapshot_.connection_attempt_id = 1;  // 当前没有自动重连，每个请求只进行首次连接。
+        snapshot_.source_kind = source.kind();
+        snapshot_.display_name = source.displayName();
+        snapshot_.capabilities = initialPlaybackCapabilities(source.kind(), false);
+        snapshot_.state = PlaybackState::Opening;
+        snapshot_.media_info = {};
+        snapshot_.last_error.reset();
+        snapshot_.network_stats.reset();
+        duration_ = 0.0;
+    }
 
-    if (!decoder_->open(filename)) {
-        std::cerr << "[Player] 打开文件失败: " << filename << std::endl;
+    // 停止与新令牌的发布已串行完成；等待和 FFmpeg 调用不占用状态锁。
+    audio_output_->reset();
+    if (playback_thread_.joinable()) playback_thread_.join();
+
+    const MediaOpenResult open_result = decoder_->open(source, io);
+    if (open_result.status != MediaOpenStatus::Opened) {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        if (io->isCancelled() || open_result.status == MediaOpenStatus::Cancelled) {
+            snapshot_.state = PlaybackState::Idle;
+        }
+        else {
+            snapshot_.state = PlaybackState::Failed;
+            snapshot_.last_error = open_result;
+        }
         return false;
     }
 
-    if (!decoder_->setPlaybackSpeed(speed_.load())) {
+    if (!io->isCancelled() && !decoder_->setPlaybackSpeed(speed_.load())) {
         std::cerr << "[Player] 初始化播放速度失败" << std::endl;
     }
 
-    // 更新状态
-    media_info_ = decoder_->getMediaInfo();
-    duration_ = media_info_.duration;
-    current_time_ = 0.0;
+    MediaInfo info = decoder_->getMediaInfo();
+    {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        if (!io->isCancelled()) {
+            duration_ = info.duration;
+            current_time_ = 0.0;
+            snapshot_.capabilities = initialPlaybackCapabilities(source.kind(), info.duration > 0.0);
+            snapshot_.media_info = std::move(info);
+            snapshot_.state = PlaybackState::Idle;  // 仍由现有 UI 发起 play()。
+            return true;
+        }
+        snapshot_.state = PlaybackState::Idle;
+    }
 
-    std::cout << "[Player] 文件加载成功: " << filename << std::endl;
-    return true;
+    // 打开成功与停止恰好交错时，不发布已经取消的结果。
+    decoder_->close();
+    return false;
 }
 
 // ============================================================
@@ -80,13 +126,18 @@ bool PlayerController::loadFile(const std::string& filename)
 void PlayerController::play()
 {
     std::lock_guard<std::recursive_mutex> lifecycle_lock(lifecycle_mutex_);
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
 
+    // 停止后重播沿用 loadFile()，不要复用上次已取消的令牌。
+    if (!active_io_ || active_io_->isCancelled() || snapshot_.state == PlaybackState::Failed) return;
     if (playing_ && !paused_) return;
 
     if (paused_) {
         paused_ = false;
+        snapshot_.state = resume_state_;
         return;
     }
+    if (playback_thread_.joinable()) return;  // 旧线程由 loadFile() 或 stop() 回收。
 
     playing_ = true;
     paused_ = false;
@@ -95,36 +146,64 @@ void PlayerController::play()
     video_packets_.reset();
     ++session_id_;   // 新session，旧线程会因sid不匹配而退出
 
-    // 启动单播放线程
-    playback_thread_ = std::thread(&PlayerController::playbackThread, this);
+    // 保持 V1 启动语义；网络首个有效输出的判据在网络播放接入时实现。
+    snapshot_.state = PlaybackState::Playing;
+    playback_thread_ = std::thread(&PlayerController::playbackThread, this, snapshot_.request_id);
 }
 
 void PlayerController::pause()
 {
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (!playing_ || paused_) return;
+    resume_state_ = snapshot_.state;
+    snapshot_.state = PlaybackState::Paused;
     paused_ = true;
 }
 
-void PlayerController::stopAsync()
+// snapshot_mutex_ 保护取消与队列清理的发布，避免停止清掉刚启动的新会话队列。
+void PlayerController::requestStopLocked()
 {
-    // 仅设置标志，立即返回，主线程不阻塞
+    if (active_io_) active_io_->cancel();
     stop_requested_ = true;
     playing_ = false;
     paused_ = false;
     seek_requested_ = false;
     current_time_ = 0.0;
+    audio_buffer_seconds_ = 0.0;
     audio_packets_.abort();
     video_packets_.abort();
+}
+
+// 先发布取消，独立于正在打开文件或读包的生命周期锁与解码锁。
+void PlayerController::stopAsync()
+{
+    {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        const bool needs_unwind = playing_ || paused_ || snapshot_.state == PlaybackState::Opening ||
+            snapshot_.state == PlaybackState::Stopping;
+        ++stop_epoch_;
+        requestStopLocked();
+        snapshot_.state = needs_unwind ? PlaybackState::Stopping : PlaybackState::Idle;
+    }
+    // 保留 V1 的设备重置方式；声卡操作的线程归属在 1.3 收束。
     audio_output_->reset();
 }
 
 void PlayerController::stop()
 {
+    // 在等待生命周期锁之前取消打开/探测，否则持锁打开时可能无法及时退出。
+    stopAsync();
     std::lock_guard<std::recursive_mutex> lifecycle_lock(lifecycle_mutex_);
 
-    // 设置标志 + 等待线程结束
-    // 只在后台线程或析构中调用，不能在主线程上调用
-    stopAsync();
+    bool newer_attempt = false;
+    {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        newer_attempt = active_io_ && !active_io_->isCancelled();
+    }
+    if (newer_attempt) stopAsync();
     if (playback_thread_.joinable()) playback_thread_.join();
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (snapshot_.state == PlaybackState::Stopping) snapshot_.state = PlaybackState::Idle;
 }
 
 void PlayerController::seek(double seconds)
@@ -159,8 +238,42 @@ PlaybackStats PlayerController::getPlaybackStats() const
     stats.dropped_frames_total = dropped_frames_total_.load();
     stats.audio_queue_packets = audio_packets_.size();
     stats.video_queue_packets = video_packets_.size();
-    stats.audio_buffer_seconds = audio_output_->getQueuedSeconds();
+    stats.audio_buffer_seconds = audio_buffer_seconds_.load();
     return stats;
+}
+
+// 按值复制状态和元信息；快速变化的统计由原子缓存/队列计数采样。
+PlaybackSnapshot PlayerController::getPlaybackSnapshot() const
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    PlaybackSnapshot snapshot = snapshot_;
+    snapshot.is_playing = playing_.load();
+    snapshot.is_paused = paused_.load();
+    snapshot.current_seconds = current_time_.load();
+    snapshot.duration_seconds = duration_.load();
+    snapshot.stats = getPlaybackStats();
+    return snapshot;
+}
+
+// 数据库查询在调用者线程完成，只把仍属于当前本地请求的字段写回快照。
+bool PlayerController::updateLocalLibraryInfo(std::uint64_t expected_request_id, const MediaInfo& info)
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (expected_request_id == 0 || expected_request_id != snapshot_.request_id ||
+        snapshot_.source_kind != PlaybackSourceKind::LocalFile || snapshot_.media_info.file_path.empty() ||
+        snapshot_.media_info.file_path != info.file_path) {
+        return false;
+    }
+
+    auto& current = snapshot_.media_info;
+    current.db_id = info.db_id;
+    current.title = info.title;
+    current.tags = info.tags;
+    current.is_favorite = info.is_favorite;
+    current.added_time = info.added_time;
+    current.play_count = info.play_count;
+    current.last_play_time = info.last_play_time;
+    return true;
 }
 
 void PlayerController::togglePlayPause()
@@ -174,16 +287,15 @@ void PlayerController::togglePlayPause()
 }
 
 // ============================================================
-// 单线程播放循环
-// 
-// 单个线程顺序执行：demux -> decode -> audio/video output
+// 解复用与控制循环，协调独立的音频和视频工作线程。
 // ============================================================
-void PlayerController::playbackThread()
+void PlayerController::playbackThread(std::uint64_t request_id)
 {
     render_fps_.store(0.0);
     decode_fps_.store(0.0);
     av_diff_ms_.store(0.0);
     dropped_frames_total_.store(0);
+    audio_buffer_seconds_.store(0.0);
 
     bool audio_ready = false;
     if (decoder_->hasAudio()) {
@@ -208,8 +320,22 @@ void PlayerController::playbackThread()
     std::atomic<double> min_valid_pts(-1.0);
     std::atomic<int> stream_generation(0);
 
+    // 复用现有工作线程采样声卡缓冲。读包结束后的同步等待也能继续更新，GUI 只读原子缓存。
+    using StatsClock = std::chrono::steady_clock;
+    const auto stats_interval = std::chrono::duration_cast<StatsClock::duration>(std::chrono::milliseconds(100)).count();
+    std::atomic<StatsClock::rep> next_stats_sample(StatsClock::now().time_since_epoch().count());
+    auto sample_audio_buffer = [&]() {
+        if (!audio_ready) return;
+        const auto now = StatsClock::now().time_since_epoch().count();
+        auto next = next_stats_sample.load();
+        if (now >= next && next_stats_sample.compare_exchange_strong(next, now + stats_interval)) {
+            audio_buffer_seconds_.store(audio_output_->getQueuedSeconds());
+        }
+    };
+
     auto get_audio_clock = [&]() -> double {
         if (!audio_ready || !audio_clock_active.load()) return current_time_.load();
+        sample_audio_buffer();
         return audio_clock_base.load() + audio_output_->getPlayedSeconds() * active_speed.load();
     };
 
@@ -508,7 +634,10 @@ void PlayerController::playbackThread()
     }
 
     AVPacket* packet = av_packet_alloc();
+    std::optional<MediaReadResult> terminal_read;
+    if (!packet) terminal_read = MediaReadResult{MediaReadStatus::Error, AVERROR(ENOMEM)};
     while (packet && is_running()) {
+        sample_audio_buffer();
         if (seek_requested_) {
             double seek_seconds = pending_seek_seconds_.load();
             stream_generation.fetch_add(1);
@@ -572,19 +701,25 @@ void PlayerController::playbackThread()
             continue;
         }
 
-        bool got_packet = false;
+        MediaReadResult read_result;
         bool is_audio_packet = false;
         bool is_video_packet = false;
         {
             std::lock_guard<std::mutex> lock(seek_mutex_);
-            got_packet = decoder_->readPacket(packet);
-            if (got_packet) {
+            read_result = decoder_->readPacketResult(packet);
+            if (read_result.status == MediaReadStatus::Packet) {
                 is_audio_packet = decoder_->isAudioPacket(packet);
                 is_video_packet = decoder_->isVideoPacket(packet);
             }
         }
 
-        if (!got_packet) {
+        if (read_result.status == MediaReadStatus::Again) {
+            // 暂无数据不等于文件结束，短暂让出线程后重新检查停止标志。
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        if (read_result.status != MediaReadStatus::Packet) {
+            terminal_read = read_result;
             break;
         }
 
@@ -601,11 +736,23 @@ void PlayerController::playbackThread()
         av_packet_free(&packet);
     }
 
-    if (stop_requested_ || session_id_.load() != my_session) {
+    const bool read_cancelled = terminal_read && terminal_read->status == MediaReadStatus::Cancelled;
+    const bool read_failed = terminal_read && (terminal_read->status == MediaReadStatus::Timeout ||
+        terminal_read->status == MediaReadStatus::Error);
+    if (stop_requested_ || session_id_.load() != my_session || read_cancelled) {
         audio_packets_.abort();
         video_packets_.abort();
     }
     else {
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            if (snapshot_.request_id == request_id && !stop_requested_) {
+                if (paused_) resume_state_ = PlaybackState::Draining;
+                else snapshot_.state = PlaybackState::Draining;
+                if (read_failed) snapshot_.last_error = *terminal_read;
+            }
+        }
+        // 保留本地已有的队列排空逻辑；本项只区分结束原因和对外状态。
         audio_packets_.finish();
         video_packets_.finish();
     }
@@ -616,5 +763,19 @@ void PlayerController::playbackThread()
     if (audio_ready) {
         audio_output_->cleanup();
     }
-    playing_ = false;
+    audio_buffer_seconds_.store(0.0);
+    {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        // 切源可能已发布新的 Opening，旧播放结束不得覆盖新请求的状态或错误。
+        if (snapshot_.request_id != request_id) return;
+        playing_ = false;
+        paused_ = false;
+        if (stop_requested_ || read_cancelled) {
+            snapshot_.state = PlaybackState::Idle;
+            current_time_ = 0.0;
+        }
+        else {
+            snapshot_.state = read_failed ? PlaybackState::Failed : PlaybackState::Ended;
+        }
+    }
 }

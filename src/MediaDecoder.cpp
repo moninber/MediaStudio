@@ -5,11 +5,93 @@
 
 #include "MediaDecoder.h"
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <sstream>
+#include <utility>
+
+namespace {
+
+thread_local bool suppress_network_ffmpeg_log = false;
+
+// 网络封装 I/O 在调用线程执行，禁止其输出可能包含 URL 的自由文本。
+// 本地文件和转码仍走 FFmpeg 默认日志；独立协议库的异步日志不经过此线程作用域。
+void ffmpegLogCallback(void* context, int level, const char* format, va_list args)
+{
+    if (!suppress_network_ffmpeg_log) {
+        av_log_default_callback(context, level, format, args);
+    }
+}
+
+class ScopedNetworkFfmpegLog {
+public:
+    // 仅在本次 FFmpeg 调用所在的线程抑制原始网络诊断，可嵌套使用。
+    explicit ScopedNetworkFfmpegLog(bool network) noexcept
+        : previous_(suppress_network_ffmpeg_log)
+    {
+        suppress_network_ffmpeg_log = previous_ || network;
+    }
+
+    // 离开网络调用后恢复该线程原来的日志策略。
+    ~ScopedNetworkFfmpegLog() { suppress_network_ffmpeg_log = previous_; }
+
+private:
+    const bool previous_;
+};
+
+// 将打开各阶段的失败区分为主动取消、期限到达和普通 FFmpeg 错误。
+MediaOpenResult classifyOpenResult(int error, MediaIoStopReason reason, MediaOpenStage stage)
+{
+    if (reason == MediaIoStopReason::Cancelled) {
+        return {MediaOpenStatus::Cancelled, error, stage};
+    }
+    if (reason == MediaIoStopReason::Timeout || error == AVERROR(ETIMEDOUT)) {
+        return {MediaOpenStatus::Timeout, error, stage};
+    }
+    return {error < 0 ? MediaOpenStatus::Error : MediaOpenStatus::Opened, error, stage};
+}
+
+// FFmpeg 按小写识别协议，只规范化已经验证的 scheme，保留地址其余字节。
+std::string normalizeFfmpegNetworkScheme(std::string address)
+{
+    for (char& value : address) {
+        if (value == ':') {
+            break;
+        }
+        if (value >= 'A' && value <= 'Z') {
+            value = static_cast<char>(value + ('a' - 'A'));
+        }
+    }
+    return address;
+}
+
+// 打开选中流的解码器，失败时回收未完成的上下文并保留原始错误。
+int openStreamDecoder(const AVCodecParameters* params, AVCodecContext*& context)
+{
+    const AVCodec* codec = avcodec_find_decoder(params->codec_id);
+    if (!codec) {
+        return AVERROR_DECODER_NOT_FOUND;
+    }
+    context = avcodec_alloc_context3(codec);
+    if (!context) {
+        return AVERROR(ENOMEM);
+    }
+    int ret = avcodec_parameters_to_context(context, params);
+    if (ret >= 0) {
+        ret = avcodec_open2(context, codec, nullptr);
+    }
+    if (ret < 0) {
+        avcodec_free_context(&context);
+    }
+    return ret;
+}
+
+} // namespace
 
 // 外部调用者（PlayerController）
 // │
@@ -59,6 +141,9 @@ MediaDecoder::MediaDecoder()
     , last_video_pts_(0.0)
     , has_last_video_pts_(false)
 {
+    // 应用在启动时安装一次进程日志入口，不在并行 I/O 期间切换全局级别或回调。
+    static std::once_flag install_ffmpeg_log;
+    std::call_once(install_ffmpeg_log, [] { av_log_set_callback(ffmpegLogCallback); });
 }
 
 // ============================================================
@@ -70,36 +155,81 @@ MediaDecoder::~MediaDecoder()
 }
 
 // ============================================================
-// 打开媒体文件
+// 保留以文件路径打开本地媒体的兼容入口。
 // ============================================================
 bool MediaDecoder::open(const std::string& filename)
 {
-    close(); // 先关闭之前打开的文件
+    return open(PlaybackSource::localFile(filename)).status == MediaOpenStatus::Opened;
+}
 
-    // --------------------------------------------------------
-    // 步骤1：打开文件，创建AVFormatContext
-    // avformat_open_input() 会：
-    // - 读取文件头信息
-    // - 创建并填充format_ctx_
-    // - 不会读取帧数据（需要avformat_find_stream_info进一步探测）
-    // --------------------------------------------------------
-    if (avformat_open_input(&format_ctx_, filename.c_str(), nullptr, nullptr) != 0) {
-        std::cerr << "[MediaDecoder] 无法打开文件: " << filename << std::endl;
-        return false;
+// 打开并探测显式类型的源；每次网络操作单独设期限，取消状态贯穿整个尝试。
+MediaOpenResult MediaDecoder::open(const PlaybackSource& source, std::shared_ptr<MediaIoControl> io)
+{
+    close();
+    if (!source.isValid()) {
+        return {MediaOpenStatus::Error, AVERROR(EINVAL), MediaOpenStage::Validation};
+    }
+    if (source.kind() == PlaybackSourceKind::NetworkVod) {
+        return {MediaOpenStatus::Error, AVERROR(ENOSYS), MediaOpenStage::Validation};
     }
 
-    // --------------------------------------------------------
-    // 步骤2：探测流信息
-    // avformat_find_stream_info() 会：
-    // - 读取若干帧数据来探测编码参数
-    // - 填充format_ctx_->streams[i]->codecpar
-    // - 对于某些格式（如MKV），这是获取完整信息的必要步骤
-    // --------------------------------------------------------
-    if (avformat_find_stream_info(format_ctx_, nullptr) < 0) {
-        std::cerr << "[MediaDecoder] 无法获取流信息" << std::endl;
+    const bool local_file = source.kind() == PlaybackSourceKind::LocalFile;
+    const PlaybackPolicy policy = playbackPolicy(source);
+    const std::string network_address = local_file ? std::string{} : normalizeFfmpegNetworkScheme(source.address());
+    const char* input_address = local_file ? source.address().c_str() : network_address.c_str();
+    io_ = io ? std::move(io) : std::make_shared<MediaIoControl>();
+    network_input_ = !local_file;
+    read_timeout_ = policy.read_timeout;
+    const ScopedNetworkFfmpegLog network_log(network_input_);
+
+    // 用安全显示名和原始错误号记录失败，关闭时保留 FFmpeg 回调对象。
+    const auto fail = [&](MediaOpenResult result) {
+        std::cerr << "[MediaDecoder] 打开未完成: " << source.displayName()
+                  << ", 阶段=" << static_cast<int>(result.stage)
+                  << ", FFmpeg=" << result.ffmpegError << std::endl;
         close();
-        return false;
+        return result;
+    };
+
+    if (io_->isCancelled()) {
+        return fail({MediaOpenStatus::Cancelled, AVERROR_EXIT, MediaOpenStage::OpenInput});
     }
+
+    // RTSP 的传输选项不传给本地、RTMP 或 SRT。
+    AVDictionary* options = nullptr;
+    if (!local_file && source.protocol() == PlaybackProtocol::Rtsp) {
+        const char* transport = source.liveOptions()->rtsp_transport == RtspTransport::Udp
+            ? "udp" : "tcp";
+        const int ret = av_dict_set(&options, "rtsp_transport", transport, 0);
+        if (ret < 0) {
+            av_dict_free(&options);
+            return fail(classifyOpenResult(ret, io_->stopReason(), MediaOpenStage::OpenInput));
+        }
+    }
+
+    // 打开前分配格式上下文并挂上回调，涵盖连接及读取文件头的阻塞。
+    format_ctx_ = avformat_alloc_context();
+    if (!format_ctx_) {
+        av_dict_free(&options);
+        return fail(classifyOpenResult(AVERROR(ENOMEM), io_->stopReason(), MediaOpenStage::OpenInput));
+    }
+    format_ctx_->interrupt_callback = {MediaIoControl::interruptCallback, io_.get()};
+    io_->armDeadline(policy.open_timeout);
+    const int open_ret = avformat_open_input(&format_ctx_, input_address, nullptr, &options);
+    av_dict_free(&options);
+    const auto open_result = classifyOpenResult(open_ret, io_->stopReason(), MediaOpenStage::OpenInput);
+    if (open_result.status != MediaOpenStatus::Opened) {
+        return fail(open_result);
+    }
+
+    // 探测可能继续读数据，独立于打开阶段重新计时。
+    io_->armDeadline(policy.probe_timeout);
+    const int probe_ret = avformat_find_stream_info(format_ctx_, nullptr);
+    const auto probe_result = classifyOpenResult(probe_ret, io_->stopReason(), MediaOpenStage::ProbeStreams);
+    if (probe_result.status != MediaOpenStatus::Opened) {
+        return fail(probe_result);
+    }
+    io_->clearDeadline();
 
     // --------------------------------------------------------
     // 步骤3：查找视频流和音频流
@@ -125,113 +255,68 @@ bool MediaDecoder::open(const std::string& filename)
     // 流程：查找解码器 → 创建上下文 → 复制参数 → 打开解码器
     // --------------------------------------------------------
     if (video_stream_index_ != -1) {
-        AVCodecParameters* codec_params = format_ctx_->streams[video_stream_index_]->codecpar;
-        // avcodec_find_decoder() 根据codec_id查找已注册的解码器
-        const AVCodec* video_codec = avcodec_find_decoder(codec_params->codec_id);
-        if (!video_codec) {
-            std::cerr << "[MediaDecoder] 不支持的视频编码器" << std::endl;
-            close();
-            return false;
+        const int ret = openStreamDecoder(
+            format_ctx_->streams[video_stream_index_]->codecpar, video_codec_ctx_);
+        if (ret < 0) {
+            return fail(classifyOpenResult(ret, io_->stopReason(), MediaOpenStage::InitializeDecoders));
         }
-
-        // 创建解码器上下文并复制流参数
-        video_codec_ctx_ = avcodec_alloc_context3(video_codec);
-        if (avcodec_parameters_to_context(video_codec_ctx_, codec_params) < 0) {
-            std::cerr << "[MediaDecoder] 无法复制视频编解码器参数" << std::endl;
-            close();
-            return false;
-        }
-
-        // 打开解码器（初始化解码器内部状态）
-        if (avcodec_open2(video_codec_ctx_, video_codec, nullptr) < 0) {
-            std::cerr << "[MediaDecoder] 无法打开视频解码器" << std::endl;
-            close();
-            return false;
-        }
-
         media_info_.has_video = true;
     }
 
     // --------------------------------------------------------
     // 步骤5：打开音频解码器（流程同视频）
     // --------------------------------------------------------
+    int audio_ret = AVERROR_STREAM_NOT_FOUND;
     if (audio_stream_index_ != -1) {
-        AVCodecParameters* codec_params = format_ctx_->streams[audio_stream_index_]->codecpar;
-        const AVCodec* audio_codec = avcodec_find_decoder(codec_params->codec_id);
-        if (!audio_codec) {
-            std::cerr << "[MediaDecoder] 不支持的音频编码器" << std::endl;
-            // 音频解码失败不终止，可以只播放视频
-        }
-        else {
-            audio_codec_ctx_ = avcodec_alloc_context3(audio_codec);
-            avcodec_parameters_to_context(audio_codec_ctx_, codec_params);
-            if (avcodec_open2(audio_codec_ctx_, audio_codec, nullptr) < 0) {
-                std::cerr << "[MediaDecoder] 无法打开音频解码器" << std::endl;
-                avcodec_free_context(&audio_codec_ctx_);
-                audio_codec_ctx_ = nullptr;
+        audio_ret = openStreamDecoder(
+            format_ctx_->streams[audio_stream_index_]->codecpar, audio_codec_ctx_);
+        if (audio_ret >= 0) {
+            // 步骤6：将不同源的音频统一转换为 44100 Hz、立体声、16 位 PCM。
+            AVChannelLayout dst_ch_layout;
+            av_channel_layout_default(&dst_ch_layout, TARGET_CHANNELS);
+            audio_ret = swr_alloc_set_opts2(&swr_ctx_, &dst_ch_layout, TARGET_SAMPLE_FMT,
+                TARGET_SAMPLE_RATE, &audio_codec_ctx_->ch_layout, audio_codec_ctx_->sample_fmt,
+                audio_codec_ctx_->sample_rate, 0, nullptr);
+            av_channel_layout_uninit(&dst_ch_layout);
+
+            if (audio_ret >= 0) {
+                audio_ret = swr_ctx_ ? swr_init(swr_ctx_) : AVERROR(ENOMEM);
             }
-            else {
+            if (audio_ret >= 0) {
                 media_info_.has_audio = true;
-
-                // ------------------------------------------------
-                // 步骤6：初始化音频重采样器（SwrContext）
-                // 为什么需要重采样？
-                // - 不同音频源使用不同的采样率/格式/声道布局
-                // - 音频输出设备通常要求固定的参数
-                // - 我们统一转换为：44100Hz, 立体声, 16位PCM(S16)
-                // ------------------------------------------------
-                AVChannelLayout dst_ch_layout;
-                av_channel_layout_default(&dst_ch_layout, TARGET_CHANNELS);
-
-                int ret = swr_alloc_set_opts2(&swr_ctx_,
-                    &dst_ch_layout,                    // 目标声道布局
-                    TARGET_SAMPLE_FMT,                 // 目标采样格式(S16)
-                    TARGET_SAMPLE_RATE,                // 目标采样率
-                    &audio_codec_ctx_->ch_layout,      // 源声道布局
-                    audio_codec_ctx_->sample_fmt,      // 源采样格式
-                    audio_codec_ctx_->sample_rate,     // 源采样率
-                    0, nullptr);
-
-                if (ret >= 0 && swr_ctx_) {
-                    ret = swr_init(swr_ctx_);
-                    if (ret >= 0) {
-                        if (!initAudioFilterGraph()) {
-                            std::cerr << "[MediaDecoder] 初始化音频tempo滤镜失败" << std::endl;
-                            destroyAudioFilterGraph();
-                            swr_free(&swr_ctx_);
-                            avcodec_free_context(&audio_codec_ctx_);
-                            media_info_.has_audio = false;
-                            audio_stream_index_ = -1;
-                        }
-                    }
-                    else {
-                        swr_free(&swr_ctx_);
-                        avcodec_free_context(&audio_codec_ctx_);
-                        media_info_.has_audio = false;
-                        audio_stream_index_ = -1;
-                    }
+                if (!initAudioFilterGraph()) {
+                    audio_ret = AVERROR_UNKNOWN;
                 }
-                else {
-                    swr_free(&swr_ctx_);
-                    avcodec_free_context(&audio_codec_ctx_);
-                    media_info_.has_audio = false;
-                    audio_stream_index_ = -1;
-                }
-                av_channel_layout_uninit(&dst_ch_layout);
             }
+        }
+        if (audio_ret < 0) {
+            // 保留旧的纯视频降级路径；只有完全没有可播放流时打开失败。
+            std::cerr << "[MediaDecoder] 无法初始化音频, FFmpeg=" << audio_ret << std::endl;
+            destroyAudioFilterGraph();
+            swr_free(&swr_ctx_);
+            avcodec_free_context(&audio_codec_ctx_);
+            media_info_.has_audio = false;
+            audio_stream_index_ = -1;
         }
     }
+    if (!media_info_.has_video && !media_info_.has_audio) {
+        return fail(classifyOpenResult(audio_ret, io_->stopReason(), MediaOpenStage::InitializeDecoders));
+    }
 
-    // 提取媒体信息
-    media_info_.file_path = filename;
-    // 从路径中提取文件名
-    size_t pos = filename.find_last_of("/\\");
-    media_info_.file_name = (pos != std::string::npos) ? filename.substr(pos + 1) : filename;
+    // 网络地址可能包含口令或签名，不进入可展示和入库的 MediaInfo。
+    if (local_file) {
+        media_info_.file_path = source.address();
+    }
+    media_info_.file_name = source.displayName();
     audio_drained_ = !media_info_.has_audio;
     audio_filter_flush_sent_ = false;
-    extractMediaInfo();
+    extractMediaInfo(local_file);
 
-    std::cout << "[MediaDecoder] 文件打开成功: " << filename << std::endl;
+    if (io_->isCancelled()) {
+        return fail({MediaOpenStatus::Cancelled, AVERROR_EXIT, MediaOpenStage::InitializeDecoders});
+    }
+
+    std::cout << "[MediaDecoder] 媒体打开成功: " << source.displayName() << std::endl;
     if (media_info_.has_video) {
         std::cout << "  视频: " << media_info_.video_info.width << "x"
                   << media_info_.video_info.height << " @ "
@@ -244,11 +329,11 @@ bool MediaDecoder::open(const std::string& filename)
                   << media_info_.audio_info.codec_name << std::endl;
     }
 
-    return true;
+    return {MediaOpenStatus::Opened, 0, MediaOpenStage::InitializeDecoders};
 }
 
 // ============================================================
-// 关闭文件并释放所有资源
+// 关闭媒体并释放所有资源；回调对象最后释放。
 // ============================================================
 void MediaDecoder::close()
 {
@@ -277,9 +362,15 @@ void MediaDecoder::close()
     }
 
     if (format_ctx_) {
-        avformat_close_input(&format_ctx_);        // 关闭文件并释放格式上下文
-        format_ctx_ = nullptr;
+        // 部分协议在关闭时会发送控制消息，不清除取消或延长已有期限。
+        io_->limitDeadline(read_timeout_);
+        const ScopedNetworkFfmpegLog network_log(network_input_);
+        avformat_close_input(&format_ctx_);
     }
+    io_.reset();
+    read_timeout_ = std::chrono::milliseconds{0};
+    network_input_ = false;
+    read_deadline_active_ = false;
 
     video_stream_index_ = -1;
     audio_stream_index_ = -1;
@@ -503,20 +594,47 @@ bool MediaDecoder::pullAudioFilterFrame(DecodedFrame& out_frame)
     return true;
 }
 
+// 兼容原有调用者，只在读到选中包时返回 true。
 bool MediaDecoder::readPacket(AVPacket* packet)
 {
-    if (!format_ctx_ || !packet) {
-        return false;
+    return readPacketResult(packet).status == MediaReadStatus::Packet;
+}
+
+// 对一次选中音视频包的读取计时，Again 和非选中包都不会重置期限。
+MediaReadResult MediaDecoder::readPacketResult(AVPacket* packet)
+{
+    if (!packet) {
+        return classifyMediaReadResult(AVERROR(EINVAL));
+    }
+    av_packet_unref(packet);
+    if (!format_ctx_) {
+        return classifyMediaReadResult(AVERROR(EINVAL));
     }
 
-    av_packet_unref(packet);
+    if (!read_deadline_active_) {
+        io_->armDeadline(read_timeout_);
+        read_deadline_active_ = true;
+    }
+    const ScopedNetworkFfmpegLog network_log(network_input_);
     while (true) {
-        int ret = av_read_frame(format_ctx_, packet);
-        if (ret < 0) {
-            return false;
+        const auto reason = io_->stopReason();
+        if (reason != MediaIoStopReason::None) {
+            const int error = reason == MediaIoStopReason::Cancelled ? AVERROR_EXIT : AVERROR(ETIMEDOUT);
+            return classifyMediaReadResult(error, reason);
         }
-        if (isVideoPacket(packet) || isAudioPacket(packet)) {
-            return true;
+
+        const int ret = av_read_frame(format_ctx_, packet);
+        const auto result = classifyMediaReadResult(ret, io_->stopReason());
+        if (result.status != MediaReadStatus::Packet) {
+            av_packet_unref(packet);
+            return result;
+        }
+        const bool selected = isVideoPacket(packet) || isAudioPacket(packet);
+        const bool valid_payload = !network_input_ || (packet->data && packet->size > 0);
+        if (selected && valid_payload) {
+            io_->clearDeadline();
+            read_deadline_active_ = false;
+            return result;
         }
         av_packet_unref(packet);
     }
@@ -934,9 +1052,9 @@ double MediaDecoder::getFrameTimestampSeconds(AVFrame* frame, int stream_index) 
 }
 
 // ============================================================
-// 提取媒体信息
+// 提取媒体信息；网络源不额外查询文件大小，以免引入无期限的网络操作。
 // ============================================================
-void MediaDecoder::extractMediaInfo()
+void MediaDecoder::extractMediaInfo(bool localFile)
 {
     if (!format_ctx_) return;
 
@@ -945,7 +1063,7 @@ void MediaDecoder::extractMediaInfo()
     media_info_.duration = (format_ctx_->duration > 0)
         ? static_cast<double>(format_ctx_->duration) / AV_TIME_BASE
         : 0.0;
-    media_info_.file_size = format_ctx_->pb ? avio_size(format_ctx_->pb) : 0;
+    media_info_.file_size = localFile && format_ctx_->pb ? avio_size(format_ctx_->pb) : 0;
     media_info_.overall_bit_rate = format_ctx_->bit_rate;
 
     // 视频流信息
@@ -966,7 +1084,9 @@ void MediaDecoder::extractMediaInfo()
             media_info_.duration = static_cast<double>(vstream->nb_frames) / fps;
         }
         media_info_.video_info.codec_name = avcodec_get_name(video_codec_ctx_->codec_id);
-        media_info_.video_info.pixel_format = av_get_pix_fmt_name(video_codec_ctx_->pix_fmt);
+        if (const char* pixel_format = av_get_pix_fmt_name(video_codec_ctx_->pix_fmt)) {
+            media_info_.video_info.pixel_format = pixel_format;
+        }
         media_info_.video_info.bit_rate = video_codec_ctx_->bit_rate;
         media_info_.video_info.duration = media_info_.duration;
         media_info_.video_info.total_frames = (int)(media_info_.duration * media_info_.video_info.frame_rate);
@@ -977,7 +1097,9 @@ void MediaDecoder::extractMediaInfo()
         media_info_.audio_info.sample_rate = audio_codec_ctx_->sample_rate;
         media_info_.audio_info.channels = audio_codec_ctx_->ch_layout.nb_channels;
         media_info_.audio_info.codec_name = avcodec_get_name(audio_codec_ctx_->codec_id);
-        media_info_.audio_info.sample_format = av_get_sample_fmt_name(audio_codec_ctx_->sample_fmt);
+        if (const char* sample_format = av_get_sample_fmt_name(audio_codec_ctx_->sample_fmt)) {
+            media_info_.audio_info.sample_format = sample_format;
+        }
         media_info_.audio_info.bit_rate = audio_codec_ctx_->bit_rate;
         media_info_.audio_info.duration = media_info_.duration;
     }

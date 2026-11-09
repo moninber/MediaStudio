@@ -28,9 +28,15 @@ endif()
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets OpenGL OpenGLWidgets)
 find_package(OpenGL REQUIRED)
 
+set(MEDIASTUDIO_PLAYBACK_SOURCES
+    src/PlaybackSource.cpp
+    src/MediaIo.cpp
+    src/MediaDecoder.cpp
+)
+
 set(MEDIASTUDIO_SOURCES
     src/main.cpp
-    src/MediaDecoder.cpp
+    ${MEDIASTUDIO_PLAYBACK_SOURCES}
     src/AudioOutput.cpp
     src/VideoRenderer.cpp
     src/AudioVisualizer.cpp
@@ -42,6 +48,9 @@ set(MEDIASTUDIO_SOURCES
 )
 
 set(MEDIASTUDIO_HEADERS
+    src/PlaybackSource.h
+    src/PlaybackSnapshot.h
+    src/MediaIo.h
     src/MediaInfo.h
     src/MediaDecoder.h
     src/AudioOutput.h
@@ -134,6 +143,46 @@ target_link_libraries(MediaStudio PRIVATE
     GLEW::GLEW
     ${MEDIASTUDIO_FFMPEG_TARGETS}
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Threads REQUIRED)
+    add_executable(MediaStudioPlaybackTests
+        tests/PlaybackTests.cpp
+        tests/RtspBlackhole.cpp
+        ${MEDIASTUDIO_PLAYBACK_SOURCES}
+    )
+    set_target_properties(MediaStudioPlaybackTests PROPERTIES
+        AUTOMOC OFF
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests"
+    )
+    target_include_directories(MediaStudioPlaybackTests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${MEDIASTUDIO_FFMPEG_ROOT}/include"
+    )
+    target_link_libraries(MediaStudioPlaybackTests PRIVATE
+        Threads::Threads
+        FFmpeg::avcodec FFmpeg::avformat FFmpeg::avutil FFmpeg::avfilter
+        FFmpeg::swresample FFmpeg::swscale
+    )
+    if(WIN32)
+        target_compile_definitions(MediaStudioPlaybackTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_link_libraries(MediaStudioPlaybackTests PRIVATE ws2_32)
+    endif()
+
+    # 测试可直接从构建目录运行，不依赖播放器部署步骤或已配置的全局 PATH。
+    get_filename_component(mediastudio_compiler_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    foreach(test_case IN ITEMS contracts local-file rtsp-cancel rtsp-timeout)
+        add_test(NAME MediaStudio.Playback.${test_case} COMMAND MediaStudioPlaybackTests ${test_case})
+        set_tests_properties(MediaStudio.Playback.${test_case} PROPERTIES TIMEOUT 18)
+        if(WIN32)
+            set_property(TEST MediaStudio.Playback.${test_case} PROPERTY ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:${MEDIASTUDIO_FFMPEG_ROOT}/bin"
+                "PATH=path_list_prepend:${mediastudio_compiler_bin}"
+            )
+        endif()
+    endforeach()
+endif()
 
 if(WIN32)
     target_link_libraries(MediaStudio PRIVATE ole32 uuid winmm)

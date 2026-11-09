@@ -29,6 +29,8 @@
 #include <memory>
 #include <vector>
 #include "MediaInfo.h"
+#include "MediaIo.h"
+#include "PlaybackSource.h"
 
 // FFmpeg头文件使用extern "C"包裹，因为FFmpeg是C库
 // C++编译器会对函数名进行name mangling（名称改编），导致链接失败
@@ -78,11 +80,15 @@ public:
      * 完整流程：打开文件 → 探测流信息 → 查找视频/音频流 → 打开解码器
      */
     bool open(const std::string& filename);
+    // 打开显式类型的媒体；取消对象覆盖打开、探测、读取和关闭的完整尝试。
+    MediaOpenResult open(const PlaybackSource& source, std::shared_ptr<MediaIoControl> io = {});
 
     /** @brief 关闭文件并释放所有FFmpeg资源 */
     void close();
 
     bool readPacket(AVPacket* packet);
+    // 只交付选中的音视频包，并区分暂时无包、EOF、超时、取消和错误。
+    MediaReadResult readPacketResult(AVPacket* packet);
     bool isVideoPacket(const AVPacket* packet) const;
     bool isAudioPacket(const AVPacket* packet) const;
     bool decodeVideoPacket(const AVPacket* packet, std::vector<DecodedFrame>& out_frames);
@@ -115,7 +121,7 @@ private:
      * @brief 从AVFormatContext中提取媒体信息
      * 填充MediaInfo结构体的各个字段
      */
-    void extractMediaInfo();
+    void extractMediaInfo(bool localFile);
     bool convertVideoFrame(AVFrame* frame, DecodedFrame& out_frame);
     bool convertAudioFrame(AVFrame* frame, DecodedFrame& out_frame);
     bool pullAudioFilterFrame(DecodedFrame& out_frame);
@@ -127,6 +133,10 @@ private:
     double getFrameTimestampSeconds(AVFrame* frame, int stream_index) const;
 
     AVFormatContext* format_ctx_;     // 封装格式上下文（管理文件读取）
+    std::shared_ptr<MediaIoControl> io_; // FFmpeg 回调使用的对象，在关闭封装后释放。
+    std::chrono::milliseconds read_timeout_{0};
+    bool network_input_ = false;
+    bool read_deadline_active_ = false; // Again 和跳过非选中包沿用同一次读取的期限。
     AVCodecContext* video_codec_ctx_; // 视频解码器上下文
     AVCodecContext* audio_codec_ctx_; // 音频解码器上下文
     SwsContext* sws_ctx_;            // 图像转换上下文（YUV→RGB）

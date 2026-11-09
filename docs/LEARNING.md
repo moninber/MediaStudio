@@ -578,8 +578,10 @@ FFmpeg处理媒体文件的核心数据流：
 
 **第一步**：阅读 `MediaDecoder.cpp` 的 `open()` 函数
 
+以下是简化的调用顺序。实际打开前先分配格式上下文并安装中断回调，再按源类型设置输入选项。
+
 ```cpp
-// 这6行代码是FFmpeg解码的固定模板：
+// 打开、探测、初始化解码器：
 avformat_open_input(&format_ctx_, filename, nullptr, nullptr);  // 1.打开文件
 avformat_find_stream_info(format_ctx_, nullptr);                  // 2.探测流信息
 avcodec_find_decoder(codec_params->codec_id);                     // 3.找解码器
@@ -617,6 +619,13 @@ sws_scale(sws_ctx_,           // 转换上下文
 - **seek操作**：必须seek到关键帧（`AVSEEK_FLAG_BACKWARD`），然后继续解码
 - **刷新缓冲区**：seek后必须 `avcodec_flush_buffers()` 清除旧帧
 - **文件结束**：发送 `nullptr` packet可刷新解码器中的剩余帧
+
+### 4.4 输入类型与可取消 I/O
+
+1. 从 `PlaybackSource.h` 和 `PlaybackSource.cpp` 看三类输入的策略。直播和点播共用 I/O 基础设施，但分别描述暂停、EOF、队列满和恢复落点。点播初始能力不会从 URL 或已知时长推断出可 seek、可倍速或可原位恢复。
+2. 从 `MediaIo.h` 和 `MediaDecoder::open()` 看一次打开尝试怎样拥有取消对象。打开、探测和每次读取分别设置单调时钟期限；FFmpeg 回调只读取原子状态和时钟。取消后不复位该对象，收尾关闭格式上下文后再释放它。本地文件不套网络读取期限。
+3. 从 `readPacketResult()` 看读包结果：包、暂时无包、EOF、超时、主动取消和其他错误各自保留 FFmpeg 返回码。结果分类负责描述这一次读取，正常 EOF 排空和直播恢复属于控制器策略。
+4. 从 `PlaybackSnapshot.h` 看 UI 如何按值读取状态、能力和媒体元信息。媒体库只回写匹配请求编号的本地库字段；读取快照不持有解码或生命周期锁。
 
 ---
 
