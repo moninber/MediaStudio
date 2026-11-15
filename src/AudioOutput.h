@@ -35,6 +35,7 @@
 #include <audioclient.h>    // IAudioClient, IAudioRenderClient
 #include <vector>
 #include <atomic>
+#include <functional>
 #include <mutex>
 
 class AudioOutput {
@@ -64,7 +65,7 @@ public:
      * 3. 拷贝PCM数据到缓冲区
      * 4. 释放缓冲区（提交数据）
      */
-    bool play(const std::vector<uint8_t>& data);
+    bool play(const std::vector<uint8_t>& data, const std::function<bool()>& is_current);
 
     /** @brief 设置音量（0.0~1.0） */
     void setVolume(float volume);

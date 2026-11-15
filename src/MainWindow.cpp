@@ -23,8 +23,26 @@
 #include <QAction>
 #include <QShortcut>
 #include <QScrollBar>
+#include <algorithm>
+#include <cmath>
 #include <iostream>
-#include <chrono>
+
+namespace {
+
+// 播放按钮在空闲、失败或结束时可以从当前播放列表项重新开始。
+bool canOpenSelectedFile(PlaybackState state)
+{
+    return state == PlaybackState::Idle || state == PlaybackState::Failed || state == PlaybackState::Ended;
+}
+
+// 定位只操作已打开、可定位且具有可用时长的当前会话。
+bool canSeek(const PlaybackSnapshot& snapshot)
+{
+    return (snapshot.is_playing || snapshot.is_paused) && snapshot.capabilities.can_seek &&
+           std::isfinite(snapshot.duration_seconds) && snapshot.duration_seconds > 0.0;
+}
+
+} // namespace
 
 // ============================================================
 // 构造函数
@@ -58,14 +76,15 @@ MainWindow::MainWindow(QWidget* parent)
 
 MainWindow::~MainWindow()
 {
-    ++load_request_id_;
+    info_timer_.stop();
+    // 停止并接回播放线程，等它们不再提交帧后才由 Qt 销毁 VideoWidget。
+    player_->shutdown();
     if (transcoding_.load()) {
         transcoder_->cancel();
     }
     if (transcoding_thread_.joinable()) {
         transcoding_thread_.join();
     }
-    player_->stop();
     delete player_;
     delete database_;
     delete transcoder_;
@@ -300,6 +319,7 @@ void MainWindow::setupBottomBar()
     slider_progress_ = new QSlider(Qt::Horizontal);
     slider_progress_->setRange(0, 1000);
     slider_progress_->setValue(0);
+    slider_progress_->setEnabled(false);
     slider_progress_->setToolTip("点击或拖动跳转播放位置");
 
     label_duration_ = new QLabel("00:00");
@@ -504,14 +524,14 @@ void MainWindow::setupShortcuts()
     QShortcut* sc_right = new QShortcut(QKeySequence(Qt::Key_Right), this);
     sc_right->setContext(Qt::ApplicationShortcut);
     connect(sc_right, &QShortcut::activated, this, [this]() {
-        player_->seek(player_->getCurrentTime() + 5.0);
+        seekRelative(5.0);
     });
 
     // 快退 (Left)
     QShortcut* sc_left = new QShortcut(QKeySequence(Qt::Key_Left), this);
     sc_left->setContext(Qt::ApplicationShortcut);
     connect(sc_left, &QShortcut::activated, this, [this]() {
-        player_->seek(player_->getCurrentTime() - 5.0);
+        seekRelative(-5.0);
     });
 
     // 音量加 (Up)
@@ -541,19 +561,27 @@ void MainWindow::setupShortcuts()
     // 倍速 (1-4)
     QShortcut* sc_speed1 = new QShortcut(QKeySequence(Qt::Key_1), this);
     sc_speed1->setContext(Qt::ApplicationShortcut);
-    connect(sc_speed1, &QShortcut::activated, this, [this]() { combo_speed_->setCurrentIndex(1); });
+    connect(sc_speed1, &QShortcut::activated, this, [this]() {
+        if (combo_speed_->isEnabled()) combo_speed_->setCurrentIndex(1);
+    });
 
     QShortcut* sc_speed2 = new QShortcut(QKeySequence(Qt::Key_2), this);
     sc_speed2->setContext(Qt::ApplicationShortcut);
-    connect(sc_speed2, &QShortcut::activated, this, [this]() { combo_speed_->setCurrentIndex(3); });
+    connect(sc_speed2, &QShortcut::activated, this, [this]() {
+        if (combo_speed_->isEnabled()) combo_speed_->setCurrentIndex(3);
+    });
 
     QShortcut* sc_speed3 = new QShortcut(QKeySequence(Qt::Key_3), this);
     sc_speed3->setContext(Qt::ApplicationShortcut);
-    connect(sc_speed3, &QShortcut::activated, this, [this]() { combo_speed_->setCurrentIndex(5); });
+    connect(sc_speed3, &QShortcut::activated, this, [this]() {
+        if (combo_speed_->isEnabled()) combo_speed_->setCurrentIndex(5);
+    });
 
     QShortcut* sc_speed4 = new QShortcut(QKeySequence(Qt::Key_4), this);
     sc_speed4->setContext(Qt::ApplicationShortcut);
-    connect(sc_speed4, &QShortcut::activated, this, [this]() { combo_speed_->setCurrentIndex(6); });
+    connect(sc_speed4, &QShortcut::activated, this, [this]() {
+        if (combo_speed_->isEnabled()) combo_speed_->setCurrentIndex(6);
+    });
 
     // 收藏 (F)
     QShortcut* sc_fav = new QShortcut(QKeySequence(Qt::Key_F), this);
@@ -562,7 +590,8 @@ void MainWindow::setupShortcuts()
         if (db_connected_) {
             auto snapshot = player_->getPlaybackSnapshot();
             auto& info = snapshot.media_info;
-            if (snapshot.source_kind == PlaybackSourceKind::LocalFile && info.db_id > 0) {
+            if (snapshot.request_id == playback_request_id_ &&
+                snapshot.source_kind == PlaybackSourceKind::LocalFile && info.db_id > 0) {
                 bool new_state = !info.is_favorite;
                 if (database_->setFavorite(info.db_id, new_state)) {
                     info.is_favorite = new_state;
@@ -608,56 +637,48 @@ void MainWindow::openFile()
     playlist_.push_back(file_path);
     current_playlist_index_ = (int)playlist_.size() - 1;
     list_playlist_->addItem(QFileInfo(filename).fileName());
+    list_playlist_->setCurrentRow(current_playlist_index_);
 
-    // 加载并播放
-    // decoder->open + avformat_find_stream_info 可能阻塞数秒，必须在后台线程执行
-    requestLoadAndPlay(file_path, QFileInfo(filename).fileName());
+    requestLoadAndPlay(file_path);
 }
 
-void MainWindow::togglePlayPause()//暂停
+// 根据当前请求状态决定播放、暂停或从列表重新打开。
+void MainWindow::togglePlayPause()
 {
-    if (!player_->isPlaying() && !player_->isPaused()) {
+    const auto snapshot = player_->getPlaybackSnapshot();
+    if (snapshot.request_id != playback_request_id_) return;
+    if (snapshot.is_playing || snapshot.is_paused) {
+        player_->togglePlayPause();
+    } else if (canOpenSelectedFile(snapshot.state)) {
         if (playlist_.empty()) {
             openFile();
-            return;
+        } else {
+            requestLoadAndPlay(playlist_[current_playlist_index_]);
         }
-        // 需要加载文件，异步执行
-        std::string path = playlist_[current_playlist_index_];
-        requestLoadAndPlay(path, QFileInfo(QString::fromStdString(path)).fileName());
-        return;
-    }
-
-    player_->togglePlayPause();
-
-    if (player_->isPaused()) {
-        btn_play_->setText("▶");
-        statusBar()->showMessage("已暂停");
-    }
-    else {
-        btn_play_->setText("⏸");
-        statusBar()->showMessage("正在播放");
     }
 }
 
-void MainWindow::stopPlayback()//停止
+// 取消尚未登记的库记录，画面与会话收尾由控制器管理。
+void MainWindow::stopPlayback()
 {
-    // 使尚在等待的加载请求及其界面回调失效，再取消已经发布的 I/O。
-    ++load_request_id_;
-    player_->stopAsync();
-    btn_play_->setText("▶");
-    video_widget_->clearFrame();
-    slider_progress_->setValue(0);
-    label_time_->setText("00:00");
-    statusBar()->showMessage("已停止");
+    library_request_id_ = 0;
+    playback_request_id_ = player_->stopAsync();
+    updatePlaybackInfo();
 }
 
 void MainWindow::seekPosition(int position)
 {
-    double duration = player_->getDuration();
-    if (duration <= 0) return;
+    const auto snapshot = player_->getPlaybackSnapshot();
+    if (snapshot.request_id != playback_request_id_ || !canSeek(snapshot)) return;
+    player_->seek((position / 1000.0) * snapshot.duration_seconds);
+}
 
-    double seek_time = (position / 1000.0) * duration;
-    player_->seek(seek_time);
+// 快捷键按与进度条相同的能力判断，并使用同一快照的当前位置。
+void MainWindow::seekRelative(double offset)
+{
+    const auto snapshot = player_->getPlaybackSnapshot();
+    if (snapshot.request_id != playback_request_id_ || !canSeek(snapshot)) return;
+    player_->seek(snapshot.current_seconds + offset);
 }
 
 void MainWindow::changeVolume(int volume)
@@ -679,6 +700,7 @@ void MainWindow::changeVolume(int volume)
 
 void MainWindow::changeSpeed(int index)
 {
+    if (!combo_speed_->isEnabled()) return;
     QStringList speeds = {"0.25", "0.5", "0.75", "1.0", "1.25", "1.5", "2.0", "4.0"};
     if (index >= 0 && index < speeds.size()) {
         float speed = speeds[index].toFloat();
@@ -692,8 +714,7 @@ void MainWindow::nextFile()
     if (playlist_.empty()) return;
     current_playlist_index_ = (current_playlist_index_ + 1) % (int)playlist_.size();
     list_playlist_->setCurrentRow(current_playlist_index_);
-    std::string path = playlist_[current_playlist_index_];
-    requestLoadAndPlay(path, QFileInfo(QString::fromStdString(path)).fileName());
+    requestLoadAndPlay(playlist_[current_playlist_index_]);
 }
 
 void MainWindow::prevFile()
@@ -701,8 +722,7 @@ void MainWindow::prevFile()
     if (playlist_.empty()) return;
     current_playlist_index_ = (current_playlist_index_ - 1 + (int)playlist_.size()) % (int)playlist_.size();
     list_playlist_->setCurrentRow(current_playlist_index_);
-    std::string path = playlist_[current_playlist_index_];
-    requestLoadAndPlay(path, QFileInfo(QString::fromStdString(path)).fileName());
+    requestLoadAndPlay(playlist_[current_playlist_index_]);
 }
 
 void MainWindow::toggleEffect()
@@ -829,65 +849,26 @@ void MainWindow::playlistItemDoubleClicked(QListWidgetItem* item)
     if (row < 0 || row >= (int)playlist_.size()) return;
 
     current_playlist_index_ = row;
-    std::string path = playlist_[row];
-    requestLoadAndPlay(path, item->text());
+    requestLoadAndPlay(playlist_[row]);
 }
 
-// 每轮刷新读取一个值快照，元信息不引用加载线程正在改写的对象。
+// 只读取一次快照。旧请求即使完成，也不更新界面或登记播放历史。
 void MainWindow::updatePlaybackInfo()
 {
     const auto snapshot = player_->getPlaybackSnapshot();
-    if (!snapshot.is_playing && !snapshot.is_paused) {
-        label_debug_stats_->setText("FPS -- | A/V -- ms | Drop -- | A -- / V -- | Buf -- ms");
-        return;
-    }
+    if (snapshot.request_id != playback_request_id_) return;
+    updatePlaybackControls(snapshot);
 
-    const double current = snapshot.current_seconds;
-    const double duration = snapshot.duration_seconds;
-    const auto& stats = snapshot.stats;
-    label_debug_stats_->setText(QString("FPS %1/%2 | A/V %3 ms | Drop %4 | A %5 / V %6 | Buf %7 ms")
-        .arg(stats.render_fps, 0, 'f', 1)
-        .arg(stats.decode_fps, 0, 'f', 1)
-        .arg(stats.av_diff_ms, 0, 'f', 0)
-        .arg(stats.dropped_frames_total)
-        .arg(stats.audio_queue_packets)
-        .arg(stats.video_queue_packets)
-        .arg(stats.audio_buffer_seconds * 1000.0, 0, 'f', 0));
-
-    // 时间格式化
-    auto formatTime = [](double seconds) -> QString {
-        int mins = (int)(seconds / 60);
-        int secs = (int)(seconds) % 60;
-        return QString("%1:%2").arg(mins, 2, 10, QChar('0')).arg(secs, 2, 10, QChar('0'));
-    };
-
-    label_time_->setText(formatTime(current));
-    slider_progress_->setEnabled(snapshot.capabilities.can_seek && duration > 0);
-
-    if (duration > 0) {
-        // 避免在用户拖动进度条时更新
-        if (!slider_progress_->isSliderDown()) {
-            slider_progress_->blockSignals(true);
-            slider_progress_->setValue((int)(current / duration * 1000));
-            slider_progress_->blockSignals(false);
-        }
-        label_duration_->setText(formatTime(duration));
-    }
-    else {
-        label_duration_->setText("--:--");
-    }
-
-    // 更新媒体信息面板
     const auto& info = snapshot.media_info;
+    QString info_text;
     if (!info.file_name.empty()) {
-        QString info_text;
-        info_text += QString("<h3>%1</h3>").arg(QString::fromStdString(info.file_name));
-        info_text += QString("<p>格式: %1</p>").arg(QString::fromStdString(info.format_name));
+        info_text += QString("<h3>%1</h3>").arg(QString::fromStdString(info.file_name).toHtmlEscaped());
+        info_text += QString("<p>格式: %1</p>").arg(QString::fromStdString(info.format_name).toHtmlEscaped());
         info_text += QString("<p>时长: %1秒</p>").arg(info.duration, 0, 'f', 1);
 
         if (info.has_video) {
             info_text += "<hr><h4>视频</h4>";
-            info_text += QString("<p>编码: %1</p>").arg(QString::fromStdString(info.video_info.codec_name));
+            info_text += QString("<p>编码: %1</p>").arg(QString::fromStdString(info.video_info.codec_name).toHtmlEscaped());
             info_text += QString("<p>分辨率: %1x%2</p>").arg(info.video_info.width).arg(info.video_info.height);
             info_text += QString("<p>帧率: %1 fps</p>").arg(info.video_info.frame_rate, 0, 'f', 1);
             info_text += QString("<p>特效: %1</p>").arg(
@@ -896,17 +877,109 @@ void MainWindow::updatePlaybackInfo()
 
         if (info.has_audio) {
             info_text += "<hr><h4>音频</h4>";
-            info_text += QString("<p>编码: %1</p>").arg(QString::fromStdString(info.audio_info.codec_name));
+            info_text += QString("<p>编码: %1</p>").arg(QString::fromStdString(info.audio_info.codec_name).toHtmlEscaped());
             info_text += QString("<p>采样率: %1 Hz</p>").arg(info.audio_info.sample_rate);
             info_text += QString("<p>声道: %1</p>").arg(info.audio_info.channels);
         }
 
-        if (info_text != last_media_info_html_) {
-            int scroll_value = text_media_info_->verticalScrollBar()->value();
-            text_media_info_->setHtml(info_text);
-            text_media_info_->verticalScrollBar()->setValue(scroll_value);
-            last_media_info_html_ = info_text;
+    }
+    if (info_text != last_media_info_html_) {
+        int scroll_value = text_media_info_->verticalScrollBar()->value();
+        text_media_info_->setHtml(info_text);
+        text_media_info_->verticalScrollBar()->setValue(scroll_value);
+        last_media_info_html_ = info_text;
+    }
+    syncLocalLibrary(snapshot);
+}
+
+// 根据同一快照刷新播放状态、定位能力、进度和实时统计。
+void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
+{
+    btn_play_->setText(snapshot.is_playing && !snapshot.is_paused ? "⏸" : "▶");
+    const bool seekable = canSeek(snapshot);
+    slider_progress_->setEnabled(seekable);
+    combo_speed_->setEnabled(snapshot.source_kind == PlaybackSourceKind::LocalFile ||
+                             snapshot.capabilities.can_change_speed);
+
+    // 状态变化时才写状态栏，保留音量、倍速或特效操作出现时的提示。
+    if (snapshot.request_id != displayed_request_id_ || snapshot.state != displayed_state_) {
+        const QString name = QString::fromStdString(snapshot.display_name);
+        QString status;
+        switch (snapshot.state) {
+            case PlaybackState::Idle: status = "已停止"; break;
+            case PlaybackState::Opening: status = "正在加载: " + name; break;
+            case PlaybackState::Buffering: status = "正在缓冲: " + name; break;
+            case PlaybackState::Playing: status = "正在播放: " + name; break;
+            case PlaybackState::Draining: status = "正在播放: " + name; break;
+            case PlaybackState::Paused: status = "已暂停"; break;
+            case PlaybackState::Reconnecting: status = "正在重新连接: " + name; break;
+            case PlaybackState::Stopping: status = "正在停止"; break;
+            case PlaybackState::Failed: status = "播放失败: " + name; break;
+            case PlaybackState::Ended: status = "播放结束: " + name; break;
         }
+        statusBar()->showMessage(status);
+        displayed_request_id_ = snapshot.request_id;
+        displayed_state_ = snapshot.state;
+    }
+
+    const auto formatTime = [](double seconds) {
+        const auto total = static_cast<qint64>(seconds);
+        return QString("%1:%2").arg(total / 60, 2, 10, QChar('0')).arg(total % 60, 2, 10, QChar('0'));
+    };
+    const double current = std::isfinite(snapshot.current_seconds) ? std::max(0.0, snapshot.current_seconds) : 0.0;
+    const double duration = snapshot.duration_seconds;
+    const bool known_duration = snapshot.capabilities.duration_known && std::isfinite(duration) && duration > 0.0;
+    label_time_->setText(formatTime(current));
+    if (!slider_progress_->isSliderDown() || !seekable) {
+        const double ratio = known_duration ? std::clamp(current / duration, 0.0, 1.0) : 0.0;
+        slider_progress_->setValue(static_cast<int>(ratio * 1000));
+    }
+    if (known_duration) {
+        label_duration_->setText(formatTime(duration));
+    } else {
+        label_duration_->setText(snapshot.state == PlaybackState::Idle ? "00:00" : "--:--");
+    }
+
+    if (snapshot.is_playing || snapshot.is_paused) {
+        const auto& stats = snapshot.stats;
+        label_debug_stats_->setText(QString("FPS %1/%2 | A/V %3 ms | Drop %4 | A %5 / V %6 | Buf %7 ms")
+            .arg(stats.render_fps, 0, 'f', 1)
+            .arg(stats.decode_fps, 0, 'f', 1)
+            .arg(stats.av_diff_ms, 0, 'f', 0)
+            .arg(stats.dropped_frames_total)
+            .arg(stats.audio_queue_packets)
+            .arg(stats.video_queue_packets)
+            .arg(stats.audio_buffer_seconds * 1000.0, 0, 'f', 0));
+    } else {
+        label_debug_stats_->setText("FPS -- | A/V -- ms | Drop -- | A -- / V -- | Buf -- ms");
+    }
+}
+
+// GUI 持有数据库连接。每个成功打开的本地请求最多做一次查询或入库，再核对编号后记录历史。
+void MainWindow::syncLocalLibrary(const PlaybackSnapshot& snapshot)
+{
+    if (library_request_id_ == 0 || snapshot.request_id != library_request_id_) return;
+    if (snapshot.state == PlaybackState::Failed || snapshot.state == PlaybackState::Idle ||
+        snapshot.state == PlaybackState::Stopping) {
+        library_request_id_ = 0;
+        return;
+    }
+    if (snapshot.state == PlaybackState::Opening || snapshot.media_info.file_path.empty()) return;
+
+    library_request_id_ = 0;
+    if (!db_connected_ || snapshot.source_kind != PlaybackSourceKind::LocalFile) return;
+    auto info = snapshot.media_info;
+    MediaInfo db_info;
+    if (database_->getMediaByPath(info.file_path, db_info)) {
+        info.db_id = db_info.db_id;
+        info.is_favorite = db_info.is_favorite;
+        info.title = db_info.title;
+        info.tags = db_info.tags;
+    } else {
+        info.db_id = database_->addMedia(info);
+    }
+    if (info.db_id > 0 && player_->updateLocalLibraryInfo(snapshot.request_id, info)) {
+        database_->recordPlayHistory(info.db_id);
     }
 }
 
@@ -933,95 +1006,30 @@ void MainWindow::toggleMute()
 // ============================================================
 // 辅助方法
 // ============================================================
-void MainWindow::requestLoadAndPlay(const std::string& path, const QString& display_name)
+// 打开对话框、播放列表、拖放及启动文件统一提交给控制器。
+void MainWindow::requestLoadAndPlay(const std::string& path)
 {
-    bool need_pause = player_->isPlaying() && !player_->isPaused();
-    if (need_pause) {
-        player_->pause();
-        btn_play_->setText("▶");
+    const auto source = PlaybackSource::localFile(path);
+    playback_request_id_ = player_->requestOpen(source);
+    library_request_id_ = playback_request_id_;
+    // 立即刷新请求对应的控件，媒体库同步仍由定时器处理。
+    updatePlaybackControls(player_->getPlaybackSnapshot());
+    if (!last_media_info_html_.isEmpty()) {
+        text_media_info_->clear();
+        last_media_info_html_.clear();
     }
-
-    video_widget_->clearFrame();
-
-    int request_id = ++load_request_id_;
-    statusBar()->showMessage(QString("%1正在加载: %2...")
-        .arg(need_pause ? "已自动暂停，" : "")
-        .arg(display_name));
-
-    std::thread([this, path, display_name, request_id]() {
-        if (request_id != load_request_id_.load()) {
-            return;
-        }
-
-        bool loaded = false;
-        {
-            std::lock_guard<std::mutex> lock(load_mutex_);
-            if (request_id != load_request_id_.load()) {
-                return;
-            }
-
-            loaded = player_->loadFile(path);
-            if (loaded && request_id == load_request_id_.load()) {
-                // 数据库同步逻辑
-                if (db_connected_) {
-                    auto snapshot = player_->getPlaybackSnapshot();
-                    // 只有本地源同步媒体库，网络源不保存原始地址或历史。
-                    if (snapshot.source_kind == PlaybackSourceKind::LocalFile) {
-                        auto& info = snapshot.media_info;
-                        MediaInfo db_info;
-                        if (database_->getMediaByPath(path, db_info)) {
-                            info.db_id = db_info.db_id;
-                            info.is_favorite = db_info.is_favorite;
-                            info.title = db_info.title;
-                            info.tags = db_info.tags;
-                        } else {
-                            int id = database_->addMedia(info);
-                            if (id > 0) {
-                                info.db_id = id;
-                            }
-                        }
-
-                        // 按源请求编号合并库字段，不覆盖另一源的媒体元信息。
-                        if (player_->updateLocalLibraryInfo(snapshot.request_id, info) && info.db_id > 0) {
-                            database_->recordPlayHistory(info.db_id);
-                        }
-                    }
-                }
-
-                player_->play();
-                player_->pause();
-                player_->play();
-            }
-        }
-
-        if (!loaded || request_id != load_request_id_.load()) {
-            return;
-        }
-
-        QMetaObject::invokeMethod(this, [this, display_name, request_id]() {
-            if (request_id != load_request_id_.load()) {
-                return;
-            }
-            btn_play_->setText("⏸");
-            statusBar()->showMessage("正在播放: " + display_name);
-        }, Qt::QueuedConnection);
-    }).detach();
 }
 
 void MainWindow::setInitialFiles(const std::vector<std::string>& files)
 {
     if (files.empty()) return;
-
-    for (const auto& f : files) {
-        playlist_.push_back(f);
-        QString name = QString::fromStdString(f);
-        int pos = name.lastIndexOf("/\\");
-        if (pos >= 0) name = name.mid(pos + 1);
-        list_playlist_->addItem(name);
+    current_playlist_index_ = static_cast<int>(playlist_.size());
+    for (const auto& file : files) {
+        playlist_.push_back(file);
+        list_playlist_->addItem(QString::fromStdString(PlaybackSource::localFile(file).displayName()));
     }
-
-    current_playlist_index_ = 0;
-    requestLoadAndPlay(files[0], QFileInfo(QString::fromStdString(files[0])).fileName());
+    list_playlist_->setCurrentRow(current_playlist_index_);
+    requestLoadAndPlay(files.front());
 }
 
 bool MainWindow::connectDatabase(const std::string& host, const std::string& user,
@@ -1057,6 +1065,7 @@ void MainWindow::dragEnterEvent(QDragEnterEvent* event)
 
 void MainWindow::dropEvent(QDropEvent* event)
 {
+    const auto old_size = playlist_.size();
     const QList<QUrl> urlList = event->mimeData()->urls();
     for (const QUrl& url : urlList) {
         QString file = url.toLocalFile();
@@ -1066,8 +1075,12 @@ void MainWindow::dropEvent(QDropEvent* event)
         }
     }
 
-    if (!playlist_.empty() && !player_->isPlaying()) {
+    if (playlist_.size() == old_size) return;
+    event->acceptProposedAction();
+    const auto snapshot = player_->getPlaybackSnapshot();
+    if (snapshot.request_id == playback_request_id_ && canOpenSelectedFile(snapshot.state)) {
         current_playlist_index_ = (int)playlist_.size() - 1;
-        requestLoadAndPlay(playlist_[current_playlist_index_], QFileInfo(QString::fromStdString(playlist_[current_playlist_index_])).fileName());
+        list_playlist_->setCurrentRow(current_playlist_index_);
+        requestLoadAndPlay(playlist_[current_playlist_index_]);
     }
 }

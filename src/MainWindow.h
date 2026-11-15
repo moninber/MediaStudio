@@ -47,7 +47,7 @@
 #include <QString>
 
 #include <atomic>
-#include <mutex>
+#include <cstdint>
 #include <thread>
 
 #include "VideoWidget.h"
@@ -105,7 +105,10 @@ private:
     void setupShortcuts();
     void applyDarkTheme();
     void connectSignals();
-    void requestLoadAndPlay(const std::string& path, const QString& display_name);
+    void requestLoadAndPlay(const std::string& path);
+    void seekRelative(double offset);
+    void updatePlaybackControls(const PlaybackSnapshot& snapshot);
+    void syncLocalLibrary(const PlaybackSnapshot& snapshot);
 
     // Qt事件重写
     void keyPressEvent(QKeyEvent* event) override;
@@ -144,8 +147,11 @@ private:
     int current_playlist_index_;
     int last_volume_ = 50;
     bool is_muted_ = false;
-    std::mutex load_mutex_;
-    std::atomic<int> load_request_id_{ 0 };
+    // 请求编号和完成标记只由界面线程操作。
+    std::uint64_t playback_request_id_ = 0;
+    std::uint64_t library_request_id_ = 0;
+    std::uint64_t displayed_request_id_ = 0;
+    PlaybackState displayed_state_ = PlaybackState::Idle;
     std::atomic<bool> transcoding_{ false };
     std::thread transcoding_thread_;
 

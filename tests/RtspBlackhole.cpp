@@ -79,7 +79,7 @@ std::array<unsigned char, 176> pcmuRtp(std::uint16_t sequence)
 class RtspBlackhole::Impl {
 public:
     // 先绑定再启动线程；若初始化失败，由成员析构关闭监听 socket。
-    Impl() : listener_(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP))
+    explicit Impl(StallAt stall) : listener_(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)), stall_(stall)
     {
         if (listener_.handle == INVALID_SOCKET) socketError("socket");
         sockaddr_in address{};
@@ -172,7 +172,7 @@ private:
         }
     }
 
-    // 实现 FFmpeg 所需的最小 RTSP 握手，送入可探测、可读取的音频。
+    // 完成最小 RTSP 握手并送入音频，或收到首条请求后保持连接但不回应。
     void serve()
     {
         if (!waitSocket(listener_.handle, true)) return;
@@ -183,6 +183,12 @@ private:
         while (!stopping_.load()) {
             const auto request = readRequest(peer.handle, pending);
             if (request.empty()) return;
+            if (stall_ == StallAt::OpenInput) {
+                holding_.store(true);
+                // 继续读 socket 以识别客户端主动关闭；服务端始终不回 RTSP 响应。
+                while (!readRequest(peer.handle, pending).empty()) {}
+                return;
+            }
             const auto cseq = request.find("\r\nCSeq:");
             if (cseq == std::string::npos) throw std::runtime_error("missing CSeq");
             const auto cseq_end = request.find("\r\n", cseq + 2);
@@ -227,6 +233,7 @@ private:
 
     Winsock winsock_;
     Socket listener_;
+    const StallAt stall_;
     std::string url_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> holding_{false};
@@ -234,7 +241,7 @@ private:
     std::thread worker_;
 };
 
-RtspBlackhole::RtspBlackhole() : impl_(std::make_unique<Impl>()) {}
+RtspBlackhole::RtspBlackhole(StallAt stall) : impl_(std::make_unique<Impl>(stall)) {}
 RtspBlackhole::~RtspBlackhole() = default;
 std::string RtspBlackhole::url() const { return impl_->url(); }
 bool RtspBlackhole::isHoldingConnection() const noexcept { return impl_->isHoldingConnection(); }

@@ -63,6 +63,9 @@ public:
      */
     void setSpectrumData(const std::vector<float>& spectrum_data);
 
+    // 清除上一播放代的频谱幅值和平滑历史，保留 FFT 窗和 OpenGL 资源。
+    void resetSpectrum();
+
     /**
      * @brief 渲染频谱图
      * @param width 渲染区域宽度

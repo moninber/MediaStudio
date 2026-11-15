@@ -220,7 +220,7 @@ void AudioOutput::cleanup()
     }
 }
 
-bool AudioOutput::play(const std::vector<uint8_t>& data)
+bool AudioOutput::play(const std::vector<uint8_t>& data, const std::function<bool()>& is_current)
 {
     if (!wave_format_) return false;
 
@@ -233,7 +233,8 @@ bool AudioOutput::play(const std::vector<uint8_t>& data)
     while (written_frames < total_frames) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!audio_client_ || !render_client_) return false;
+            // 每轮缓冲写入都检查取消和代次，刷新声卡后旧 PCM 不能再次提交。
+            if (!is_current() || !audio_client_ || !render_client_) return false;
 
             UINT32 num_padding_frames = 0;
             HRESULT hr = audio_client_->GetCurrentPadding(&num_padding_frames);

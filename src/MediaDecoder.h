@@ -100,10 +100,12 @@ public:
      * @brief 跳转到指定时间位置
      * @param seconds 目标时间（秒）
      * 
-     * 内部调用av_seek_frame()实现，使用AVSEEK_FLAG_BACKWARD标志
-     * 确保跳转到目标时间之前最近的关键帧，然后继续解码到精确位置
+     * 通过 av_seek_frame() 向前查找关键帧。定位失败时保留解码器和滤镜状态。
      */
-    void seek(double seconds);
+    bool seek(double seconds);
+
+    // 从给定时间重新建立解码和输出状态，不改变解封装读取位置。
+    void flushAfterDiscontinuity(double seconds);
 
     bool setPlaybackSpeed(float speed);
 
@@ -153,6 +155,7 @@ private:
     MediaInfo media_info_;           // 媒体文件信息
     bool audio_drained_;
     bool audio_filter_flush_sent_;
+    int64_t min_audio_input_pts_ = AV_NOPTS_VALUE;  // atempo 输入的最早采样位置，单位 1/44100 秒。
     double last_video_pts_;
     bool has_last_video_pts_;
 

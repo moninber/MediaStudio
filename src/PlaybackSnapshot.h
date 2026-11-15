@@ -48,12 +48,14 @@ using PlaybackError = std::variant<MediaOpenResult, MediaReadResult>;
 struct PlaybackSnapshot {
     std::uint64_t request_id = 0;
     std::uint64_t connection_attempt_id = 0;
+    std::uint64_t generation = 0;
     PlaybackSourceKind source_kind = PlaybackSourceKind::LocalFile;
     std::string display_name;
     PlaybackState state = PlaybackState::Idle;
     PlaybackCapabilities capabilities;
     bool is_playing = false;
     bool is_paused = false;
+    bool has_current_video_output = false;  // 当前标签已有控件接收的帧，静态留帧不计入。
     double current_seconds = 0.0;
     double duration_seconds = 0.0;
     PlaybackStats stats;

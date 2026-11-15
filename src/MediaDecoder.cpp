@@ -18,6 +18,7 @@
 namespace {
 
 thread_local bool suppress_network_ffmpeg_log = false;
+constexpr long double TimestampUpperBound = 0x1p63L;
 
 // 网络封装 I/O 在调用线程执行，禁止其输出可能包含 URL 的自由文本。
 // 本地文件和转码仍走 FFmpeg 默认日志；独立协议库的异步日志不经过此线程作用域。
@@ -379,6 +380,7 @@ void MediaDecoder::close()
     media_info_ = MediaInfo();  // 重置媒体信息
     audio_drained_ = false;
     audio_filter_flush_sent_ = false;
+    min_audio_input_pts_ = AV_NOPTS_VALUE;
     last_video_pts_ = 0.0;
     has_last_video_pts_ = false;
 }
@@ -924,6 +926,9 @@ bool MediaDecoder::convertAudioFrame(AVFrame* frame, DecodedFrame& out_frame)
         return false;
     }
 
+    // 定位后的输出可能从重采样器缓存开始，记录转换前的延迟（按输出采样计）。
+    const int64_t output_delay = min_audio_input_pts_ == AV_NOPTS_VALUE
+        ? 0 : std::max<int64_t>(0, swr_get_delay(swr_ctx_, TARGET_SAMPLE_RATE));
     int converted_samples = swr_convert(swr_ctx_,
         resampled_frame->data, output_samples,
         (const uint8_t**)frame->data, frame->nb_samples);
@@ -968,13 +973,31 @@ bool MediaDecoder::convertAudioFrame(AVFrame* frame, DecodedFrame& out_frame)
     int64_t src_ts = frame->best_effort_timestamp;
     if (src_ts == AV_NOPTS_VALUE) src_ts = frame->pts;
     if (src_ts == AV_NOPTS_VALUE) src_ts = frame->pkt_dts;
+    resampled_frame->pts = AV_NOPTS_VALUE;
     if (src_ts != AV_NOPTS_VALUE) {
-        resampled_frame->pts = av_rescale_q(src_ts,
-            format_ctx_->streams[audio_stream_index_]->time_base,
-            AVRational{ 1, TARGET_SAMPLE_RATE });
+        const AVRational stream_time_base = format_ctx_->streams[audio_stream_index_]->time_base;
+        const AVRational sample_time_base{1, TARGET_SAMPLE_RATE};
+        const auto rounding = min_audio_input_pts_ == AV_NOPTS_VALUE ? AV_ROUND_NEAR_INF : AV_ROUND_DOWN;
+        const auto pts = av_rescale_q_rnd(src_ts, stream_time_base, sample_time_base, rounding);
+        if (pts > AV_NOPTS_VALUE + output_delay) {
+            resampled_frame->pts = pts - output_delay;
+        }
     }
-    else {
-        resampled_frame->pts = AV_NOPTS_VALUE;
+
+    // 在变速前裁剪已知时间戳的预解码采样。移动 packed PCM 的内容以保留 AVFrame 的缓冲区所有权。
+    if (min_audio_input_pts_ != AV_NOPTS_VALUE && resampled_frame->pts != AV_NOPTS_VALUE &&
+        resampled_frame->pts < min_audio_input_pts_) {
+        if (resampled_frame->pts <= min_audio_input_pts_ - converted_samples) {
+            av_frame_free(&resampled_frame);
+            return false;
+        }
+        const auto skip = static_cast<int>(min_audio_input_pts_ - resampled_frame->pts);
+        const std::size_t bytes_per_sample = TARGET_CHANNELS * av_get_bytes_per_sample(TARGET_SAMPLE_FMT);
+        uint8_t* samples = resampled_frame->data[0];
+        std::memmove(samples, samples + skip * bytes_per_sample,
+                     (converted_samples - skip) * bytes_per_sample);
+        resampled_frame->nb_samples = converted_samples - skip;
+        resampled_frame->pts = min_audio_input_pts_;
     }
 
     int ret = av_buffersrc_add_frame_flags(audio_buffer_src_ctx_, resampled_frame, AV_BUFFERSRC_FLAG_KEEP_REF);
@@ -988,33 +1011,44 @@ bool MediaDecoder::convertAudioFrame(AVFrame* frame, DecodedFrame& out_frame)
 }
 
 // ============================================================
-// 跳转到指定时间位置
+// 定位成功后才刷新编解码器、重采样器和滤镜状态。
 // ============================================================
-void MediaDecoder::seek(double seconds)
+bool MediaDecoder::seek(double seconds)
 {
-    if (!format_ctx_) {
-        return;
+    if (!format_ctx_ || !std::isfinite(seconds) || seconds < 0.0) {
+        return false;
     }
 
     // 音频是播放主时钟，优先按音频流定位能让听感上的 seek 落点更接近目标。
     const int seek_stream_index = (audio_stream_index_ != -1) ? audio_stream_index_ : video_stream_index_;
-    if (seek_stream_index == -1) {
-        return;
+    if (seek_stream_index < 0 || static_cast<unsigned>(seek_stream_index) >= format_ctx_->nb_streams) {
+        return false;
     }
 
-    // 将秒数转换为流的时间戳单位（time_base）
-    // FFmpeg内部使用时间戳(pts)而非秒数来表示时间
-    // 转换公式：timestamp = seconds / time_base
-    AVStream* stream = format_ctx_->streams[seek_stream_index];
-    int64_t timestamp = (int64_t)(seconds / av_q2d(stream->time_base));
+    // 向下取整到流的时间单位，并检查整数范围，避免超大目标溢出。
+    const AVRational time_base = format_ctx_->streams[seek_stream_index]->time_base;
+    if (time_base.num <= 0 || time_base.den <= 0) {
+        return false;
+    }
+    const long double ticks = static_cast<long double>(seconds) * time_base.den / time_base.num;
+    if (!std::isfinite(ticks) || ticks >= TimestampUpperBound) {
+        return false;
+    }
+    const auto timestamp = static_cast<int64_t>(ticks);
 
-    // av_seek_frame() 跳转到指定时间戳
-    // AVSEEK_FLAG_BACKWARD：向后寻找最近的关键帧
-    // （因为非关键帧不能独立解码，必须从关键帧开始）
-    av_seek_frame(format_ctx_, seek_stream_index, timestamp, AVSEEK_FLAG_BACKWARD);
+    if (av_seek_frame(format_ctx_, seek_stream_index, timestamp, AVSEEK_FLAG_BACKWARD) < 0) {
+        return false;
+    }
+    flushAfterDiscontinuity(seconds);
+    return true;
+}
 
-    // 刷新解码器缓冲区，清除旧帧
-    // 跳转后，解码器中可能还有跳转前的缓存帧，需要清除
+// 清除旧解码状态；无法重定位的本地源也可从当前位置切换播放速度。
+void MediaDecoder::flushAfterDiscontinuity(double seconds)
+{
+    if (!format_ctx_ || !std::isfinite(seconds) || seconds < 0.0) {
+        return;
+    }
     if (video_codec_ctx_) {
         avcodec_flush_buffers(video_codec_ctx_);
     }
@@ -1031,6 +1065,9 @@ void MediaDecoder::seek(double seconds)
 
     audio_drained_ = !media_info_.has_audio;
     audio_filter_flush_sent_ = false;
+    // 取不早于目标的第一个输出采样，下面的滤镜只处理这个位置及之后的 PCM。
+    const long double first_sample = std::ceil(static_cast<long double>(seconds) * TARGET_SAMPLE_RATE);
+    min_audio_input_pts_ = first_sample < TimestampUpperBound ? static_cast<int64_t>(first_sample) : AV_NOPTS_VALUE;
     last_video_pts_ = seconds;
     has_last_video_pts_ = true;
 

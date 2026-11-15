@@ -189,6 +189,13 @@ void AudioVisualizer::setSpectrumData(const std::vector<float>& spectrum_data)
     }
 }
 
+// 新播放代从静音基线开始，不叠加上一代的平滑值。
+void AudioVisualizer::resetSpectrum()
+{
+    std::fill(spectrum_data_.begin(), spectrum_data_.end(), 0.0f);
+    std::fill(smoothed_data_.begin(), smoothed_data_.end(), 0.0f);
+}
+
 // ============================================================
 // FFT实现 - Cooley-Tukey radix-2 算法
 // ============================================================

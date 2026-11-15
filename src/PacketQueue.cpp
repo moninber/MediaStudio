@@ -1,43 +1,46 @@
 #include "PacketQueue.h"
 
+#include <new>
+#include <utility>
+
+// 新队列可接收入包，消费者在队列为空时等待。
 PacketQueue::PacketQueue()
-    : size_(0)
-    , abort_requested_(false)
+    : abort_requested_(false)
     , finished_(false)
 {
 }
 
-PacketQueue::~PacketQueue()
+// 队列所有者先结束生产者和消费者，再析构并释放余下的包引用。
+PacketQueue::~PacketQueue() = default;
+
+// 由队列或入队中的临时所有者自动释放包引用。
+void PacketQueue::PacketDeleter::operator()(AVPacket* packet) const noexcept
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    clearLocked();
+    av_packet_free(&packet);
 }
 
-bool PacketQueue::push(const AVPacket* packet)
+// 入队复制 FFmpeg 引用，调用方仍可独立释放原包。
+bool PacketQueue::push(const AVPacket* packet, PlaybackEpoch epoch)
 {
     if (!packet) return false;
 
-    AVPacket* copy = av_packet_alloc();
+    std::unique_ptr<AVPacket, PacketDeleter> copy(av_packet_clone(packet));
     if (!copy) return false;
 
-    if (av_packet_ref(copy, packet) < 0) {
-        av_packet_free(&copy);
-        return false;
-    }
-
     std::lock_guard<std::mutex> lock(mutex_);
-    if (abort_requested_ || finished_) {
-        av_packet_free(&copy);
+    if (abort_requested_ || finished_) return false;
+
+    try {
+        packets_.push({std::move(copy), epoch});
+    } catch (const std::bad_alloc&) {
         return false;
     }
-
-    packets_.push(copy);
-    ++size_;
     condition_.notify_one();
     return true;
 }
 
-bool PacketQueue::pop(AVPacket* packet, bool block)
+// 出队时移动引用和对应编号，清空队列不会影响已经出队的包。
+bool PacketQueue::pop(AVPacket* packet, PlaybackEpoch& epoch, bool block)
 {
     if (!packet) return false;
 
@@ -49,11 +52,13 @@ bool PacketQueue::pop(AVPacket* packet, bool block)
 
     if (abort_requested_ || packets_.empty()) return false;
 
-    AVPacket* front = packets_.front();
+    auto front = std::move(packets_.front());
     packets_.pop();
-    --size_;
-    av_packet_move_ref(packet, front);
-    av_packet_free(&front);
+    lock.unlock();
+
+    av_packet_unref(packet);
+    av_packet_move_ref(packet, front.packet.get());
+    epoch = front.epoch;
     return true;
 }
 
@@ -91,7 +96,7 @@ void PacketQueue::finish()
 int PacketQueue::size() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return size_;
+    return static_cast<int>(packets_.size());
 }
 
 bool PacketQueue::isAborted() const
@@ -106,12 +111,10 @@ bool PacketQueue::isFinished() const
     return finished_;
 }
 
+// 删除条目的同时释放 AVPacket，编号不会残留到下一次入队。
 void PacketQueue::clearLocked()
 {
     while (!packets_.empty()) {
-        AVPacket* packet = packets_.front();
         packets_.pop();
-        av_packet_free(&packet);
     }
-    size_ = 0;
 }

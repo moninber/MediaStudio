@@ -34,16 +34,20 @@ set(MEDIASTUDIO_PLAYBACK_SOURCES
     src/MediaDecoder.cpp
 )
 
-set(MEDIASTUDIO_SOURCES
-    src/main.cpp
-    ${MEDIASTUDIO_PLAYBACK_SOURCES}
+set(MEDIASTUDIO_SESSION_SOURCES
     src/AudioOutput.cpp
     src/VideoRenderer.cpp
     src/AudioVisualizer.cpp
-    src/MediaTranscoder.cpp
     src/PacketQueue.cpp
     src/PlayerController.cpp
     src/VideoWidget.cpp
+)
+
+set(MEDIASTUDIO_SOURCES
+    src/main.cpp
+    ${MEDIASTUDIO_PLAYBACK_SOURCES}
+    ${MEDIASTUDIO_SESSION_SOURCES}
+    src/MediaTranscoder.cpp
     src/MainWindow.cpp
 )
 
@@ -178,6 +182,55 @@ if(BUILD_TESTING)
         if(WIN32)
             set_property(TEST MediaStudio.Playback.${test_case} PROPERTY ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:${MEDIASTUDIO_FFMPEG_ROOT}/bin"
+                "PATH=path_list_prepend:${mediastudio_compiler_bin}"
+            )
+        endif()
+    endforeach()
+
+    # 会话用例链接实际控制器和显示控件，离屏提交帧，无需显卡上下文或音频设备。
+    add_executable(MediaStudioSessionTests
+        tests/ControllerTests.cpp
+        tests/RtspBlackhole.cpp
+        ${MEDIASTUDIO_PLAYBACK_SOURCES}
+        ${MEDIASTUDIO_SESSION_SOURCES}
+    )
+    set_target_properties(MediaStudioSessionTests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests"
+    )
+    target_include_directories(MediaStudioSessionTests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${MEDIASTUDIO_FFMPEG_ROOT}/include"
+        "${MEDIASTUDIO_GLEW_ROOT}/include"
+    )
+    target_link_libraries(MediaStudioSessionTests PRIVATE
+        Threads::Threads
+        Qt6::Core Qt6::Gui Qt6::Widgets Qt6::OpenGL Qt6::OpenGLWidgets
+        OpenGL::GL GLEW::GLEW
+        FFmpeg::avcodec FFmpeg::avformat FFmpeg::avutil FFmpeg::avfilter
+        FFmpeg::swresample FFmpeg::swscale
+    )
+    if(WIN32)
+        target_compile_definitions(MediaStudioSessionTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_link_libraries(MediaStudioSessionTests PRIVATE ole32 uuid winmm ws2_32)
+    endif()
+
+    foreach(test_case IN ITEMS controller-local controller-supersede packet-epochs widget-epochs)
+        set(test_name MediaStudio.Session.${test_case})
+        add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
+        set_tests_properties(${test_name} PROPERTIES
+            TIMEOUT 18
+            WORKING_DIRECTORY "$<TARGET_FILE_DIR:MediaStudioSessionTests>"
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        )
+        if(TARGET Qt6::QOffscreenIntegrationPlugin)
+            set_property(TEST ${test_name} APPEND PROPERTY ENVIRONMENT
+                "QT_QPA_PLATFORM_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::QOffscreenIntegrationPlugin>")
+        endif()
+        if(WIN32)
+            set_property(TEST ${test_name} PROPERTY ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:${MEDIASTUDIO_FFMPEG_ROOT}/bin"
+                "PATH=path_list_prepend:${MEDIASTUDIO_GLEW_ROOT}/bin/Release/x64"
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
                 "PATH=path_list_prepend:${mediastudio_compiler_bin}"
             )
         endif()
