@@ -25,6 +25,7 @@
 #include <vector>
 #include <string>
 #include <windows.h>
+#include <objbase.h>
 #include "MainWindow.h"
 
 int main(int argc, char* argv[])

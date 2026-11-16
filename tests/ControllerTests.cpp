@@ -325,6 +325,62 @@ void testControllerSupersede()
     player.shutdown();
 }
 
+// 让已打开的纯视频 RTSP 在读包中欠缺剩余 TCP 数据，验证较早入队的包还能解码和提交。
+void testControllerBlockedRead()
+{
+    VideoWidget widget;
+    RtspBlackhole server(RtspBlackhole::StallAt::VideoReadPacket);
+    PlayerController player;
+    player.setVideoWidget(&widget);
+
+    const auto source = PlaybackSource::networkLive(server.url(), {RtspTransport::Tcp, LivePreset::LowLatency});
+    const auto request = player.requestOpen(source);
+    require(request > 0, "controller did not accept the video request");
+    waitUntil([&] { return server.isHoldingConnection(); }, 2s, "RTSP server did not send its partial record");
+    const auto silence_started = Clock::now();
+
+    PlaybackSnapshot queued;
+    waitUntil([&] {
+        queued = player.getPlaybackSnapshot();
+        return queued.request_id == request && queued.state == PlaybackState::Playing &&
+               queued.media_info.has_video && !queued.media_info.has_audio && queued.stats.video_queue_packets >= 30;
+    }, 1s, "RTSP probe did not complete and queue the video burst");
+    require(server.isHoldingConnection(), "RTSP closed after probing");
+    std::cout << "during_stall_initial_video_queue=" << queued.stats.video_queue_packets
+              << " initial_media_seconds=" << queued.current_seconds << std::endl;
+
+    PlaybackSnapshot progressed;
+    waitUntil([&] {
+        progressed = player.getPlaybackSnapshot();
+        return server.isHoldingConnection() && progressed.request_id == request &&
+               progressed.state == PlaybackState::Playing && !progressed.last_error &&
+               progressed.has_current_video_output && progressed.current_seconds >= queued.current_seconds + 0.5 &&
+               progressed.stats.video_queue_packets + 6 <= queued.stats.video_queue_packets;
+    }, 1600ms, "queued video did not decode and reach the widget while RTSP read remained blocked");
+    const auto progressed_at = Clock::now();
+    std::cout << "during_stall_video_queue=" << progressed.stats.video_queue_packets
+              << " media_seconds=" << progressed.current_seconds
+              << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(progressed_at - silence_started).count()
+              << std::endl;
+
+    // 停止在同一连接仍欠半包时提交，同时检查命令返回、会话退出、对端 socket 被关闭。
+    const auto stop_at = Clock::now();
+    require(player.stopAsync() == request && Clock::now() - stop_at < 500ms,
+            "stop command blocked behind the RTSP read");
+    waitUntil([&] {
+        const auto snapshot = player.getPlaybackSnapshot();
+        return snapshot.request_id == request && snapshot.state == PlaybackState::Idle &&
+               !snapshot.is_playing && !snapshot.has_current_video_output &&
+               !snapshot.last_error && !server.isHoldingConnection();
+    }, 1200ms, "stopping did not cancel the RTSP read and close the session");
+    const auto idle_at = Clock::now();
+    require(idle_at - silence_started < playbackPolicy(source).read_timeout,
+            "RTSP read was released only after the read deadline");
+    std::cout << "blocked_read_stop_to_idle_and_disconnect_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(idle_at - stop_at).count() << '\n';
+    player.shutdown();
+}
+
 // 直接验证两个异步输出入口在三种标签发生变化时拒绝迟到数据。
 void testWidgetEpochs()
 {
@@ -367,8 +423,9 @@ int main(int argc, char* argv[])
         QApplication app(argc, argv);
         if (mode == "controller-local") testControllerLocal();
         else if (mode == "controller-supersede") testControllerSupersede();
+        else if (mode == "controller-blocked-read") testControllerBlockedRead();
         else if (mode == "widget-epochs") testWidgetEpochs();
-        else throw std::runtime_error("expected controller-local, controller-supersede, packet-epochs or widget-epochs");
+        else throw std::runtime_error("unknown session test");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "Session test failed: " << error.what() << '\n';

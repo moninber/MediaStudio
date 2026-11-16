@@ -74,6 +74,20 @@ std::array<unsigned char, 176> pcmuRtp(std::uint16_t sequence)
     return bytes;
 }
 
+// 32x32 白色 YUV420P 的 H.264 Baseline IDR，SPS/PPS 由 SDP 提供，无需运行编码器。
+std::array<unsigned char, 28> h264Rtp(std::uint16_t sequence)
+{
+    const std::uint32_t timestamp = sequence * 3600u;  // 90 kHz 时钟，每帧 40 ms。
+    return {
+        '$', 0, 0, 24, 0x80, 0xe0,
+        static_cast<unsigned char>(sequence >> 8), static_cast<unsigned char>(sequence),
+        static_cast<unsigned char>(timestamp >> 24), static_cast<unsigned char>(timestamp >> 16),
+        static_cast<unsigned char>(timestamp >> 8), static_cast<unsigned char>(timestamp),
+        0x12, 0x34, 0x56, 0x78,
+        0x65, 0x88, 0x84, 0x3a, 0x26, 0x28, 0x00, 0x08, 0xf6, 0x49, 0xd7, 0x5e
+    };
+}
+
 } // namespace
 
 class RtspBlackhole::Impl {
@@ -172,13 +186,25 @@ private:
         }
     }
 
-    // 完成最小 RTSP 握手并送入音频，或收到首条请求后保持连接但不回应。
+    // 纯视频流量小于控制器预读阈值，随后发送半包，使下一次读取等待剩余字节。
+    bool sendVideoThenStall(SOCKET socket)
+    {
+        for (std::uint16_t seq = 1; seq <= 60; ++seq) {
+            const auto packet = h264Rtp(seq);
+            if (!writeAll(socket, {reinterpret_cast<const char*>(packet.data()), packet.size()})) return false;
+        }
+        const auto incomplete = h264Rtp(61);
+        return writeAll(socket, {reinterpret_cast<const char*>(incomplete.data()), 5});
+    }
+
+    // 完成最小 RTSP 握手并提供所选媒体，或收到首条请求后保持 TCP 连接但不回应。
     void serve()
     {
         if (!waitSocket(listener_.handle, true)) return;
         const Socket peer(accept(listener_.handle, nullptr, nullptr));
         if (peer.handle == INVALID_SOCKET) socketError("accept");
         setNonBlocking(peer.handle);
+        const bool video = stall_ == StallAt::VideoReadPacket;
         std::string pending;
         while (!stopping_.load()) {
             const auto request = readRequest(peer.handle, pending);
@@ -197,9 +223,15 @@ private:
             if (method == "OPTIONS") {
                 reply += "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n";
             } else if (method == "DESCRIBE") {
-                const std::string sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n"
-                    "s=MediaStudio CTest\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\na=control:*\r\n"
-                    "m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000/1\r\na=control:trackID=0\r\n";
+                std::string sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n"
+                    "s=MediaStudio CTest\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\na=control:*\r\n";
+                if (video) {
+                    sdp += "m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n"
+                           "a=fmtp:96 packetization-mode=1;sprop-parameter-sets=Z0LACtolsBEAAAMAAQAAAwAyjxImoA==,aM4PyA==\r\n";
+                } else {
+                    sdp += "m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000/1\r\n";
+                }
+                sdp += "a=control:trackID=0\r\n";
                 reply += "Content-Type: application/sdp\r\nContent-Base: " + url_ +
                          "/\r\nContent-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
             } else if (method == "SETUP") {
@@ -211,7 +243,7 @@ private:
                          "Session: 1234abcd;timeout=60\r\n\r\n";
             } else if (method == "PLAY") {
                 reply += "Session: 1234abcd\r\nRTP-Info: url=" + url_ +
-                         "/trackID=0;seq=1;rtptime=160\r\n\r\n";
+                         "/trackID=0;seq=1;rtptime=" + (video ? "3600" : "160") + "\r\n\r\n";
             } else if (method == "TEARDOWN" || method == "GET_PARAMETER") {
                 reply += "Session: 1234abcd\r\n\r\n";
             } else {
@@ -219,10 +251,12 @@ private:
             }
             if (!writeAll(peer.handle, reply) || method == "TEARDOWN") return;
             if (method == "PLAY") {
-                for (std::uint16_t seq = 1; seq <= 96; ++seq) {
-                    const auto packet = pcmuRtp(seq);
-                    if (!writeAll(peer.handle, {reinterpret_cast<const char*>(packet.data()), packet.size()})) {
-                        return;
+                if (video) {
+                    if (!sendVideoThenStall(peer.handle)) return;
+                } else {
+                    for (std::uint16_t seq = 1; seq <= 96; ++seq) {
+                        const auto packet = pcmuRtp(seq);
+                        if (!writeAll(peer.handle, {reinterpret_cast<const char*>(packet.data()), packet.size()})) return;
                     }
                 }
                 // 不送更多 RTP，也不关 socket。read 必须靠客户端中断或期限结束。

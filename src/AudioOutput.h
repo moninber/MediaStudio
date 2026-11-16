@@ -33,15 +33,28 @@
 #include <windows.h>
 #include <mmdeviceapi.h>    // IMMDeviceEnumerator, IMMDevice
 #include <audioclient.h>    // IAudioClient, IAudioRenderClient
-#include <vector>
-#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
-#include <mutex>
+#include <vector>
 
+// 区分 PCM 已提交、部分提交、声卡暂满、命令中断和设备失败。
+enum class AudioWriteResult { Written, Pending, WouldBlock, Interrupted, Error };
+
+// 使用同一次声卡采样计算的已播放时长和待播放时长。
+struct AudioProgress {
+    double played_seconds = 0.0;
+    double queued_seconds = 0.0;
+    bool valid = false;
+};
+
+// 音频工作线程独占对象，从构造、COM 初始化到析构均在同一线程完成。
 class AudioOutput {
 public:
     AudioOutput();
     ~AudioOutput();
+    AudioOutput(const AudioOutput&) = delete;
+    AudioOutput& operator=(const AudioOutput&) = delete;
 
     /**
      * @brief 初始化音频输出设备
@@ -54,39 +67,25 @@ public:
     /** @brief 释放WASAPI资源 */
     void cleanup();
 
-    /**
-     * @brief 播放一段PCM音频数据
-     * @param data PCM音频数据（16位有符号整数格式）
-     * @return true=成功, false=失败
-     * 
-     * 工作流程：
-     * 1. 查询缓冲区可用空间
-     * 2. 请求写入缓冲区
-     * 3. 拷贝PCM数据到缓冲区
-     * 4. 释放缓冲区（提交数据）
-     */
-    bool play(const std::vector<uint8_t>& data, const std::function<bool()>& is_current);
+    // 每次最多提交约 10 ms PCM，只在提交成功后推进帧偏移。调用者在两次写入之间处理命令。
+    // can_write 快速查询当前取消、暂停和代次状态，不等待且不抛异常。
+    AudioWriteResult write(const std::vector<std::uint8_t>& data, std::size_t& offset_frames,
+        const std::function<bool()>& can_write);
 
-    /** @brief 设置音量（0.0~1.0） */
-    void setVolume(float volume);
+    // 用一次 padding 查询生成快照，valid 为 false 代表本次无法采样。
+    AudioProgress sample();
 
-    /** @brief 获取当前音量 */
-    float getVolume() const { return volume_.load(); }
+    // 暂停时保留设备里已提交但尚未播放的 PCM，继续后从剩余位置播放。
+    bool pause();
+    bool resume();
 
-    /** @brief 暂停播放 */
-    void pause();
-
-    /** @brief 恢复播放 */
-    void resume();
-
-    /** @brief 是否正在播放 */
-    bool isPlaying() const { return playing_.load(); }
-
-    double getPlayedSeconds();
-    double getQueuedSeconds();
-    void reset();
+    // 清除设备中的待播放 PCM 和累计帧数，保留当前暂停状态。
+    bool reset();
 
 private:
+    // 调试构建检查所有设备调用来自构造线程。
+    void assertOwnerThread() const noexcept;
+
     // WASAPI COM接口指针
     IMMDeviceEnumerator* device_enumerator_;  // 设备枚举器（用于查找音频设备）
     IMMDevice* device_;                       // 音频端点设备（扬声器/耳机）
@@ -94,18 +93,15 @@ private:
     IAudioRenderClient* render_client_;       // 渲染客户端（写入PCM数据）
 
     // 音频格式参数
-    int sample_rate_;                          // 采样率
-    int channels_;                             // 声道数
-    int bytes_per_sample_;                     // 每采样字节数（16位=2字节）
     WAVEFORMATEX* wave_format_;               // 音频格式描述结构
 
-    // 状态控制（使用原子变量，线程安全）
-    std::atomic<float> volume_;                // 音量
-    std::atomic<bool> playing_;                // 是否正在播放
-    std::atomic<unsigned long long> submitted_frames_;
+    // 状态只由设备所属的音频工作线程访问。
+    bool playing_;
+    bool paused_;
+    std::uint64_t submitted_frames_;
     bool com_initialized_;                     // 是否由本对象初始化了COM
-    UINT32 buffer_frame_count_;                // WASAPI缓冲区帧数（play()中限速用）
-    std::mutex mutex_;                         // 互斥锁（保护WASAPI调用）
-
-    HANDLE audio_event_;                       // 音频事件句柄（用于缓冲区通知）
+    UINT32 buffer_frame_count_;                // 实际 WASAPI 缓冲区帧数
+#ifndef NDEBUG
+    const DWORD owner_thread_id_ = GetCurrentThreadId();
+#endif
 };

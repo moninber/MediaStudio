@@ -20,6 +20,12 @@ namespace {
 thread_local bool suppress_network_ffmpeg_log = false;
 constexpr long double TimestampUpperBound = 0x1p63L;
 
+// 流时间基无效时，解码器继续使用原有的时间戳回退路径。
+bool hasValidTimeBase(AVRational time_base) noexcept
+{
+    return time_base.num > 0 && time_base.den > 0;
+}
+
 // 网络封装 I/O 在调用线程执行，禁止其输出可能包含 URL 的自由文本。
 // 本地文件和转码仍走 FFmpeg 默认日志；独立协议库的异步日志不经过此线程作用域。
 void ffmpegLogCallback(void* context, int level, const char* format, va_list args)
@@ -317,6 +323,14 @@ MediaOpenResult MediaDecoder::open(const PlaybackSource& source, std::shared_ptr
         return fail({MediaOpenStatus::Cancelled, AVERROR_EXIT, MediaOpenStage::InitializeDecoders});
     }
 
+    // 在启动解码线程之前复制时间基，读包即使修改格式上下文也不影响解码线程访问。
+    if (video_stream_index_ >= 0) {
+        video_time_base_ = format_ctx_->streams[video_stream_index_]->time_base;
+    }
+    if (audio_stream_index_ >= 0) {
+        audio_time_base_ = format_ctx_->streams[audio_stream_index_]->time_base;
+    }
+
     std::cout << "[MediaDecoder] 媒体打开成功: " << source.displayName() << std::endl;
     if (media_info_.has_video) {
         std::cout << "  视频: " << media_info_.video_info.width << "x"
@@ -375,6 +389,8 @@ void MediaDecoder::close()
 
     video_stream_index_ = -1;
     audio_stream_index_ = -1;
+    video_time_base_ = {0, 1};
+    audio_time_base_ = {0, 1};
     current_time_ = 0.0;
     playback_speed_ = 1.0f;
     media_info_ = MediaInfo();  // 重置媒体信息
@@ -642,14 +658,16 @@ MediaReadResult MediaDecoder::readPacketResult(AVPacket* packet)
     }
 }
 
+// 读包线程按打开时选定的流索引分流。
 bool MediaDecoder::isVideoPacket(const AVPacket* packet) const
 {
-    return packet && video_codec_ctx_ && packet->stream_index == video_stream_index_;
+    return packet && video_stream_index_ >= 0 && packet->stream_index == video_stream_index_;
 }
 
+// 音频初始化失败时索引为 -1，读包线程跳过这一路。
 bool MediaDecoder::isAudioPacket(const AVPacket* packet) const
 {
-    return packet && audio_codec_ctx_ && packet->stream_index == audio_stream_index_;
+    return packet && audio_stream_index_ >= 0 && packet->stream_index == audio_stream_index_;
 }
 
 bool MediaDecoder::decodeVideoPacket(const AVPacket* packet, std::vector<DecodedFrame>& out_frames)
@@ -786,7 +804,7 @@ void MediaDecoder::receiveAudioFrames(std::vector<DecodedFrame>& out_frames)
 }
 
 // ============================================================
-// 转换视频帧
+// 转换视频帧，使用打开时缓存的时间基计算 PTS。
 // ============================================================
 bool MediaDecoder::convertVideoFrame(AVFrame* frame, DecodedFrame& out_frame)
 {
@@ -802,8 +820,8 @@ bool MediaDecoder::convertVideoFrame(AVFrame* frame, DecodedFrame& out_frame)
         ? media_info_.video_info.frame_rate
         : 25.0;
     double pts = 0.0;
-    if (ts != AV_NOPTS_VALUE) {
-        pts = ts * av_q2d(format_ctx_->streams[video_stream_index_]->time_base);
+    if (ts != AV_NOPTS_VALUE && hasValidTimeBase(video_time_base_)) {
+        pts = ts * av_q2d(video_time_base_);
         if (!media_info_.has_audio && has_last_video_pts_ && pts <= last_video_pts_) {
             pts = last_video_pts_ + 1.0 / fps;
         }
@@ -896,7 +914,7 @@ bool MediaDecoder::convertVideoFrame(AVFrame* frame, DecodedFrame& out_frame)
 }
 
 // ============================================================
-// 转换音频帧
+// 转换音频帧，使用缓存的时间基建立直出和 atempo 的时间戳。
 // ============================================================
 bool MediaDecoder::convertAudioFrame(AVFrame* frame, DecodedFrame& out_frame)
 {
@@ -962,7 +980,7 @@ bool MediaDecoder::convertAudioFrame(AVFrame* frame, DecodedFrame& out_frame)
         out_frame.data = output_buffer;
         out_frame.samples = converted_samples;
         out_frame.data_size = data_size;
-        out_frame.pts = getFrameTimestampSeconds(frame, audio_stream_index_);
+        out_frame.pts = getFrameTimestampSeconds(frame, audio_time_base_);
         current_time_ = out_frame.pts;
 
         av_channel_layout_uninit(&resampled_frame->ch_layout);
@@ -974,11 +992,10 @@ bool MediaDecoder::convertAudioFrame(AVFrame* frame, DecodedFrame& out_frame)
     if (src_ts == AV_NOPTS_VALUE) src_ts = frame->pts;
     if (src_ts == AV_NOPTS_VALUE) src_ts = frame->pkt_dts;
     resampled_frame->pts = AV_NOPTS_VALUE;
-    if (src_ts != AV_NOPTS_VALUE) {
-        const AVRational stream_time_base = format_ctx_->streams[audio_stream_index_]->time_base;
+    if (src_ts != AV_NOPTS_VALUE && hasValidTimeBase(audio_time_base_)) {
         const AVRational sample_time_base{1, TARGET_SAMPLE_RATE};
         const auto rounding = min_audio_input_pts_ == AV_NOPTS_VALUE ? AV_ROUND_NEAR_INF : AV_ROUND_DOWN;
-        const auto pts = av_rescale_q_rnd(src_ts, stream_time_base, sample_time_base, rounding);
+        const auto pts = av_rescale_q_rnd(src_ts, audio_time_base_, sample_time_base, rounding);
         if (pts > AV_NOPTS_VALUE + output_delay) {
             resampled_frame->pts = pts - output_delay;
         }
@@ -1027,7 +1044,7 @@ bool MediaDecoder::seek(double seconds)
 
     // 向下取整到流的时间单位，并检查整数范围，避免超大目标溢出。
     const AVRational time_base = format_ctx_->streams[seek_stream_index]->time_base;
-    if (time_base.num <= 0 || time_base.den <= 0) {
+    if (!hasValidTimeBase(time_base)) {
         return false;
     }
     const long double ticks = static_cast<long double>(seconds) * time_base.den / time_base.num;
@@ -1046,7 +1063,7 @@ bool MediaDecoder::seek(double seconds)
 // 清除旧解码状态；无法重定位的本地源也可从当前位置切换播放速度。
 void MediaDecoder::flushAfterDiscontinuity(double seconds)
 {
-    if (!format_ctx_ || !std::isfinite(seconds) || seconds < 0.0) {
+    if ((!video_codec_ctx_ && !audio_codec_ctx_) || !std::isfinite(seconds) || seconds < 0.0) {
         return;
     }
     if (video_codec_ctx_) {
@@ -1074,9 +1091,10 @@ void MediaDecoder::flushAfterDiscontinuity(double seconds)
     current_time_ = seconds;
 }
 
-double MediaDecoder::getFrameTimestampSeconds(AVFrame* frame, int stream_index) const
+// 用调用方的时间基换算已解码帧，缺少有效时间戳时沿用当前媒体时间。
+double MediaDecoder::getFrameTimestampSeconds(const AVFrame* frame, AVRational time_base) const
 {
-    if (!frame || !format_ctx_ || stream_index < 0 || stream_index >= (int)format_ctx_->nb_streams) {
+    if (!frame || !hasValidTimeBase(time_base)) {
         return current_time_.load();
     }
 
@@ -1085,7 +1103,7 @@ double MediaDecoder::getFrameTimestampSeconds(AVFrame* frame, int stream_index) 
     if (ts == AV_NOPTS_VALUE) ts = frame->pkt_dts;
     if (ts == AV_NOPTS_VALUE) return current_time_.load();
 
-    return ts * av_q2d(format_ctx_->streams[stream_index]->time_base);
+    return ts * av_q2d(time_base);
 }
 
 // ============================================================

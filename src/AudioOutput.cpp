@@ -5,46 +5,59 @@
 
 #include "AudioOutput.h"
 #include <iostream>
-#include <thread>
-#include <chrono>
+#include <cassert>
+#include <cstring>
+#include <limits>
 #include <mmreg.h>      // WAVE_FORMAT_PCM等常量定义
 #include <algorithm>    // std::min, std::max
 
+// 初始化拥有资源的状态，设备在音频线程调用 init 后才打开。
 AudioOutput::AudioOutput()
     : device_enumerator_(nullptr)
     , device_(nullptr)
     , audio_client_(nullptr)
     , render_client_(nullptr)
-    , sample_rate_(0)
-    , channels_(0)
-    , bytes_per_sample_(2)  // 16位PCM = 2字节
     , wave_format_(nullptr)
-    , volume_(1.0f)
     , playing_(false)
+    , paused_(false)
     , submitted_frames_(0)
     , com_initialized_(false)
     , buffer_frame_count_(0)
-    , audio_event_(nullptr)
 {
 }
 
+// 析构时在设备所属线程关闭 WASAPI 和 COM，也处理部分初始化失败。
 AudioOutput::~AudioOutput()
 {
     cleanup();
 }
 
+void AudioOutput::assertOwnerThread() const noexcept
+{
+    assert(owner_thread_id_ == GetCurrentThreadId());
+}
+
+// 使用原有共享模式 16 位 PCM 和缓冲请求，在工作线程初始化 COM 与设备。
 bool AudioOutput::init(int sample_rate, int channels)
 {
     cleanup();
 
-    sample_rate_ = sample_rate;
-    channels_ = channels;
-    submitted_frames_.store(0);
+    constexpr unsigned int bytes_per_sample = 2;
+    if (sample_rate <= 0 || channels <= 0 ||
+        static_cast<unsigned int>(channels) > std::numeric_limits<WORD>::max() / bytes_per_sample ||
+        static_cast<std::uint64_t>(sample_rate) * channels * bytes_per_sample > std::numeric_limits<DWORD>::max()) {
+        std::cerr << "[AudioOutput] PCM 格式参数无效" << std::endl;
+        return false;
+    }
 
     // 后台线程需要自己初始化COM（WASAPI是COM对象）
     // COINIT_MULTITHREADED适合后台工作线程
-    HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    com_initialized_ = SUCCEEDED(com_hr) || com_hr == S_FALSE;
+    const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(com_hr)) {
+        std::cerr << "[AudioOutput] 初始化 COM 失败 (hr=0x" << std::hex << com_hr << std::dec << ")" << std::endl;
+        return false;
+    }
+    com_initialized_ = true;
 
     // --------------------------------------------------------
     // 步骤1：创建设备枚举器
@@ -97,8 +110,8 @@ bool AudioOutput::init(int sample_rate, int channels)
     // --------------------------------------------------------
     WAVEFORMATEX desired_format = {};
     desired_format.wFormatTag = WAVE_FORMAT_PCM;
-    desired_format.nChannels = channels_;
-    desired_format.nSamplesPerSec = sample_rate_;
+    desired_format.nChannels = static_cast<WORD>(channels);
+    desired_format.nSamplesPerSec = static_cast<DWORD>(sample_rate);
     desired_format.wBitsPerSample = 16;
     desired_format.nBlockAlign = (desired_format.wBitsPerSample / 8) * desired_format.nChannels;
     desired_format.nAvgBytesPerSec = desired_format.nSamplesPerSec * desired_format.nBlockAlign;
@@ -137,7 +150,7 @@ bool AudioOutput::init(int sample_rate, int channels)
     // 分配音频缓冲区，指定缓冲持续时间
     // REFERENCE_TIME单位：100纳秒（1秒 = 10,000,000 × 100ns）
     // --------------------------------------------------------
-    REFERENCE_TIME buffer_duration = 3500000; // 0.35秒缓冲（降低单线程同步等待导致的音频饿死风险）
+    REFERENCE_TIME buffer_duration = 3500000; // 保留原有的 0.35 秒共享模式缓冲请求。
     DWORD stream_flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
     hr = audio_client_->Initialize(
         AUDCLNT_SHAREMODE_SHARED,  // 共享模式（与其他应用共享设备）
@@ -163,25 +176,30 @@ bool AudioOutput::init(int sample_rate, int channels)
         return false;
     }
 
-    bytes_per_sample_ = wave_format_->wBitsPerSample / 8;
-
     // 获取实际分配的缓冲区大小
     hr = audio_client_->GetBufferSize(&buffer_frame_count_);
-    if (FAILED(hr)) buffer_frame_count_ = 0;
+    if (FAILED(hr) || buffer_frame_count_ == 0) {
+        std::cerr << "[AudioOutput] 无法取得音频缓冲区大小" << std::endl;
+        return false;
+    }
 
-    std::cout << "[AudioOutput] 初始化成功: " << sample_rate_ << "Hz, "
-              << channels_ << "ch, 16bit, buf=" << buffer_frame_count_ << "frames" << std::endl;
+    std::cout << "[AudioOutput] 初始化成功: " << sample_rate << "Hz, "
+              << channels << "ch, 16bit, buf=" << buffer_frame_count_ << "frames" << std::endl;
     return true;
 }
 
+// 停止设备后依次释放 COM 接口和格式，再平衡本线程的 CoInitializeEx。
 void AudioOutput::cleanup()
 {
+    assertOwnerThread();
     // 停止播放
-    if (audio_client_) {
+    if (audio_client_ && playing_) {
         audio_client_->Stop();
     }
-    playing_.store(false);
-    submitted_frames_.store(0);
+    playing_ = false;
+    paused_ = false;
+    submitted_frames_ = 0;
+    buffer_frame_count_ = 0;
 
     // 释放COM接口（调用Release()减少引用计数）
     // 释放顺序：后获取的先释放
@@ -208,11 +226,6 @@ void AudioOutput::cleanup()
         wave_format_ = nullptr;
     }
 
-    if (audio_event_) {
-        CloseHandle(audio_event_);
-        audio_event_ = nullptr;
-    }
-
     // 平衡COM初始化
     if (com_initialized_) {
         CoUninitialize();
@@ -220,123 +233,98 @@ void AudioOutput::cleanup()
     }
 }
 
-bool AudioOutput::play(const std::vector<uint8_t>& data, const std::function<bool()>& is_current)
+// 尝试提交一个有界片段，把是否继续等待以及如何处理中断交给音频工作线程。
+AudioWriteResult AudioOutput::write(const std::vector<std::uint8_t>& data, std::size_t& offset_frames,
+    const std::function<bool()>& can_write)
 {
-    if (!wave_format_) return false;
-
-    UINT32 total_frames = (UINT32)(data.size() / wave_format_->nBlockAlign);
-    if (total_frames == 0) return true;
-
-    UINT32 written_frames = 0;
-    int idle_retry = 0;
-
-    while (written_frames < total_frames) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            // 每轮缓冲写入都检查取消和代次，刷新声卡后旧 PCM 不能再次提交。
-            if (!is_current() || !audio_client_ || !render_client_) return false;
-
-            UINT32 num_padding_frames = 0;
-            HRESULT hr = audio_client_->GetCurrentPadding(&num_padding_frames);
-            if (FAILED(hr)) return false;
-
-            UINT32 num_available = (buffer_frame_count_ > num_padding_frames)
-                ? (buffer_frame_count_ - num_padding_frames)
-                : 0;
-            UINT32 remaining_frames = total_frames - written_frames;
-            UINT32 to_write = std::min(num_available, remaining_frames);
-
-            if (to_write > 0) {
-                BYTE* data_ptr = nullptr;
-                hr = render_client_->GetBuffer(to_write, &data_ptr);
-                if (FAILED(hr)) return false;
-
-                const uint8_t* src = data.data() + written_frames * wave_format_->nBlockAlign;
-                memcpy(data_ptr, src, to_write * wave_format_->nBlockAlign);
-
-                hr = render_client_->ReleaseBuffer(to_write, 0);
-                if (FAILED(hr)) return false;
-
-                if (!playing_) {
-                    hr = audio_client_->Start();
-                    if (FAILED(hr)) return false;
-                    playing_.store(true);
-                }
-
-                submitted_frames_.fetch_add(to_write);
-                written_frames += to_write;
-                idle_retry = 0;
-                continue;
-            }
-        }
-
-        if (++idle_retry > 200) {
-            return false;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    assertOwnerThread();
+    if (!audio_client_ || !render_client_ || !wave_format_ || buffer_frame_count_ == 0) {
+        return AudioWriteResult::Error;
     }
+    if (paused_ || (can_write && !can_write())) return AudioWriteResult::Interrupted;
 
+    const auto block_align = wave_format_->nBlockAlign;
+    const auto total_frames = data.size() / block_align;
+    if (data.size() % block_align != 0 || offset_frames > total_frames) return AudioWriteResult::Error;
+    if (offset_frames == total_frames) return AudioWriteResult::Written;
+
+    UINT32 padding = 0;
+    if (FAILED(audio_client_->GetCurrentPadding(&padding))) return AudioWriteResult::Error;
+    if (padding >= buffer_frame_count_) return AudioWriteResult::WouldBlock;
+
+    const auto max_chunk_frames = std::max<DWORD>(1, wave_format_->nSamplesPerSec / 100);
+    const auto frames = static_cast<UINT32>(std::min<std::size_t>({
+        buffer_frame_count_ - padding, max_chunk_frames, total_frames - offset_frames}));
+    BYTE* destination = nullptr;
+    if (FAILED(render_client_->GetBuffer(frames, &destination))) return AudioWriteResult::Error;
+    if (!destination) {
+        render_client_->ReleaseBuffer(0, 0);
+        return AudioWriteResult::Error;
+    }
+    std::memcpy(destination, data.data() + offset_frames * block_align,
+                static_cast<std::size_t>(frames) * block_align);
+    // 共享模式允许用零帧归还尚未提交的缓冲。代次或暂停在拷贝期间变化时，帧偏移保持不变。
+    if (can_write && !can_write()) {
+        return SUCCEEDED(render_client_->ReleaseBuffer(0, 0)) ? AudioWriteResult::Interrupted : AudioWriteResult::Error;
+    }
+    if (FAILED(render_client_->ReleaseBuffer(frames, 0))) return AudioWriteResult::Error;
+
+    offset_frames += frames;
+    submitted_frames_ += frames;
+    if (!playing_) {
+        if (FAILED(audio_client_->Start())) return AudioWriteResult::Error;
+        playing_ = true;
+    }
+    return offset_frames == total_frames ? AudioWriteResult::Written : AudioWriteResult::Pending;
+}
+
+// 只读取一次 padding，确保时钟与缓冲统计描述同一个设备时刻。
+AudioProgress AudioOutput::sample()
+{
+    assertOwnerThread();
+    if (!audio_client_ || !wave_format_ || buffer_frame_count_ == 0) return {};
+    UINT32 padding = 0;
+    if (FAILED(audio_client_->GetCurrentPadding(&padding))) return {};
+
+    const auto played = submitted_frames_ > padding ? submitted_frames_ - padding : 0;
+    const double sample_rate = wave_format_->nSamplesPerSec;
+    return {played / sample_rate, padding / sample_rate, true};
+}
+
+// 清空声卡待播帧后清零时钟，等待线程下一次提交有效 PCM 时重新启动设备。
+bool AudioOutput::reset()
+{
+    assertOwnerThread();
+    if (!audio_client_) return false;
+    if (playing_ && FAILED(audio_client_->Stop())) return false;
+    playing_ = false;
+    if (FAILED(audio_client_->Reset())) return false;
+    submitted_frames_ = 0;
     return true;
 }
 
-double AudioOutput::getQueuedSeconds()
+// Stop 暂停音频引擎，保留已排队数据和累计提交帧，继续时复用原时钟。
+bool AudioOutput::pause()
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!audio_client_ || !wave_format_ || wave_format_->nSamplesPerSec == 0) return 0.0;
-
-    UINT32 padding_frames = 0;
-    HRESULT hr = audio_client_->GetCurrentPadding(&padding_frames);
-    if (FAILED(hr)) return 0.0;
-
-    return static_cast<double>(padding_frames) / wave_format_->nSamplesPerSec;
+    assertOwnerThread();
+    if (!audio_client_) return false;
+    if (paused_) return true;
+    if (playing_ && FAILED(audio_client_->Stop())) return false;
+    playing_ = false;
+    paused_ = true;
+    return true;
 }
 
-double AudioOutput::getPlayedSeconds()
+// 恢复已经提交的 PCM。空设备在下一次有效写入时再启动。
+bool AudioOutput::resume()
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!audio_client_ || !wave_format_ || wave_format_->nSamplesPerSec == 0) return 0.0;
-
-    UINT32 padding_frames = 0;
-    HRESULT hr = audio_client_->GetCurrentPadding(&padding_frames);
-    if (FAILED(hr)) return 0.0;
-
-    unsigned long long submitted = submitted_frames_.load();
-    unsigned long long padding = padding_frames;
-    unsigned long long played = submitted > padding ? submitted - padding : 0;
-    return static_cast<double>(played) / wave_format_->nSamplesPerSec;
-}
-
-void AudioOutput::reset()
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (audio_client_) {
-        audio_client_->Stop();
-        audio_client_->Reset();
-    }
-    playing_.store(false);
-    submitted_frames_.store(0);
-}
-
-void AudioOutput::setVolume(float volume)
-{
-    volume_.store(std::max(0.0f, std::min(1.0f, volume)));
-}
-
-void AudioOutput::pause()
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (audio_client_ && playing_) {
-        audio_client_->Stop();
-        playing_.store(false);
-    }
-}
-
-void AudioOutput::resume()
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (audio_client_ && !playing_) {
-        audio_client_->Start();
+    assertOwnerThread();
+    if (!audio_client_) return false;
+    if (!paused_) return true;
+    if (submitted_frames_ != 0) {
+        if (FAILED(audio_client_->Start())) return false;
         playing_ = true;
     }
+    paused_ = false;
+    return true;
 }

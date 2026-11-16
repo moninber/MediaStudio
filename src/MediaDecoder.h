@@ -132,9 +132,9 @@ private:
     bool initAudioFilterGraph();
     void destroyAudioFilterGraph();
     std::string buildAtempoFilterChain(float speed) const;
-    double getFrameTimestampSeconds(AVFrame* frame, int stream_index) const;
+    double getFrameTimestampSeconds(const AVFrame* frame, AVRational time_base) const;
 
-    AVFormatContext* format_ctx_;     // 封装格式上下文（管理文件读取）
+    AVFormatContext* format_ctx_;     // 由 supervisor 独占，解码线程不访问 AVStream。
     std::shared_ptr<MediaIoControl> io_; // FFmpeg 回调使用的对象，在关闭封装后释放。
     std::chrono::milliseconds read_timeout_{0};
     bool network_input_ = false;
@@ -149,6 +149,9 @@ private:
 
     int video_stream_index_;         // 视频流索引（-1=无视频流）
     int audio_stream_index_;         // 音频流索引（-1=无音频流）
+    // 打开时按值复制，整个解码会话只读，等解码线程退出后再清除。
+    AVRational video_time_base_{0, 1};
+    AVRational audio_time_base_{0, 1};
 
     std::atomic<double> current_time_;            // 当前播放时间（秒）
     float playback_speed_;

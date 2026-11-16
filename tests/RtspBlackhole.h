@@ -6,7 +6,7 @@
 // 只在回环地址提供一次 RTSP/TCP 会话；可在打开握手或成功送包后阻塞。
 class RtspBlackhole {
 public:
-    enum class StallAt { ReadPacket, OpenInput };
+    enum class StallAt { ReadPacket, OpenInput, VideoReadPacket };
 
     // 默认先完成握手并提供有效音频，保留读包取消测试的行为。
     explicit RtspBlackhole(StallAt stall = StallAt::ReadPacket);

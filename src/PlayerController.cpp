@@ -1,11 +1,13 @@
 #include "PlayerController.h"
 #include "VideoWidget.h"
 #include "AudioVisualizer.h"
+#include "AudioOutput.h"
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <future>
 #include <iostream>
 #include <utility>
 
@@ -246,22 +248,11 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
 {
     if (request.io->isCancelled()) return {};
     const bool local_file = request.source.kind() == PlaybackSourceKind::LocalFile;
-    bool audio_ready = false;
-    if (decoder_.hasAudio()) {
-        audio_ready = audio_output_.init(decoder_.getOutputAudioSampleRate(), decoder_.getOutputAudioChannels());
-        if (!audio_ready) {
-            std::cerr << "[Player] 音频输出初始化失败" << std::endl;
-            audio_output_.cleanup();
-        }
-    }
     const bool use_video = decoder_.hasVideo();
-    if (!audio_ready && !use_video) return MediaReadResult{MediaReadStatus::Error, AVERROR(EIO)};
 
     std::atomic<float> active_speed(local_file ? speed_.load() : 1.0f);
     decoder_.setPlaybackSpeed(active_speed.load());
     std::atomic<bool> speed_change_pending(false);
-    std::atomic<bool> audio_clock_active(false);
-    std::atomic<double> audio_clock_base(0.0);
     std::atomic<double> min_valid_pts(-1.0);
     std::atomic<std::uint64_t> stream_generation(request.epoch.generation);
     std::atomic<std::uint64_t> audio_drained(0);
@@ -269,6 +260,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
     std::atomic<bool> reconfiguring(false);
     std::atomic<bool> workers_done(false);
     std::atomic<bool> worker_allocation_failed(false);
+    std::atomic<int> audio_error(0);
 
     auto epoch_now = [&] {
         return PlaybackEpoch{request.epoch.request_id, request.epoch.connection_attempt_id, stream_generation.load()};
@@ -283,32 +275,30 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
     };
 
     using Clock = std::chrono::steady_clock;
-    const auto sample_interval = std::chrono::duration_cast<Clock::duration>(100ms).count();
-    std::atomic<Clock::rep> next_audio_sample(0);
-    auto sample_audio_buffer = [&] {
-        if (!audio_ready) return;
-        const auto now = Clock::now().time_since_epoch().count();
-        auto next = next_audio_sample.load();
-        if (now < next || !next_audio_sample.compare_exchange_strong(next, now + sample_interval)) return;
-        const auto epoch = epoch_now();
-        const double queued = audio_output_.getQueuedSeconds();
-        publish(epoch, [&] { snapshot_.stats.audio_buffer_seconds = queued; });
+    struct AudioClockSample {
+        PlaybackEpoch epoch;
+        std::optional<double> position;
+        double queued_seconds = 0.0;
+        bool tail_drained = false;
     };
-    auto audio_clock = [&] {
-        return audio_clock_base.load() + audio_output_.getPlayedSeconds() * active_speed.load();
+    // 音频线程从声卡采样后整体发布，视频/解复用线程只读取匹配代次的副本。
+    AudioClockSample audio_clock;
+    auto read_audio_clock = [&](PlaybackEpoch epoch) {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        return audio_clock.epoch == epoch ? audio_clock : AudioClockSample{};
     };
 
     // 成功出队后的帧沿用该包的完整标签。EOF 刷新则使用调用 flush 之前捕获的标签。
     auto consume = [&](PacketQueue& queue, std::atomic<std::uint64_t>& drained,
-                       auto decode, auto flush, const auto& ready, const auto& output) {
+                       auto decode, auto flush, bool blocking_pop, const auto& ready, const auto& output) {
         AVPacket* packet = av_packet_alloc();
         if (!packet) {
             worker_allocation_failed = true;
             return;
         }
-        while (running()) {
+        while (running() && !audio_error) {
             auto epoch = epoch_now();
-            if (!is_current(epoch) || !ready()) {
+            if (!ready(epoch) || !is_current(epoch)) {
                 std::this_thread::sleep_for(5ms);
                 continue;
             }
@@ -317,12 +307,15 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                 continue;
             }
 
-            const bool has_packet = queue.pop(packet, epoch, true);
-            if (!has_packet && (!queue.isFinished() || queue.isAborted() || !running())) continue;
+            const bool has_packet = queue.pop(packet, epoch, blocking_pop);
+            if (!has_packet && (!queue.isFinished() || queue.isAborted() || !running())) {
+                if (!blocking_pop) std::this_thread::sleep_for(5ms);
+                continue;
+            }
             std::vector<DecodedFrame> frames;
             bool flushed = false;
             {
-                std::lock_guard<std::mutex> lock(seek_mutex_);
+                std::lock_guard<std::mutex> lock(codec_mutex_);
                 if (is_current(epoch)) {
                     if (has_packet) (decoder_.*decode)(packet, frames);
                     else {
@@ -343,25 +336,88 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
     };
 
     std::thread audio_worker;
-    if (audio_ready) {
-        audio_worker = std::thread([&] {
+    bool audio_ready = false;
+    if (decoder_.hasAudio()) {
+        std::promise<bool> initialized;
+        auto audio_init = initialized.get_future();
+        audio_worker = std::thread([&, init = std::move(initialized)]() mutable {
+            // 声卡对象和 COM 生命周期都在音频线程，退出此作用域即关闭。
+            AudioOutput device;
+            const int sample_rate = decoder_.getOutputAudioSampleRate();
+            const int channels = decoder_.getOutputAudioChannels();
+            const bool opened = running() && device.init(sample_rate, channels);
+            init.set_value(opened);
+            if (!opened) return;
+
             AudioVisualizer fft;
             fft.init(64, false);
-            std::uint64_t spectrum_generation = 0;
+            std::uint64_t device_generation = request.epoch.generation;
+            std::optional<double> clock_base;
+            auto last_sample_at = Clock::now() - 8ms;
             bool device_paused = false;
-            auto ready = [&] {
+            std::optional<double> tail_seconds_left;
+
+            auto fail_audio = [&](int code, const char* message) {
+                std::cerr << "[Player] " << message << std::endl;
+                audio_error = AVERROR(code);
+            };
+            auto sample_device = [&](PlaybackEpoch epoch, bool force) {
+                const auto now = Clock::now();
+                if (!force && now - last_sample_at < 8ms) return;
+                const double elapsed = std::chrono::duration<double>(now - last_sample_at).count();
+                last_sample_at = now;
+                const auto progress = device.sample();
+                if (!progress.valid) {
+                    fail_audio(EIO, "无法读取声卡进度");
+                    return;
+                }
+
+                AudioClockSample sample{epoch, {}, progress.queued_seconds, false};
+                if (clock_base) sample.position = *clock_base + progress.played_seconds * active_speed.load();
+                if (audio_drained == epoch.generation) {
+                    sample.tail_drained = progress.queued_seconds <= 0.005;
+                    if (!tail_seconds_left) tail_seconds_left = std::min(3.0, progress.queued_seconds + 1.0);
+                    else if (!device_paused) *tail_seconds_left -= elapsed;
+                    if (!sample.tail_drained && *tail_seconds_left <= 0.0 && is_current(epoch)) {
+                        fail_audio(ETIMEDOUT, "等待声卡尾音超时");
+                    }
+                }
+                publish(epoch, [&] {
+                    audio_clock = sample;
+                    snapshot_.stats.audio_buffer_seconds = sample.queued_seconds;
+                    if (sample.position && !paused_) current_time_ = *sample.position;
+                });
+            };
+            auto ready = [&](PlaybackEpoch epoch) {
+                if (!running() || audio_error) return false;
+                // 看到新代次后，先清除旧 padding，再允许这次的 PCM 写入。
+                if (is_current(epoch) && device_generation != epoch.generation) {
+                    if (!device.reset()) {
+                        fail_audio(EIO, "声卡重置失败");
+                        return false;
+                    }
+                    device_generation = epoch.generation;
+                    clock_base.reset();
+                    tail_seconds_left.reset();
+                    fft.resetSpectrum();
+                }
+
                 const bool paused = paused_.load();
                 if (paused != device_paused) {
-                    if (paused) audio_output_.pause();
-                    else audio_output_.resume();
+                    const bool updated = paused ? device.pause() : device.resume();
+                    if (!updated) {
+                        fail_audio(EIO, "无法更新声卡暂停状态");
+                        return false;
+                    }
                     device_paused = paused;
                 }
-                return !paused && !speed_change_pending;
+                if (!is_current(epoch)) return false;
+                sample_device(epoch, false);
+                return !paused && !speed_change_pending && !audio_error;
             };
 
             auto output = [&](DecodedFrame& frame, PlaybackEpoch epoch) {
                 if (!frame.data || frame.data_size <= 0) return;
-                const int sample_rate = decoder_.getOutputAudioSampleRate();
                 const double target = min_valid_pts.load();
                 int trim_bytes = 0;
                 double effective_pts = frame.pts;
@@ -381,41 +437,54 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                     }
                 }
 
-                while (is_current(epoch) && !speed_change_pending && !ready()) {
-                    std::this_thread::sleep_for(5ms);
-                }
-                if (!is_current(epoch) || speed_change_pending) return;
-                const bool written = audio_output_.play(pcm, [&] { return is_current(epoch) && !speed_change_pending; });
-                if (!written) {
-                    if (is_current(epoch) && !speed_change_pending) {
-                        std::cerr << "[Player] 音频写入失败: " << frame.data_size << " bytes" << std::endl;
+                // 暂停保留本帧的 PCM 写入偏移。停止、切源或换代使此帧失效。
+                std::size_t offset = 0;
+                auto last_write = Clock::now();
+                const auto can_write = [&] { return is_current(epoch) && !paused_ && !speed_change_pending; };
+                while (running() && !audio_error && epoch == epoch_now()) {
+                    if (!ready(epoch) || !can_write()) {
+                        last_write = Clock::now();
+                        std::this_thread::sleep_for(5ms);
+                        continue;
                     }
-                    return;
+                    const auto previous_offset = offset;
+                    const auto result = device.write(pcm, offset, can_write);
+                    if (offset > previous_offset) {
+                        last_write = Clock::now();
+                        if (!clock_base) {
+                            clock_base = std::max(effective_pts, target);
+                            sample_device(epoch, true);
+                        }
+                    }
+                    if (result == AudioWriteResult::Written) break;
+                    if (result == AudioWriteResult::Error) {
+                        fail_audio(EIO, "PCM 写入失败");
+                        return;
+                    }
+                    if (result == AudioWriteResult::WouldBlock && Clock::now() - last_write >= 1s) {
+                        fail_audio(ETIMEDOUT, "等待声卡缓冲空间超时");
+                        return;
+                    }
+                    if (result != AudioWriteResult::Pending) std::this_thread::sleep_for(5ms);
                 }
 
-                if (video && show_visualizer_ && is_current(epoch)) {
-                    if (spectrum_generation != epoch.generation) {
-                        fft.resetSpectrum();
-                        spectrum_generation = epoch.generation;
-                    }
-                    fft.processAudioData(pcm.data(), static_cast<int>(pcm.size()),
-                        decoder_.getOutputAudioChannels(), sample_rate);
+                if (video && show_visualizer_ && can_write() && !audio_error) {
+                    fft.processAudioData(pcm.data(), static_cast<int>(pcm.size()), channels, sample_rate);
                     video->setSpectrumData(epoch, fft.getSpectrumData());
                 }
-                const double played = audio_output_.getPlayedSeconds();
-                publish(epoch, [&] {
-                    if (!audio_clock_active) {
-                        audio_clock_base = std::max(effective_pts, target);
-                        audio_clock_active = true;
-                    }
-                    if (!paused_) current_time_ = audio_clock_base.load() + played * active_speed.load();
-                });
             };
 
             consume(audio_packets_, audio_drained, &MediaDecoder::decodeAudioPacket,
-                &MediaDecoder::flushAudioDecoder, ready, output);
+                &MediaDecoder::flushAudioDecoder, false, ready, output);
         });
+        // 只在 supervisor 等待初始化结果。窗口线程仍能发布停止或新请求。
+        audio_ready = audio_init.get();
+        if (!audio_ready) {
+            audio_worker.join();
+            if (running()) std::cerr << "[Player] 音频输出初始化失败" << std::endl;
+        }
     }
+    if (!audio_ready && !use_video) return MediaReadResult{MediaReadStatus::Error, AVERROR(EIO)};
 
     std::thread video_worker;
     if (use_video) {
@@ -430,7 +499,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                 playback_anchor = Clock::now();
                 anchor_pts = current_time_.load();
             };
-            auto ready = [&] {
+            auto ready = [&](PlaybackEpoch) {
                 if (paused_) reset_anchor();
                 return !paused_ && !speed_change_pending;
             };
@@ -445,14 +514,17 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                 }
                 if (frame.pts + 0.0001 < min_valid_pts.load()) return;
                 ++decoded_frames;
-                const bool sync_to_audio = audio_ready && audio_clock_active;
+                auto audio = read_audio_clock(epoch);
+                const bool sync_to_audio = audio.position.has_value();
                 double diff = 0.0;
                 if (sync_to_audio) {
-                    diff = frame.pts - audio_clock();
+                    diff = frame.pts - *audio.position;
                     while (is_current(epoch) && !paused_ && !speed_change_pending && diff > 0.04) {
-                        if (audio_drained == epoch.generation && audio_output_.getQueuedSeconds() <= 0.005) break;
+                        if (audio.tail_drained) break;
                         std::this_thread::sleep_for(5ms);
-                        diff = frame.pts - audio_clock();
+                        audio = read_audio_clock(epoch);
+                        if (!audio.position) break;
+                        diff = frame.pts - *audio.position;
                     }
                 }
                 else if (!audio_ready || local_file) {
@@ -477,11 +549,12 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                     if (accepted) ++submitted_frames;
                 }
 
-                const double now_pts = sync_to_audio ? audio_clock() : frame.pts;
                 const auto now = Clock::now();
                 const double elapsed = std::chrono::duration<double>(now - window_start).count();
                 publish(epoch, [&] {
-                    if (!paused_) current_time_ = now_pts;
+                    if (!paused_ && (audio_clock.epoch != epoch || !audio_clock.position)) {
+                        current_time_ = frame.pts;
+                    }
                     if (accepted) snapshot_.has_current_video_output = true;
                     if (sync_to_audio) snapshot_.stats.av_diff_ms = diff * 1000.0;
                     if (dropped) ++snapshot_.stats.dropped_frames_total;
@@ -498,7 +571,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
             };
 
             consume(video_packets_, video_drained, &MediaDecoder::decodeVideoPacket,
-                &MediaDecoder::flushVideoDecoder, ready, output);
+                &MediaDecoder::flushVideoDecoder, true, ready, output);
         });
     }
 
@@ -517,7 +590,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
             seek_requested_ = false;
         }
         {
-            std::lock_guard<std::mutex> lock(seek_mutex_);
+            std::lock_guard<std::mutex> lock(codec_mutex_);
             if (reposition && !decoder_.seek(position)) {
                 reconfiguring = false;
                 return false;
@@ -527,8 +600,6 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                 std::cerr << "[Player] 更新播放速度失败: " << new_speed << "x" << std::endl;
             }
         }
-        if (audio_ready) audio_output_.reset();
-
         {
             std::lock_guard<std::mutex> lock(snapshot_mutex_);
             if (!running()) return false;
@@ -538,7 +609,6 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
             snapshot_.generation = stream_generation.load();
             snapshot_.has_current_video_output = false;
             snapshot_.stats = {};
-            audio_clock_active = false;
             min_valid_pts = position;
             current_time_ = position;
             resume_state_ = PlaybackState::Playing;
@@ -562,10 +632,14 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
             error = MediaReadResult{MediaReadStatus::Error, AVERROR(ENOMEM)};
             break;
         }
-        sample_audio_buffer();
+        if (const int code = audio_error.load()) {
+            error = MediaReadResult{MediaReadStatus::Error, code};
+            break;
+        }
         const float requested_speed = local_file ? speed_.load() : 1.0f;
         const bool speed_changed = std::fabs(requested_speed - active_speed.load()) > 0.001f;
         const bool seeking = seek_requested_.load();
+        const auto epoch = epoch_now();
         if (seeking || speed_changed) {
             const bool reposition = seeking || can_reposition_for_speed;
             // 无法定位时先消费旧队列，避免倍速操作把媒体退回开头或跳过整批预读包。
@@ -575,11 +649,12 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                 continue;
             }
             speed_change_pending = speed_changed;
-            if (speed_changed && !seeking && !paused_ && audio_ready && audio_output_.getQueuedSeconds() > 0.05) {
+            const auto audio = read_audio_clock(epoch);
+            if (speed_changed && !seeking && !paused_ && audio.queued_seconds > 0.05) {
                 std::this_thread::sleep_for(2ms);
                 continue;
             }
-            const double position = std::max(0.0, audio_clock_active ? audio_clock() : current_time_.load());
+            const double position = std::max(0.0, audio.position.value_or(current_time_.load()));
             if (refresh(requested_speed, position, reposition)) draining = false;
             else {
                 can_reposition_for_speed = false;
@@ -593,17 +668,10 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
             continue;
         }
 
-        const auto epoch = epoch_now();
         if (draining) {
-            if (audio_ready && audio_clock_active) {
-                const double played_position = audio_clock();
-                publish(epoch, [&] {
-                    if (!paused_) current_time_ = std::max(current_time_.load(), played_position);
-                });
-            }
-            const bool done = (!audio_ready || audio_drained == epoch.generation) &&
+            const bool done = (!audio_ready || read_audio_clock(epoch).tail_drained) &&
                               (!use_video || video_drained == epoch.generation);
-            if (done && (!audio_ready || audio_output_.getQueuedSeconds() <= 0.005)) {
+            if (done) {
                 std::lock_guard<std::mutex> lock(snapshot_mutex_);
                 if (running() && !seek_requested_ && !paused_) {
                     const double duration = duration_.load();
@@ -625,11 +693,8 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
             continue;
         }
 
-        MediaReadResult result;
-        {
-            std::lock_guard<std::mutex> lock(seek_mutex_);
-            result = decoder_.readPacketResult(packet);
-        }
+        // 格式上下文仅 supervisor 使用。网络等包期间，worker 仍可用缓存的 time_base 解码。
+        const MediaReadResult result = decoder_.readPacketResult(packet);
         if (result.status == MediaReadStatus::Again) {
             std::this_thread::sleep_for(2ms);
             continue;
@@ -664,6 +729,5 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
     av_packet_free(&packet);
     if (audio_worker.joinable()) audio_worker.join();
     if (video_worker.joinable()) video_worker.join();
-    if (audio_ready) audio_output_.cleanup();
     return error;
 }

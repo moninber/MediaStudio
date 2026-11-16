@@ -7,7 +7,6 @@
 #include <optional>
 #include <thread>
 
-#include "AudioOutput.h"
 #include "MediaDecoder.h"
 #include "PacketQueue.h"
 #include "PlaybackSnapshot.h"
@@ -69,7 +68,6 @@ private:
     PlaybackEpoch currentEpochLocked() const;
 
     MediaDecoder decoder_;
-    AudioOutput audio_output_;
     PacketQueue audio_packets_;
     PacketQueue video_packets_;
 
@@ -95,6 +93,6 @@ private:
     bool shutting_down_ = false;
     PlaybackState resume_state_ = PlaybackState::Playing;
 
-    std::mutex seek_mutex_;  // 解码与 seek 互斥，格式上下文的锁归属在 1.3 收束。
+    std::mutex codec_mutex_;  // 解码、排空和刷新互斥，解复用读包不持此锁。
     std::thread supervisor_;
 };

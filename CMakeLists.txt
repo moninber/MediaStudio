@@ -214,7 +214,7 @@ if(BUILD_TESTING)
         target_link_libraries(MediaStudioSessionTests PRIVATE ole32 uuid winmm ws2_32)
     endif()
 
-    foreach(test_case IN ITEMS controller-local controller-supersede packet-epochs widget-epochs)
+    foreach(test_case IN ITEMS controller-local controller-supersede controller-blocked-read packet-epochs widget-epochs)
         set(test_name MediaStudio.Session.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES
