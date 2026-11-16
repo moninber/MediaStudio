@@ -14,18 +14,22 @@
 #include "MediaTranscoder.h"
 #include <iostream>
 
-MediaTranscoder::MediaTranscoder()
-    : cancelled_(false)
-{
-}
+MediaTranscoder::MediaTranscoder() = default;
 
 MediaTranscoder::~MediaTranscoder()
 {
 }
 
-void MediaTranscoder::cancel()
+// GUI 只发布取消，FFmpeg 资源仍由转码线程释放。
+void MediaTranscoder::cancel() noexcept
 {
-    cancelled_ = true;
+    cancelled_.store(true);
+}
+
+// 回调仅访问本次任务的原子取消标志。
+int MediaTranscoder::interruptInput(void* opaque) noexcept
+{
+    return static_cast<MediaTranscoder*>(opaque)->cancelled_.load();
 }
 
 // ============================================================
@@ -41,21 +45,30 @@ bool MediaTranscoder::transcode(
     int bitrate,
     std::function<void(float)> progress_cb)
 {
-    cancelled_ = false;
     last_error_.clear();
+    if (cancelled_.load()) {
+        last_error_ = "转码已取消";
+        return false;
+    }
 
     // --------------------------------------------------------
     // 步骤1：打开输入文件
     // --------------------------------------------------------
-    AVFormatContext* in_fmt_ctx = nullptr;
+    AVFormatContext* in_fmt_ctx = avformat_alloc_context();
+    if (!in_fmt_ctx) {
+        last_error_ = "无法分配输入格式上下文";
+        return false;
+    }
+    // 打开前安装回调，覆盖打开、探测和读包，任务对象始终晚于格式上下文释放。
+    in_fmt_ctx->interrupt_callback = {&MediaTranscoder::interruptInput, this};
     if (avformat_open_input(&in_fmt_ctx, input_path.c_str(), nullptr, nullptr) != 0) {
-        last_error_ = "无法打开输入文件: " + input_path;
+        last_error_ = cancelled_.load() ? "转码已取消" : "无法打开输入文件: " + input_path;
         std::cerr << "[Transcoder] " << last_error_ << std::endl;
         return false;
     }
 
-    if (avformat_find_stream_info(in_fmt_ctx, nullptr) < 0) {
-        last_error_ = "无法获取输入流信息";
+    if (avformat_find_stream_info(in_fmt_ctx, nullptr) < 0 || cancelled_.load()) {
+        last_error_ = cancelled_.load() ? "转码已取消" : "无法获取输入流信息";
         avformat_close_input(&in_fmt_ctx);
         return false;
     }
@@ -85,6 +98,10 @@ bool MediaTranscoder::transcode(
     SwrContext* swr_ctx = nullptr;
 
     for (unsigned int i = 0; i < in_fmt_ctx->nb_streams; i++) {
+        if (cancelled_.load()) {
+            last_error_ = "转码已取消";
+            goto cleanup;
+        }
         AVStream* in_stream = in_fmt_ctx->streams[i];
         AVCodecParameters* in_codecpar = in_stream->codecpar;
 
@@ -295,6 +312,10 @@ bool MediaTranscoder::transcode(
     // --------------------------------------------------------
     // 步骤4：打开输出文件并写入头部
     // --------------------------------------------------------
+    if (cancelled_.load()) {
+        last_error_ = "转码已取消";
+        goto cleanup;
+    }
     if (!(out_fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&out_fmt_ctx->pb, output_path.c_str(), AVIO_FLAG_WRITE) < 0) {
             last_error_ = "无法打开输出文件: " + output_path;
@@ -316,7 +337,7 @@ bool MediaTranscoder::transcode(
         AVFrame* frame = av_frame_alloc();
         int64_t total_duration = in_fmt_ctx->duration;
 
-        while (!cancelled_ && av_read_frame(in_fmt_ctx, packet) >= 0) {
+        while (!cancelled_.load() && av_read_frame(in_fmt_ctx, packet) >= 0) {
             if (packet->stream_index == video_in_idx && video_dec_ctx && video_enc_ctx) {
                 processVideoStream(out_fmt_ctx, video_dec_ctx, video_enc_ctx,
                     in_fmt_ctx->streams[video_in_idx]->time_base, video_out_idx, packet, frame, &sws_ctx,
@@ -377,7 +398,11 @@ bool MediaTranscoder::transcode(
         av_write_trailer(out_fmt_ctx);
     }
 
-    std::cout << "[Transcoder] 转码完成: " << output_path << std::endl;
+    if (cancelled_.load()) {
+        last_error_ = "转码已取消";
+    } else {
+        std::cout << "[Transcoder] 转码完成: " << output_path << std::endl;
+    }
 
 cleanup:
     // 释放资源

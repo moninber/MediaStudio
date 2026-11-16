@@ -187,12 +187,14 @@ if(BUILD_TESTING)
         endif()
     endforeach()
 
-    # 会话用例链接实际控制器和显示控件，离屏提交帧，无需显卡上下文或音频设备。
+    # 会话和关窗用例链接实际主窗口、控制器及显示控件，离屏执行，无需数据库或音频设备。
     add_executable(MediaStudioSessionTests
         tests/ControllerTests.cpp
         tests/RtspBlackhole.cpp
         ${MEDIASTUDIO_PLAYBACK_SOURCES}
         ${MEDIASTUDIO_SESSION_SOURCES}
+        src/MainWindow.cpp
+        src/MediaTranscoder.cpp
     )
     set_target_properties(MediaStudioSessionTests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests"
@@ -209,12 +211,15 @@ if(BUILD_TESTING)
         FFmpeg::avcodec FFmpeg::avformat FFmpeg::avutil FFmpeg::avfilter
         FFmpeg::swresample FFmpeg::swscale
     )
+    target_compile_definitions(MediaStudioSessionTests PRIVATE MEDIASTUDIO_ENABLE_MYSQL=0)
     if(WIN32)
         target_compile_definitions(MediaStudioSessionTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
         target_link_libraries(MediaStudioSessionTests PRIVATE ole32 uuid winmm ws2_32)
     endif()
 
-    foreach(test_case IN ITEMS controller-local controller-supersede controller-blocked-read packet-epochs widget-epochs)
+    foreach(test_case IN ITEMS controller-local controller-supersede controller-blocked-read packet-epochs widget-epochs
+                          window-close-open window-close-probe window-close-read window-stop-reopen window-close-transcode
+                          window-close-modal)
         set(test_name MediaStudio.Session.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES

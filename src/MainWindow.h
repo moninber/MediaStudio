@@ -48,6 +48,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <thread>
 
 #include "VideoWidget.h"
@@ -95,6 +96,8 @@ private slots:
     void toggleMute();
 
 private:
+    friend struct MainWindowCloseTestAccess;
+
     // UI构建函数
     void setupUI();
     void setupMenuBar();
@@ -106,11 +109,19 @@ private:
     void applyDarkTheme();
     void connectSignals();
     void requestLoadAndPlay(const std::string& path);
+    std::uint64_t requestPlayback(const PlaybackSource& source);
+    void startTranscode(const QString& input, const QString& output);
     void seekRelative(double offset);
     void updatePlaybackControls(const PlaybackSnapshot& snapshot);
     void syncLocalLibrary(const PlaybackSnapshot& snapshot);
 
+    enum class CloseState { Running, WaitingForWorkers, Ready };
+    bool isClosing() const { return close_state_ != CloseState::Running; }
+    void rejectOwnedDialog();
+    void finishCloseWhenReady();
+
     // Qt事件重写
+    void closeEvent(QCloseEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     void dragEnterEvent(QDragEnterEvent* event) override;
     void dropEvent(QDropEvent* event) override;
@@ -119,7 +130,7 @@ private:
     VideoWidget* video_widget_;
     PlayerController* player_;
     MediaDatabase* database_;
-    MediaTranscoder* transcoder_;
+    std::unique_ptr<MediaTranscoder> transcoder_;
 
     // UI控件
     QPushButton* btn_play_;
@@ -141,6 +152,10 @@ private:
 
     // 状态更新定时器
     QTimer info_timer_;
+    QTimer close_timer_;
+    CloseState close_state_ = CloseState::Running;
+    // 模态调用退出后再销毁窗口，避免其嵌套事件循环中重入关闭。
+    int modal_depth_ = 0;
 
     // 播放列表数据
     std::vector<std::string> playlist_;
@@ -152,6 +167,7 @@ private:
     std::uint64_t library_request_id_ = 0;
     std::uint64_t displayed_request_id_ = 0;
     PlaybackState displayed_state_ = PlaybackState::Idle;
+    std::uint64_t transcode_request_id_ = 0;
     std::atomic<bool> transcoding_{ false };
     std::thread transcoding_thread_;
 

@@ -3,13 +3,13 @@
 #include <memory>
 #include <string>
 
-// 只在回环地址提供一次 RTSP/TCP 会话；可在打开握手或成功送包后阻塞。
+// 默认在回环地址提供一次 RTSP/TCP 会话；也可显式绑定私有 IPv4。
 class RtspBlackhole {
 public:
-    enum class StallAt { ReadPacket, OpenInput, VideoReadPacket };
+    enum class StallAt { ReadPacket, OpenInput, ProbeStreams, VideoReadPacket };
 
     // 默认先完成握手并提供有效音频，保留读包取消测试的行为。
-    explicit RtspBlackhole(StallAt stall = StallAt::ReadPacket);
+    explicit RtspBlackhole(StallAt stall = StallAt::ReadPacket, const std::string& bind_address = "127.0.0.1");
     ~RtspBlackhole();
     RtspBlackhole(const RtspBlackhole&) = delete;
     RtspBlackhole& operator=(const RtspBlackhole&) = delete;

@@ -26,7 +26,7 @@ PlayerController::~PlayerController()
 void PlayerController::setVideoWidget(VideoWidget* widget)
 {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
-    video_widget_ = widget;
+    if (!shutting_down_) video_widget_ = widget;
 }
 
 PlaybackEpoch PlayerController::currentEpochLocked() const
@@ -51,18 +51,18 @@ void PlayerController::cancelCurrentLocked()
     seek_requested_ = false;
     playing_ = false;
     paused_ = false;
-    audio_packets_.abort();
-    video_packets_.abort();
 }
 
 std::uint64_t PlayerController::requestOpen(const PlaybackSource& source)
 {
-    auto io = std::make_shared<MediaIoControl>();
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
     if (shutting_down_) return 0;
+    auto io = std::make_shared<MediaIoControl>();
 
     const PlaybackEpoch epoch{snapshot_.request_id + 1, 1, 1};
     cancelCurrentLocked();
+    audio_packets_.abort();
+    video_packets_.abort();
     resetSnapshotLocked(epoch.request_id, PlaybackState::Opening);
     snapshot_.connection_attempt_id = epoch.connection_attempt_id;
     snapshot_.generation = epoch.generation;
@@ -82,27 +82,42 @@ std::uint64_t PlayerController::requestOpen(const PlaybackSource& source)
 std::uint64_t PlayerController::stopAsync()
 {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (shutting_down_) return 0;
     const auto request_id = snapshot_.request_id;
     cancelCurrentLocked();
+    audio_packets_.abort();
+    video_packets_.abort();
     resetSnapshotLocked(request_id, supervisor_busy_ ? PlaybackState::Stopping : PlaybackState::Idle);
     if (video_widget_) video_widget_->setPlaybackEpoch({}, false);
     return request_id;
 }
 
+void PlayerController::requestShutdown()
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (shutting_down_) return;
+    shutting_down_ = true;
+    cancelCurrentLocked();
+    resetSnapshotLocked(snapshot_.request_id, supervisor_busy_ ? PlaybackState::Stopping : PlaybackState::Idle);
+    if (video_widget_) video_widget_->setPlaybackEpoch({}, false);
+    // FFmpeg 回调轮询取消标志，退出后由 supervisor 中止队列、释放包并回收 worker。
+    command_changed_.notify_one();
+}
+
+bool PlayerController::isShutdownComplete() const noexcept
+{
+    return shutdown_complete_.load(std::memory_order_acquire);
+}
+
 void PlayerController::shutdown()
 {
-    {
-        std::lock_guard<std::mutex> lock(snapshot_mutex_);
-        shutting_down_ = true;
-        cancelCurrentLocked();
-    }
-    command_changed_.notify_one();
+    requestShutdown();
     if (supervisor_.joinable()) supervisor_.join();
 }
 
 void PlayerController::setPausedLocked(bool paused)
 {
-    if (!playing_ || paused_ == paused || snapshot_.source_kind != PlaybackSourceKind::LocalFile) return;
+    if (shutting_down_ || !playing_ || paused_ == paused || snapshot_.source_kind != PlaybackSourceKind::LocalFile) return;
     if (paused) {
         resume_state_ = snapshot_.state;
         snapshot_.state = PlaybackState::Paused;
@@ -134,24 +149,33 @@ void PlayerController::togglePlayPause()
 void PlayerController::seek(double seconds)
 {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
-    if (!playing_ || !snapshot_.capabilities.can_seek || !std::isfinite(seconds)) return;
+    if (shutting_down_ || !playing_ || !snapshot_.capabilities.can_seek || !std::isfinite(seconds)) return;
     pending_seek_ = std::clamp(seconds, 0.0, duration_.load());
     seek_requested_ = true;
 }
 
 void PlayerController::setVolume(float volume)
 {
-    volume_ = std::clamp(volume, 0.0f, 1.0f);
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (!shutting_down_) volume_ = std::clamp(volume, 0.0f, 1.0f);
 }
 
 void PlayerController::setSpeed(float speed)
 {
-    if (std::isfinite(speed)) speed_ = std::clamp(speed, 0.25f, 4.0f);
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (!shutting_down_ && std::isfinite(speed)) speed_ = std::clamp(speed, 0.25f, 4.0f);
 }
 
 void PlayerController::setEffect(VideoEffect effect)
 {
-    current_effect_ = effect;
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (!shutting_down_) current_effect_ = effect;
+}
+
+void PlayerController::toggleVisualizer()
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (!shutting_down_) show_visualizer_ = !show_visualizer_.load();
 }
 
 PlaybackSnapshot PlayerController::getPlaybackSnapshot() const
@@ -170,7 +194,7 @@ PlaybackSnapshot PlayerController::getPlaybackSnapshot() const
 bool PlayerController::updateLocalLibraryInfo(std::uint64_t expected_request_id, const MediaInfo& info)
 {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
-    if (expected_request_id == 0 || expected_request_id != snapshot_.request_id ||
+    if (shutting_down_ || expected_request_id == 0 || expected_request_id != snapshot_.request_id ||
         snapshot_.source_kind != PlaybackSourceKind::LocalFile || snapshot_.media_info.file_path.empty() ||
         snapshot_.media_info.file_path != info.file_path) {
         return false;
@@ -193,7 +217,12 @@ void PlayerController::supervisorLoop()
     for (;;) {
         std::unique_lock<std::mutex> lock(snapshot_mutex_);
         command_changed_.wait(lock, [&] { return shutting_down_ || pending_open_.has_value(); });
-        if (shutting_down_) return;
+        if (shutting_down_) {
+            active_io_.reset();
+            video_widget_ = nullptr;
+            snapshot_.state = PlaybackState::Idle;
+            break;
+        }
         auto request = std::move(*pending_open_);
         pending_open_.reset();
         auto* video = video_widget_;
@@ -205,6 +234,7 @@ void PlayerController::supervisorLoop()
 
         lock.lock();
         supervisor_busy_ = false;
+        if (shutting_down_) continue;
         if (snapshot_.state == PlaybackState::Stopping) {
             snapshot_.state = PlaybackState::Idle;
         }
@@ -220,6 +250,8 @@ void PlayerController::supervisorLoop()
         snapshot_.state = error ? PlaybackState::Failed : PlaybackState::Ended;
         snapshot_.last_error = error;
     }
+    // 上一请求已回收 worker 并关闭输入，最后一次访问控件和快照结束后才发布完成。
+    shutdown_complete_.store(true, std::memory_order_release);
 }
 
 std::optional<PlaybackError> PlayerController::runRequest(const OpenRequest& request, VideoWidget* video)

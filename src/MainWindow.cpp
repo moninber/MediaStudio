@@ -4,6 +4,10 @@
  */
 
 #include "MainWindow.h"
+#include <QApplication>
+#include <QCloseEvent>
+#include <QDialog>
+#include <QPointer>
 #include <QFileDialog>
 #include <QInputDialog>
 #include <QMessageBox>
@@ -23,9 +27,11 @@
 #include <QAction>
 #include <QShortcut>
 #include <QScrollBar>
+#include <QScopedValueRollback>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <system_error>
 
 namespace {
 
@@ -55,7 +61,6 @@ MainWindow::MainWindow(QWidget* parent)
     // 创建核心组件
     player_ = new PlayerController();
     database_ = new MediaDatabase();
-    transcoder_ = new MediaTranscoder();
 
     // 先创建停靠窗口（setupMenuBar需要引用它们）
     dock_playlist_ = new QDockWidget("播放列表", this);
@@ -69,6 +74,8 @@ MainWindow::MainWindow(QWidget* parent)
     // 启动信息更新定时器（200ms刷新一次播放信息）
     QObject::connect(&info_timer_, &QTimer::timeout, this, &MainWindow::updatePlaybackInfo);
     info_timer_.start(200);
+    close_timer_.setInterval(16);
+    QObject::connect(&close_timer_, &QTimer::timeout, this, &MainWindow::finishCloseWhenReady);
 
     setWindowTitle("MediaStudio - 音视频工作站");
     resize(1280, 720);
@@ -76,18 +83,18 @@ MainWindow::MainWindow(QWidget* parent)
 
 MainWindow::~MainWindow()
 {
+    close_state_ = CloseState::Ready;
     info_timer_.stop();
-    // 停止并接回播放线程，等它们不再提交帧后才由 Qt 销毁 VideoWidget。
+    close_timer_.stop();
+    // 直接析构也先同时取消，再接回线程。VideoWidget 由 Qt 在此之后销毁。
+    player_->requestShutdown();
+    if (transcoder_) transcoder_->cancel();
     player_->shutdown();
-    if (transcoding_.load()) {
-        transcoder_->cancel();
-    }
     if (transcoding_thread_.joinable()) {
         transcoding_thread_.join();
     }
     delete player_;
     delete database_;
-    delete transcoder_;
 }
 
 // ============================================================
@@ -127,6 +134,8 @@ void MainWindow::setupMenuBar()
     // 帮助菜单
     QMenu* menu_help = menuBar()->addMenu("帮助");
     menu_help->addAction("快捷键说明", this, [this]() {
+        if (isClosing()) return;
+        QScopedValueRollback modal_scope(modal_depth_, modal_depth_ + 1);
         QMessageBox::information(this, "快捷键说明",
             "SPACE - 播放/暂停\n"
             "LEFT/RIGHT - 后退/前进5秒\n"
@@ -140,6 +149,8 @@ void MainWindow::setupMenuBar()
             "F - 切换收藏");
     });
     menu_help->addAction("关于", this, [this]() {
+        if (isClosing()) return;
+        QScopedValueRollback modal_scope(modal_depth_, modal_depth_ + 1);
         QMessageBox::about(this, "关于 MediaStudio",
             "MediaStudio v1.0\n\n"
             "基于 FFmpeg + OpenGL + Qt 的音视频工作站\n\n"
@@ -587,7 +598,7 @@ void MainWindow::setupShortcuts()
     QShortcut* sc_fav = new QShortcut(QKeySequence(Qt::Key_F), this);
     sc_fav->setContext(Qt::ApplicationShortcut);
     connect(sc_fav, &QShortcut::activated, this, [this]() {
-        if (db_connected_) {
+        if (!isClosing() && db_connected_) {
             auto snapshot = player_->getPlaybackSnapshot();
             auto& info = snapshot.media_info;
             if (snapshot.request_id == playback_request_id_ &&
@@ -625,11 +636,13 @@ void MainWindow::setupShortcuts()
 // ============================================================
 void MainWindow::openFile()
 {
+    if (isClosing()) return;
+    QScopedValueRollback modal_scope(modal_depth_, modal_depth_ + 1);
     QString filename = QFileDialog::getOpenFileName(this,
         "打开媒体文件", "",
         "媒体文件 (*.mp4 *.mkv *.avi *.mov *.flv *.wmv *.mp3 *.wav);;所有文件 (*.*)");
 
-    if (filename.isEmpty()) return;
+    if (isClosing() || filename.isEmpty()) return;
 
     std::string file_path = filename.toStdString();
 
@@ -645,6 +658,7 @@ void MainWindow::openFile()
 // 根据当前请求状态决定播放、暂停或从列表重新打开。
 void MainWindow::togglePlayPause()
 {
+    if (isClosing()) return;
     const auto snapshot = player_->getPlaybackSnapshot();
     if (snapshot.request_id != playback_request_id_) return;
     if (snapshot.is_playing || snapshot.is_paused) {
@@ -661,6 +675,7 @@ void MainWindow::togglePlayPause()
 // 取消尚未登记的库记录，画面与会话收尾由控制器管理。
 void MainWindow::stopPlayback()
 {
+    if (isClosing()) return;
     library_request_id_ = 0;
     playback_request_id_ = player_->stopAsync();
     updatePlaybackInfo();
@@ -668,6 +683,7 @@ void MainWindow::stopPlayback()
 
 void MainWindow::seekPosition(int position)
 {
+    if (isClosing()) return;
     const auto snapshot = player_->getPlaybackSnapshot();
     if (snapshot.request_id != playback_request_id_ || !canSeek(snapshot)) return;
     player_->seek((position / 1000.0) * snapshot.duration_seconds);
@@ -676,6 +692,7 @@ void MainWindow::seekPosition(int position)
 // 快捷键按与进度条相同的能力判断，并使用同一快照的当前位置。
 void MainWindow::seekRelative(double offset)
 {
+    if (isClosing()) return;
     const auto snapshot = player_->getPlaybackSnapshot();
     if (snapshot.request_id != playback_request_id_ || !canSeek(snapshot)) return;
     player_->seek(snapshot.current_seconds + offset);
@@ -683,6 +700,7 @@ void MainWindow::seekRelative(double offset)
 
 void MainWindow::changeVolume(int volume)
 {
+    if (isClosing()) return;
     player_->setVolume(volume / 100.0f);
     is_muted_ = (volume == 0);
     if (!is_muted_) {
@@ -700,7 +718,7 @@ void MainWindow::changeVolume(int volume)
 
 void MainWindow::changeSpeed(int index)
 {
-    if (!combo_speed_->isEnabled()) return;
+    if (isClosing() || !combo_speed_->isEnabled()) return;
     QStringList speeds = {"0.25", "0.5", "0.75", "1.0", "1.25", "1.5", "2.0", "4.0"};
     if (index >= 0 && index < speeds.size()) {
         float speed = speeds[index].toFloat();
@@ -711,7 +729,7 @@ void MainWindow::changeSpeed(int index)
 
 void MainWindow::nextFile()
 {
-    if (playlist_.empty()) return;
+    if (isClosing() || playlist_.empty()) return;
     current_playlist_index_ = (current_playlist_index_ + 1) % (int)playlist_.size();
     list_playlist_->setCurrentRow(current_playlist_index_);
     requestLoadAndPlay(playlist_[current_playlist_index_]);
@@ -719,7 +737,7 @@ void MainWindow::nextFile()
 
 void MainWindow::prevFile()
 {
-    if (playlist_.empty()) return;
+    if (isClosing() || playlist_.empty()) return;
     current_playlist_index_ = (current_playlist_index_ - 1 + (int)playlist_.size()) % (int)playlist_.size();
     list_playlist_->setCurrentRow(current_playlist_index_);
     requestLoadAndPlay(playlist_[current_playlist_index_]);
@@ -727,6 +745,7 @@ void MainWindow::prevFile()
 
 void MainWindow::toggleEffect()
 {
+    if (isClosing()) return;
     VideoEffect current = player_->getEffect();
     int next = (static_cast<int>(current) + 1) % static_cast<int>(VideoEffect::Count);
     VideoEffect new_effect = static_cast<VideoEffect>(next);
@@ -738,6 +757,7 @@ void MainWindow::toggleEffect()
 
 void MainWindow::toggleVisualizer()
 {
+    if (isClosing()) return;
     player_->toggleVisualizer();
     bool showing = player_->isVisualizerShown();
     video_widget_->setShowSpectrum(showing);
@@ -746,27 +766,29 @@ void MainWindow::toggleVisualizer()
 
 void MainWindow::connectDatabaseDialog()
 {
+    if (isClosing()) return;
+    QScopedValueRollback modal_scope(modal_depth_, modal_depth_ + 1);
     bool ok;
     QString host = QInputDialog::getText(this, "数据库连接", "主机地址:",
         QLineEdit::Normal, "127.0.0.1", &ok);
-    if (!ok) return;
+    if (isClosing() || !ok) return;
 
     QString user = QInputDialog::getText(this, "数据库连接", "用户名:",
         QLineEdit::Normal, "root", &ok);
-    if (!ok) return;
+    if (isClosing() || !ok) return;
 
     QString password = QInputDialog::getText(this, "数据库连接", "密码:",
         QLineEdit::Password, "", &ok);
-    if (!ok) return;
+    if (isClosing() || !ok) return;
 
     QString database = QInputDialog::getText(this, "数据库连接", "数据库名:",
         QLineEdit::Normal, "media_center", &ok);
-    if (!ok) return;
+    if (isClosing() || !ok) return;
 
     if (connectDatabase(host.toStdString(), user.toStdString(),
                         password.toStdString(), database.toStdString())) {
-        QMessageBox::information(this, "成功", "数据库连接成功！");
         db_connected_ = true;
+        QMessageBox::information(this, "成功", "数据库连接成功！");
     }
     else {
         QMessageBox::warning(this, "失败",
@@ -776,6 +798,8 @@ void MainWindow::connectDatabaseDialog()
 
 void MainWindow::transcodeDialog()
 {
+    if (isClosing()) return;
+    QScopedValueRollback modal_scope(modal_depth_, modal_depth_ + 1);
     if (transcoding_.load()) {
         QMessageBox::information(this, "提示", "已有转码任务正在执行，请稍候。");
         return;
@@ -783,47 +807,71 @@ void MainWindow::transcodeDialog()
 
     QString input = QFileDialog::getOpenFileName(this, "选择源文件", "",
         "媒体文件 (*.mp4 *.mkv *.avi *.mov *.flv);;所有文件 (*.*)");
-    if (input.isEmpty()) return;
+    if (isClosing() || input.isEmpty()) return;
 
     QString output = QFileDialog::getSaveFileName(this, "保存转码文件", "",
         "MP4 (*.mp4);;MKV (*.mkv);;AVI (*.avi)");
-    if (output.isEmpty()) return;
+    if (isClosing() || output.isEmpty()) return;
+    startTranscode(input, output);
+}
 
-    transcoding_ = true;
-    statusBar()->showMessage("正在转码...");
+// 每项转码独立持有取消标志。完成标志由工作线程发布，关闭流程不依赖界面回调。
+void MainWindow::startTranscode(const QString& input, const QString& output)
+{
+    if (isClosing() || transcoding_.load()) return;
     if (transcoding_thread_.joinable()) {
         transcoding_thread_.join();
     }
-    transcoding_thread_ = std::thread([this, input, output]() {
-        bool success = transcoder_->transcode(
-            input.toStdString(), output.toStdString(),
-            0, 0, "libx264", "aac", 0,
-            [this](float progress) {
-                QMetaObject::invokeMethod(this, [this, progress]() {
-                    statusBar()->showMessage(QString("转码进度: %1%").arg((int)(progress * 100)));
-                }, Qt::QueuedConnection);
-            }
-        );
 
-        QMetaObject::invokeMethod(this, [this, success, output]() {
+    transcoder_ = std::make_unique<MediaTranscoder>();
+    auto* job = transcoder_.get();
+    const auto request = ++transcode_request_id_;
+    transcoding_ = true;
+    statusBar()->showMessage("正在转码...");
+    try {
+        transcoding_thread_ = std::thread([this, job, request, input, output]() {
+            bool success = false;
+            QString detail;
+            try {
+                success = job->transcode(input.toStdString(), output.toStdString(), 0, 0, "libx264", "aac", 0,
+                    [this, request](float progress) {
+                        QMetaObject::invokeMethod(this, [this, request, progress]() {
+                            if (isClosing() || request != transcode_request_id_) return;
+                            statusBar()->showMessage(QString("转码进度: %1%").arg((int)(progress * 100)));
+                        }, Qt::QueuedConnection);
+                    });
+                if (!success) detail = QString::fromStdString(job->getLastError());
+            } catch (const std::exception& error) {
+                detail = QString::fromUtf8(error.what());
+            }
+
+            // 回调以值捕获错误。旧任务迟到或关窗时，不再更新界面或打开消息框。
+            QMetaObject::invokeMethod(this, [this, request, success, output, detail]() {
+                if (isClosing() || request != transcode_request_id_) return;
+                QScopedValueRollback modal_scope(modal_depth_, modal_depth_ + 1);
+                if (success) {
+                    statusBar()->showMessage("转码完成: " + output);
+                    QMessageBox::information(this, "完成", "转码完成！");
+                } else {
+                    statusBar()->showMessage("转码失败");
+                    QMessageBox::warning(this, "失败", "转码失败:\n" + detail);
+                }
+            }, Qt::QueuedConnection);
             transcoding_ = false;
-            if (success) {
-                statusBar()->showMessage("转码完成: " + output);
-                QMessageBox::information(this, "完成", "转码完成！");
-            }
-            else {
-                statusBar()->showMessage("转码失败");
-                QMessageBox::warning(this, "失败",
-                    "转码失败:\n" + QString::fromStdString(transcoder_->getLastError()));
-            }
-        }, Qt::QueuedConnection);
-    });
+        });
+    } catch (const std::system_error& error) {
+        transcoding_ = false;
+        statusBar()->showMessage("无法启动转码任务: " + QString::fromUtf8(error.what()));
+    }
 }
 
 void MainWindow::addToPlaylist()
 {
+    if (isClosing()) return;
+    QScopedValueRollback modal_scope(modal_depth_, modal_depth_ + 1);
     QStringList files = QFileDialog::getOpenFileNames(this, "添加文件到播放列表", "",
         "媒体文件 (*.mp4 *.mkv *.avi *.mov *.flv *.wmv *.mp3 *.wav);;所有文件 (*.*)");
+    if (isClosing()) return;
 
     for (const QString& file : files) {
         playlist_.push_back(file.toStdString());
@@ -833,6 +881,7 @@ void MainWindow::addToPlaylist()
 
 void MainWindow::removeFromPlaylist()
 {
+    if (isClosing()) return;
     int row = list_playlist_->currentRow();
     if (row < 0) return;
 
@@ -845,6 +894,7 @@ void MainWindow::removeFromPlaylist()
 
 void MainWindow::playlistItemDoubleClicked(QListWidgetItem* item)
 {
+    if (isClosing()) return;
     int row = list_playlist_->row(item);
     if (row < 0 || row >= (int)playlist_.size()) return;
 
@@ -855,6 +905,7 @@ void MainWindow::playlistItemDoubleClicked(QListWidgetItem* item)
 // 只读取一次快照。旧请求即使完成，也不更新界面或登记播放历史。
 void MainWindow::updatePlaybackInfo()
 {
+    if (isClosing()) return;
     const auto snapshot = player_->getPlaybackSnapshot();
     if (snapshot.request_id != playback_request_id_) return;
     updatePlaybackControls(snapshot);
@@ -985,6 +1036,7 @@ void MainWindow::syncLocalLibrary(const PlaybackSnapshot& snapshot)
 
 void MainWindow::toggleMute()
 {
+    if (isClosing()) return;
     if (is_muted_) {
         // 解除静音，恢复之前的音量
         slider_volume_->setValue(last_volume_);
@@ -1009,20 +1061,29 @@ void MainWindow::toggleMute()
 // 打开对话框、播放列表、拖放及启动文件统一提交给控制器。
 void MainWindow::requestLoadAndPlay(const std::string& path)
 {
-    const auto source = PlaybackSource::localFile(path);
-    playback_request_id_ = player_->requestOpen(source);
-    library_request_id_ = playback_request_id_;
+    requestPlayback(PlaybackSource::localFile(path));
+}
+
+// 关闭开始后拒绝新的源请求。现有菜单、拖放和命令行仍只构造本地源。
+std::uint64_t MainWindow::requestPlayback(const PlaybackSource& source)
+{
+    if (isClosing()) return 0;
+    const auto request = player_->requestOpen(source);
+    if (request == 0) return 0;
+    playback_request_id_ = request;
+    library_request_id_ = source.kind() == PlaybackSourceKind::LocalFile ? request : 0;
     // 立即刷新请求对应的控件，媒体库同步仍由定时器处理。
     updatePlaybackControls(player_->getPlaybackSnapshot());
     if (!last_media_info_html_.isEmpty()) {
         text_media_info_->clear();
         last_media_info_html_.clear();
     }
+    return request;
 }
 
 void MainWindow::setInitialFiles(const std::vector<std::string>& files)
 {
-    if (files.empty()) return;
+    if (isClosing() || files.empty()) return;
     current_playlist_index_ = static_cast<int>(playlist_.size());
     for (const auto& file : files) {
         playlist_.push_back(file);
@@ -1035,6 +1096,7 @@ void MainWindow::setInitialFiles(const std::vector<std::string>& files)
 bool MainWindow::connectDatabase(const std::string& host, const std::string& user,
                                   const std::string& password, const std::string& database)
 {
+    if (isClosing()) return false;
     if (database_->connect(host, user, password, database)) {
         return database_->initTables();
     }
@@ -1042,10 +1104,74 @@ bool MainWindow::connectDatabase(const std::string& host, const std::string& use
 }
 
 // ============================================================
-// 键盘事件
+// 关闭与键盘事件
 // ============================================================
+void MainWindow::closeEvent(QCloseEvent* event)
+{
+    if (close_state_ == CloseState::Ready) {
+        QMainWindow::closeEvent(event);
+        return;
+    }
+    event->ignore();
+    if (isClosing()) return;
+
+    // 先关闭命令入口，再同时发出取消。事件循环继续处理队列与窗口关闭。
+    close_state_ = CloseState::WaitingForWorkers;
+    info_timer_.stop();
+    library_request_id_ = 0;
+    setAcceptDrops(false);
+    for (auto* shortcut : findChildren<QShortcut*>()) shortcut->setEnabled(false);
+    for (auto* action : findChildren<QAction*>()) action->setEnabled(false);
+    video_widget_->setUpdatesEnabled(false);
+    setEnabled(false);
+    statusBar()->showMessage("正在关闭，等待任务结束...");
+
+    player_->requestShutdown();
+    if (transcoder_) transcoder_->cancel();
+    rejectOwnedDialog();
+    close_timer_.start();
+}
+
+// 原生文件对话框可能不派发 Qt 定时器，首次关闭事件也要直接拒绝它。
+void MainWindow::rejectOwnedDialog()
+{
+    if (modal_depth_ == 0) return;
+    auto* active = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+    if (active && active->parentWidget() == this) {
+        active->reject();
+        return;
+    }
+
+    // Windows 原生文件对话框可能没有出现在 Qt 的模态窗口列表中。
+    const auto dialogs = findChildren<QFileDialog*>(Qt::FindDirectChildrenOnly);
+    if (!dialogs.isEmpty()) {
+        QPointer<QFileDialog> dialog = dialogs.back();
+        dialog->reject();
+        if (dialog) dialog->hide();
+    }
+}
+
+// 等线程发布退出状态与嵌套对话框返回，再接受第二次关闭事件。
+void MainWindow::finishCloseWhenReady()
+{
+    if (close_state_ != CloseState::WaitingForWorkers) return;
+    if (modal_depth_ != 0) {
+        rejectOwnedDialog();
+        return;
+    }
+    if (!player_->isShutdownComplete() || transcoding_.load()) return;
+
+    close_timer_.stop();
+    close_state_ = CloseState::Ready;
+    close();
+}
+
 void MainWindow::keyPressEvent(QKeyEvent* event)
 {
+    if (isClosing()) {
+        event->ignore();
+        return;
+    }
     // 强制捕获 Esc 键退出程序，无论焦点在哪
     if (event->key() == Qt::Key_Escape) {
         close();
@@ -1058,13 +1184,17 @@ void MainWindow::keyPressEvent(QKeyEvent* event)
 // 拖放支持
 void MainWindow::dragEnterEvent(QDragEnterEvent* event)
 {
-    if (event->mimeData()->hasUrls()) {
+    if (!isClosing() && event->mimeData()->hasUrls()) {
         event->acceptProposedAction();
     }
 }
 
 void MainWindow::dropEvent(QDropEvent* event)
 {
+    if (isClosing()) {
+        event->ignore();
+        return;
+    }
     const auto old_size = playlist_.size();
     const QList<QUrl> urlList = event->mimeData()->urls();
     for (const QUrl& url : urlList) {

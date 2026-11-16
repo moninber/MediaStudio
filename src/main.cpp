@@ -36,11 +36,15 @@ int main(int argc, char* argv[])
     // 否则Qt的QFileDialog等依赖STA COM的功能会死锁
     // WASAPI在STA模式下同样可以正常工作
     // --------------------------------------------------------
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    if (FAILED(hr) && hr != S_FALSE) {
+    const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) {
         std::cerr << "COM初始化失败: " << std::hex << hr << std::endl;
         return 1;
     }
+    // 后创建的窗口和 QApplication 先析构，最后释放 GUI 线程自己的 COM 初始化。
+    const struct GuiComScope {
+        ~GuiComScope() { CoUninitialize(); }
+    } gui_com_scope{};
 
     // --------------------------------------------------------
     // 创建Qt应用实例
@@ -82,11 +86,5 @@ int main(int argc, char* argv[])
     // --------------------------------------------------------
     window.show();
 
-    int result = app.exec();
-
-    // --------------------------------------------------------
-    // 清理
-    // --------------------------------------------------------
-    CoUninitialize();
-    return result;
+    return app.exec();
 }

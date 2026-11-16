@@ -22,7 +22,10 @@ public:
     // 新请求优先：立即取消旧 I/O，替换尚未开始的打开命令。
     std::uint64_t requestOpen(const PlaybackSource& source);
     std::uint64_t stopAsync();
-    // 窗口销毁输出控件前调用，等待 supervisor 正常退出。
+    // 关窗先封闭命令入口并取消会话，GUI 保持事件循环，等待后台收尾。
+    void requestShutdown();
+    bool isShutdownComplete() const noexcept;
+    // 由对象所有者调用，确保 supervisor 已 join 后再销毁控制器。
     void shutdown();
 
     void play();
@@ -33,7 +36,7 @@ public:
     void setSpeed(float speed);
     void setEffect(VideoEffect effect);
 
-    // 在提交首个播放命令之前绑定控件，控件须存活到 shutdown() 返回。
+    // 在提交首个播放命令之前绑定控件，控件须存活到后台收尾完成或 shutdown() 返回。
     void setVideoWidget(VideoWidget* widget);
 
     bool isPlaying() const { return playing_.load(); }
@@ -48,7 +51,7 @@ public:
     PlaybackSnapshot getPlaybackSnapshot() const;
     bool updateLocalLibraryInfo(std::uint64_t expected_request_id, const MediaInfo& info);
 
-    void toggleVisualizer() { show_visualizer_ = !show_visualizer_.load(); }
+    void toggleVisualizer();
     bool isVisualizerShown() const { return show_visualizer_.load(); }
 
 private:
@@ -91,6 +94,7 @@ private:
     VideoWidget* video_widget_ = nullptr;
     bool supervisor_busy_ = false;
     bool shutting_down_ = false;
+    std::atomic<bool> shutdown_complete_{false};  // 仅 supervisor 在完成最后一次资源访问后发布。
     PlaybackState resume_state_ = PlaybackState::Playing;
 
     std::mutex codec_mutex_;  // 解码、排空和刷新互斥，解复用读包不持此锁。

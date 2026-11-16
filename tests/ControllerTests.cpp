@@ -1,19 +1,48 @@
+#include "MainWindow.h"
 #include "PlayerController.h"
 #include "RtspBlackhole.h"
 #include "VideoWidget.h"
 
 #include <QApplication>
+#include <QEventLoop>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QPointer>
+#include <QTemporaryDir>
+#include <QTimer>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <random>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+
+// 通过主窗口自己的命令入口构造用例，并读取用于验证旧输出隔离的按值快照。
+struct MainWindowCloseTestAccess {
+    // 使用程序内部相同的打开入口，不引入面向用户的网络选项。
+    static std::uint64_t open(MainWindow& window, const PlaybackSource& source)
+    {
+        return window.requestPlayback(source);
+    }
+
+    // 读取当前播放快照，便于验证关窗前后的输出归属。
+    static PlaybackSnapshot snapshot(const MainWindow& window)
+    {
+        return window.player_->getPlaybackSnapshot();
+    }
+
+    // 走实际转码 worker 入口，测试不弹出选择文件的界面。
+    static void startTranscode(MainWindow& window, const QString& input, const QString& output)
+    {
+        window.startTranscode(input, output);
+    }
+};
 
 namespace {
 
@@ -381,6 +410,265 @@ void testControllerBlockedRead()
     player.shutdown();
 }
 
+// 离屏窗口也运行实际 closeEvent 和延迟删除，失败时回收仍存活的测试窗口。
+struct TestWindow {
+    QPointer<MainWindow> view = new MainWindow;
+
+    // 窗口只有正常接受关闭后才由 Qt 删除。
+    TestWindow() { view->setAttribute(Qt::WA_DeleteOnClose); }
+    // 若断言失败导致窗口未关闭，仍走析构的线程收尾。
+    ~TestWindow() { delete view.data(); }
+};
+
+// 等待窗口或夹具达到测试前置条件，同时让 Qt 线程持续分发事件。
+template<typename Predicate>
+void waitInQt(Predicate ready, Clock::duration timeout, const char* detail)
+{
+    if (ready()) return;
+    QEventLoop loop;
+    QTimer poll;
+    const auto deadline = Clock::now() + timeout;
+    bool satisfied = false;
+    QObject::connect(&poll, &QTimer::timeout, &loop, [&] {
+        satisfied = ready();
+        if (satisfied || Clock::now() >= deadline) loop.quit();
+    });
+    poll.start(5);
+    loop.exec();
+    require(satisfied, detail);
+}
+
+// CTest 默认只使用回环地址，显式环境变量可复测私有接口。
+std::string testRtspAddress()
+{
+    return qEnvironmentVariable("MEDIASTUDIO_TEST_RTSP_ADDRESS", "127.0.0.1").toStdString();
+}
+
+// 检查已接到关窗命令的快照中不再有旧源标记或可显示内容。
+bool outputRetired(const PlaybackSnapshot& snapshot, std::uint64_t request)
+{
+    return snapshot.request_id == request && snapshot.connection_attempt_id == 0 && snapshot.generation == 0 &&
+           !snapshot.is_playing && !snapshot.has_current_video_output && !snapshot.last_error &&
+           (snapshot.state == PlaybackState::Stopping || snapshot.state == PlaybackState::Idle);
+}
+
+// 在 Qt 事件回调里发出关窗，再验证事件分发、拒绝迟到请求和实际销毁。
+Clock::time_point closeWindow(QPointer<MainWindow>& view, std::uint64_t request, const char* stage,
+                              const std::function<void()>& before_close = {})
+{
+    QEventLoop loop;
+    QTimer modal_watch;
+    Clock::time_point requested;
+    Clock::time_point returned;
+    Clock::time_point destroyed;
+    bool first_close_deferred = false;
+    bool repeat_close_deferred = false;
+    bool heartbeat_while_alive = false;
+    bool late_open_rejected = false;
+    bool old_output_retired = false;
+    bool showed_modal = false;
+    QObject::connect(&modal_watch, &QTimer::timeout, &loop, [&] {
+        if (auto* modal = QApplication::activeModalWidget()) {
+            showed_modal = true;
+            // 防止意外的模态对话框吞掉事件循环退出，随后仍要报告测试失败。
+            modal->close();
+        }
+    });
+    modal_watch.start(5);
+    QObject::connect(view.data(), &QObject::destroyed, &loop, [&] {
+        destroyed = Clock::now();
+        loop.quit();
+    });
+    QTimer::singleShot(2500ms, &loop, &QEventLoop::quit);
+    QTimer::singleShot(0, &loop, [&] {
+        if (before_close) before_close();
+        requested = Clock::now();
+        first_close_deferred = !view->close();
+        returned = Clock::now();
+        if (!view || !first_close_deferred) return;
+        repeat_close_deferred = !view->close();
+        QTimer::singleShot(0, &loop, [&] {
+            heartbeat_while_alive = !view.isNull();
+            if (!view) return;
+            const auto late = PlaybackSource::localFile("not-opened-during-window-shutdown.avi");
+            late_open_rejected = MainWindowCloseTestAccess::open(*view, late) == 0;
+            old_output_retired = outputRetired(MainWindowCloseTestAccess::snapshot(*view), request);
+        });
+    });
+    loop.exec();
+
+    require(first_close_deferred && repeat_close_deferred, "close did not defer until playback shutdown completed");
+    require(returned - requested < 100ms, "close command exceeded the 100 ms UI target");
+    require(heartbeat_while_alive, "Qt could not dispatch a queued event while awaiting shutdown");
+    require(late_open_rejected && old_output_retired, "closing window accepted a late request or retained old output");
+    require(view.isNull() && destroyed - requested < 2s, "window did not finish playback shutdown and delete within 2 s");
+    require(!showed_modal && !QApplication::activeModalWidget(), "late completion opened a modal dialog during shutdown");
+    std::cout << "window_close_stage=" << stage
+              << " command_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(returned - requested).count()
+              << " destroy_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(destroyed - requested).count()
+              << " heartbeat_while_alive=1 late_open_rejected=1 old_output_retired=1 modal=0\n";
+    return requested;
+}
+
+// 同样的夹具在独立会话中让解码器按期限返回，精确确认挂起位置是探测流。
+void verifyProbePhase(const std::string& address)
+{
+    RtspBlackhole server(RtspBlackhole::StallAt::ProbeStreams, address);
+    const auto source = PlaybackSource::networkLive(server.url());
+    MediaDecoder decoder;
+    const auto started = Clock::now();
+    const auto result = decoder.open(source);
+    const auto elapsed = Clock::now() - started;
+    require(result.status == MediaOpenStatus::Timeout && result.stage == MediaOpenStage::ProbeStreams,
+            "fixture did not time out in avformat_find_stream_info");
+    std::cout << "probe_precheck_stage=ProbeStreams ffmpeg_error=" << result.ffmpegError
+              << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() << '\n';
+}
+
+// 在真实 RTSP 打开、探测或读包受阻时，关闭实际主窗口并观察对端收尾。
+void testWindowCloseRtsp(RtspBlackhole::StallAt stage, const char* name)
+{
+    const auto address = testRtspAddress();
+    if (stage == RtspBlackhole::StallAt::ProbeStreams) verifyProbePhase(address);
+    RtspBlackhole server(stage, address);
+    TestWindow window;
+    const auto source = PlaybackSource::networkLive(server.url());
+    const auto request = MainWindowCloseTestAccess::open(*window.view, source);
+    require(request > 0, "window did not accept test RTSP source");
+    waitInQt([&] { return server.isHoldingConnection(); }, 2s, "RTSP did not reach fixture stall point");
+    const auto held_at = Clock::now();
+    const bool read_stage = stage == RtspBlackhole::StallAt::VideoReadPacket;
+    PlaybackSnapshot snapshot;
+    waitInQt([&] {
+        snapshot = MainWindowCloseTestAccess::snapshot(*window.view);
+        if (!server.isHoldingConnection() || snapshot.request_id != request || snapshot.last_error) return false;
+        if (read_stage) {
+            // 60 帧小于读包高水位，已提交帧、未空队列和服务端半包共同证实经过了探测。
+            return snapshot.state == PlaybackState::Playing && snapshot.has_current_video_output &&
+                   snapshot.current_seconds >= 0.15 && snapshot.stats.video_queue_packets >= 15;
+        }
+        // PLAY 回应已发出，留出调度时间让 FFmpeg 进入已独立确认的探测阶段。
+        return snapshot.state == PlaybackState::Opening && Clock::now() - held_at >= 100ms;
+    }, 1500ms, "window did not reach the expected RTSP open, probe or read phase");
+    std::cout << "window_rtsp_stall=" << name << " bind=" << address << " socket_held=1"
+              << " video_queue=" << snapshot.stats.video_queue_packets
+              << " media_seconds=" << snapshot.current_seconds << '\n';
+    const auto requested = closeWindow(window.view, request, name);
+    waitInQt([&] { return !server.isHoldingConnection(); }, 500ms, "RTSP peer did not observe connection close");
+    const auto disconnected = Clock::now();
+    require(disconnected - requested < 2s && disconnected - held_at < 5s,
+            "RTSP connection was closed after cancellation target or deadline");
+    std::cout << "window_rtsp_stage=" << name << " cancel_to_peer_closed_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(disconnected - requested).count() << '\n';
+}
+
+// 窗口先停止尚未打开的连接，紧接着使用正常文件入口继续播放，最后在本地播放中关闭。
+void testWindowStopReopen()
+{
+    const VideoFixtures fixtures;
+    RtspBlackhole server(RtspBlackhole::StallAt::OpenInput, testRtspAddress());
+    TestWindow window;
+    const auto blocked = MainWindowCloseTestAccess::open(*window.view, PlaybackSource::networkLive(server.url()));
+    require(blocked > 0, "window did not accept blocked RTSP request");
+    waitInQt([&] { return server.isHoldingConnection(); }, 2s, "RTSP open did not block before stop");
+    const auto stopped = Clock::now();
+    require(QMetaObject::invokeMethod(window.view.data(), "stopPlayback", Qt::DirectConnection),
+            "could not invoke window stop action");
+    const auto stop_return = Clock::now();
+    require(stop_return - stopped < 100ms && outputRetired(MainWindowCloseTestAccess::snapshot(*window.view), blocked),
+            "window stop blocked or failed to retire the prior request");
+
+    window.view->setInitialFiles({fixtures.second().u8string()});
+    const auto reopen_return = Clock::now();
+    require(reopen_return - stop_return < 100ms, "reopening local media blocked the UI");
+    PlaybackSnapshot reopened;
+    waitInQt([&] {
+        reopened = MainWindowCloseTestAccess::snapshot(*window.view);
+        return reopened.request_id > blocked && reopened.state == PlaybackState::Playing &&
+               reopened.media_info.video_info.width == 80 && reopened.has_current_video_output &&
+               reopened.current_seconds >= 0.15 && !reopened.last_error && !server.isHoldingConnection();
+    }, 2s, "stop then reopen did not close the old socket and play latest local video");
+    std::cout << "window_stop_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(stop_return - stopped).count()
+              << " reopen_command_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(reopen_return - stop_return).count()
+              << " stop_to_local_output_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - stopped).count()
+              << " local_media_seconds=" << reopened.current_seconds << '\n';
+    closeWindow(window.view, reopened.request_id, "local-playing");
+}
+
+// 验证真实转码输入受阻时可关窗，并覆盖启动命令后立即关窗的竞争窗口。
+void testWindowCloseTranscode()
+{
+    const QTemporaryDir outputs("mediastudio-transcode-close-XXXXXX");
+    require(outputs.isValid(), "could not allocate transcode fixture output directory");
+    const auto address = testRtspAddress();
+    {
+        RtspBlackhole server(RtspBlackhole::StallAt::OpenInput, address);
+        TestWindow window;
+        const auto output = outputs.filePath("blocked.mp4");
+        MainWindowCloseTestAccess::startTranscode(*window.view, QString::fromStdString(server.url()), output);
+        waitInQt([&] { return server.isHoldingConnection(); }, 2s, "transcode input did not block in RTSP open");
+        const auto requested = closeWindow(window.view, 0, "transcode-open");
+        waitInQt([&] { return !server.isHoldingConnection(); }, 500ms, "transcode did not close the RTSP peer");
+        require(Clock::now() - requested < 2s && !QFileInfo::exists(output),
+                "blocked transcode outlived shutdown or produced an output file");
+        std::cout << "transcode_input_socket_closed=1 bind=" << address
+                  << " cancel_to_peer_closed_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - requested).count() << '\n';
+    }
+
+    RtspBlackhole server(RtspBlackhole::StallAt::OpenInput, address);
+    TestWindow window;
+    const auto output = outputs.filePath("starting.mp4");
+    closeWindow(window.view, 0, "transcode-starting", [&] {
+        MainWindowCloseTestAccess::startTranscode(*window.view, QString::fromStdString(server.url()), output);
+    });
+    require(!QFileInfo::exists(output), "transcode started after the cancellation was posted");
+}
+
+// 在真实打开文件槽的嵌套事件循环里关闭主窗口，确认槽返回后才销毁窗口。
+void testWindowCloseModal()
+{
+    TestWindow window;
+    QEventLoop loop;
+    QTimer poll;
+    bool close_deferred = false;
+    bool dialog_rejected = false;
+    bool slot_returned = false;
+    bool destroyed_after_slot = false;
+    bool deadline_hit = false;
+    Clock::duration close_elapsed{};
+    QObject::connect(window.view.data(), &QObject::destroyed, &loop, [&] {
+        destroyed_after_slot = slot_returned;
+        loop.quit();
+    });
+    QObject::connect(&poll, &QTimer::timeout, &loop, [&] {
+        auto* dialog = qobject_cast<QFileDialog*>(QApplication::activeModalWidget());
+        if (!dialog || dialog->parentWidget() != window.view.data()) return;
+        poll.stop();
+        QObject::connect(dialog, &QDialog::rejected, &loop, [&] { dialog_rejected = !window.view.isNull(); });
+        const auto started = Clock::now();
+        close_deferred = !window.view->close() && !window.view.isNull();
+        close_elapsed = Clock::now() - started;
+    });
+    poll.start(5);
+    QTimer::singleShot(2500ms, &loop, [&] {
+        deadline_hit = true;
+        if (auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget())) dialog->reject();
+        loop.quit();
+    });
+    QTimer::singleShot(0, &loop, [&] {
+        slot_returned = QMetaObject::invokeMethod(window.view.data(), "openFile", Qt::DirectConnection);
+    });
+    loop.exec();
+
+    require(close_deferred && close_elapsed < 100ms, "close while the file dialog was active did not defer promptly");
+    require(dialog_rejected && !deadline_hit, "window close did not reject the active file dialog");
+    require(window.view.isNull() && destroyed_after_slot, "window was not destroyed after the modal slot unwound");
+    std::cout << "window_close_stage=qt-file-dialog command_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(close_elapsed).count()
+              << " first_close_deferred=1 dialog_rejected=1 slot_returned_before_destruction=1\n";
+}
+
 // 直接验证两个异步输出入口在三种标签发生变化时拒绝迟到数据。
 void testWidgetEpochs()
 {
@@ -411,7 +699,7 @@ void testWidgetEpochs()
 
 } // namespace
 
-// 不显示窗口。外层 CTest 超时覆盖线程无法退出的失败情形。
+// 离屏运行实际 Qt 事件循环。外层 CTest 超时覆盖线程无法退出的失败情形。
 int main(int argc, char* argv[])
 {
     try {
@@ -420,10 +708,21 @@ int main(int argc, char* argv[])
             testPacketEpochs();
             return 0;
         }
+        if (mode == "window-close-modal") {
+            // 离屏用例只运行 Qt 文件对话框，不依赖操作系统的原生模态事件循环。
+            QCoreApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
+        }
         QApplication app(argc, argv);
+        app.setQuitOnLastWindowClosed(false);
         if (mode == "controller-local") testControllerLocal();
         else if (mode == "controller-supersede") testControllerSupersede();
         else if (mode == "controller-blocked-read") testControllerBlockedRead();
+        else if (mode == "window-close-open") testWindowCloseRtsp(RtspBlackhole::StallAt::OpenInput, "open");
+        else if (mode == "window-close-probe") testWindowCloseRtsp(RtspBlackhole::StallAt::ProbeStreams, "probe");
+        else if (mode == "window-close-read") testWindowCloseRtsp(RtspBlackhole::StallAt::VideoReadPacket, "read");
+        else if (mode == "window-stop-reopen") testWindowStopReopen();
+        else if (mode == "window-close-transcode") testWindowCloseTranscode();
+        else if (mode == "window-close-modal") testWindowCloseModal();
         else if (mode == "widget-epochs") testWidgetEpochs();
         else throw std::runtime_error("unknown session test");
         return 0;

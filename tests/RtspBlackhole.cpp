@@ -93,12 +93,20 @@ std::array<unsigned char, 28> h264Rtp(std::uint16_t sequence)
 class RtspBlackhole::Impl {
 public:
     // 先绑定再启动线程；若初始化失败，由成员析构关闭监听 socket。
-    explicit Impl(StallAt stall) : listener_(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)), stall_(stall)
+    Impl(StallAt stall, const std::string& bind_address)
+        : listener_(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)), stall_(stall), bind_address_(bind_address)
     {
         if (listener_.handle == INVALID_SOCKET) socketError("socket");
         sockaddr_in address{};
         address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (InetPtonA(AF_INET, bind_address_.c_str(), &address.sin_addr) != 1) {
+            throw std::runtime_error("RTSP fixture address must be a numeric IPv4 address");
+        }
+        // 只允许显式回环或私有地址，防止夹具监听所有接口或公开地址。
+        const auto ip = ntohl(address.sin_addr.s_addr);
+        if ((ip >> 24) != 127 && (ip >> 24) != 10 && (ip >> 20) != 0xAC1 && (ip >> 16) != 0xC0A8) {
+            throw std::runtime_error("RTSP fixture bind address must be loopback or private IPv4");
+        }
         int size = sizeof(address);
         if (bind(listener_.handle, reinterpret_cast<sockaddr*>(&address), size) == SOCKET_ERROR ||
             listen(listener_.handle, 1) == SOCKET_ERROR ||
@@ -106,7 +114,7 @@ public:
             socketError("bind/listen/getsockname");
         }
         setNonBlocking(listener_.handle);
-        url_ = "rtsp://127.0.0.1:" + std::to_string(ntohs(address.sin_port)) + "/blackhole";
+        url_ = "rtsp://" + bind_address_ + ":" + std::to_string(ntohs(address.sin_port)) + "/blackhole";
         worker_ = std::thread([this] {
             try {
                 serve();
@@ -204,7 +212,8 @@ private:
         const Socket peer(accept(listener_.handle, nullptr, nullptr));
         if (peer.handle == INVALID_SOCKET) socketError("accept");
         setNonBlocking(peer.handle);
-        const bool video = stall_ == StallAt::VideoReadPacket;
+        const bool probing = stall_ == StallAt::ProbeStreams;
+        const bool video = probing || stall_ == StallAt::VideoReadPacket;
         std::string pending;
         while (!stopping_.load()) {
             const auto request = readRequest(peer.handle, pending);
@@ -223,11 +232,16 @@ private:
             if (method == "OPTIONS") {
                 reply += "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n";
             } else if (method == "DESCRIBE") {
-                std::string sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n"
-                    "s=MediaStudio CTest\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\na=control:*\r\n";
+                std::string sdp = "v=0\r\no=- 0 0 IN IP4 " + bind_address_ + "\r\n"
+                    "s=MediaStudio CTest\r\nc=IN IP4 " + bind_address_ + "\r\nt=0 0\r\na=control:*\r\n";
                 if (video) {
                     sdp += "m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n"
-                           "a=fmtp:96 packetization-mode=1;sprop-parameter-sets=Z0LACtolsBEAAAMAAQAAAwAyjxImoA==,aM4PyA==\r\n";
+                           "a=fmtp:96 packetization-mode=1";
+                    // 探测用例省略 SPS/PPS，其余握手正常，使流尺寸只能从后续 RTP 获得。
+                    if (!probing) {
+                        sdp += ";sprop-parameter-sets=Z0LACtolsBEAAAMAAQAAAwAyjxImoA==,aM4PyA==";
+                    }
+                    sdp += "\r\n";
                 } else {
                     sdp += "m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000/1\r\n";
                 }
@@ -251,7 +265,11 @@ private:
             }
             if (!writeAll(peer.handle, reply) || method == "TEARDOWN") return;
             if (method == "PLAY") {
-                if (video) {
+                if (probing) {
+                    // PLAY 成功，但探测一直等缺失的解码参数。对端关闭前保留 TCP。
+                    holding_.store(true);
+                    continue;
+                } else if (video) {
                     if (!sendVideoThenStall(peer.handle)) return;
                 } else {
                     for (std::uint16_t seq = 1; seq <= 96; ++seq) {
@@ -268,6 +286,7 @@ private:
     Winsock winsock_;
     Socket listener_;
     const StallAt stall_;
+    const std::string bind_address_;
     std::string url_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> holding_{false};
@@ -275,7 +294,9 @@ private:
     std::thread worker_;
 };
 
-RtspBlackhole::RtspBlackhole(StallAt stall) : impl_(std::make_unique<Impl>(stall)) {}
+// 创建指定地址上的单会话夹具，地址默认仍是回环。
+RtspBlackhole::RtspBlackhole(StallAt stall, const std::string& bind_address)
+    : impl_(std::make_unique<Impl>(stall, bind_address)) {}
 RtspBlackhole::~RtspBlackhole() = default;
 std::string RtspBlackhole::url() const { return impl_->url(); }
 bool RtspBlackhole::isHoldingConnection() const noexcept { return impl_->isHoldingConnection(); }

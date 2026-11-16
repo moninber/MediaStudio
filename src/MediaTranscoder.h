@@ -33,6 +33,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <functional>
 #include "MediaInfo.h"
@@ -74,13 +75,16 @@ public:
         std::function<void(float)> progress_cb = nullptr
     );
 
-    /** @brief 取消正在进行的转码 */
-    void cancel();
+    /** @brief 取消此任务，包括线程尚未进入 transcode() 的情况 */
+    void cancel() noexcept;
 
     /** @brief 获取最后的错误信息 */
     const std::string& getLastError() const { return last_error_; }
 
 private:
+    // FFmpeg 在输入 I/O 阻塞时查询此标志，不等待 GUI 线程。
+    static int interruptInput(void* opaque) noexcept;
+
     /**
      * @brief 处理视频流转码
      * 解码 → 缩放 → 编码 → 写入
@@ -115,6 +119,6 @@ private:
         std::function<void(float)>& progress_cb
     );
 
-    bool cancelled_;        // 取消标志
+    std::atomic<bool> cancelled_{false}; // 一次转码任务的取消状态，任务内不会复位。
     std::string last_error_; // 最后错误信息
 };
