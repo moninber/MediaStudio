@@ -100,13 +100,14 @@ public:
      * @brief 跳转到指定时间位置
      * @param seconds 目标时间（秒）
      * 
-     * 通过 av_seek_frame() 向前查找关键帧。定位失败时保留解码器和滤镜状态。
+     * 本地文件通过 av_seek_frame() 查找关键帧。网络直播不允许定位。
      */
     bool seek(double seconds);
 
     // 从给定时间重新建立解码和输出状态，不改变解封装读取位置。
     void flushAfterDiscontinuity(double seconds);
 
+    // 只允许本地文件变速，网络直播只接受原速。
     bool setPlaybackSpeed(float speed);
 
     /** @brief 获取媒体文件信息（用于显示和数据库存储） */

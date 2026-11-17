@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -90,6 +91,7 @@ private:
     std::optional<OpenRequest> pending_open_;
     std::optional<double> pending_seek_;
     PlaybackSnapshot snapshot_;
+    std::optional<std::chrono::steady_clock::time_point> live_output_started_at_;
     std::shared_ptr<MediaIoControl> active_io_;
     VideoWidget* video_widget_ = nullptr;
     bool supervisor_busy_ = false;

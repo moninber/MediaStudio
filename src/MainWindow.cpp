@@ -7,9 +7,12 @@
 #include <QApplication>
 #include <QCloseEvent>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QPointer>
 #include <QFileDialog>
+#include <QFormLayout>
 #include <QInputDialog>
+#include <QLineEdit>
 #include <QMessageBox>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
@@ -21,22 +24,27 @@
 #include <QDropEvent>
 #include <QMimeData>
 #include <QUrl>
-#include <QFileInfo>
 #include <QToolBar>
 #include <QStatusBar>
 #include <QAction>
 #include <QShortcut>
 #include <QScrollBar>
 #include <QScopedValueRollback>
+#include <QSignalBlocker>
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <iostream>
+#include <optional>
 #include <system_error>
+#include <utility>
 
 namespace {
 
+constexpr std::array<float, 8> kPlaybackSpeeds{0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f, 4.0f};
+constexpr int kNormalSpeedIndex = 3;
+
 // 播放按钮在空闲、失败或结束时可以从当前播放列表项重新开始。
-bool canOpenSelectedFile(PlaybackState state)
+bool canOpenSelectedSource(PlaybackState state)
 {
     return state == PlaybackState::Idle || state == PlaybackState::Failed || state == PlaybackState::Ended;
 }
@@ -48,6 +56,31 @@ bool canSeek(const PlaybackSnapshot& snapshot)
            std::isfinite(snapshot.duration_seconds) && snapshot.duration_seconds > 0.0;
 }
 
+// 2.1 直播不支持暂停，失败或停止后可重新选择或打开当前列表项。
+bool canTogglePlayback(const PlaybackSnapshot& snapshot)
+{
+    return canOpenSelectedSource(snapshot.state) ||
+           (snapshot.source_kind == PlaybackSourceKind::LocalFile &&
+            (snapshot.is_playing || snapshot.is_paused));
+}
+
+// 直播只使用固定标签，禁止将原地址、账号、查询参数填入任何展示控件。
+QString rtspLabel(RtspTransport transport)
+{
+    return transport == RtspTransport::Udp ? "RTSP/UDP · 稳定" : "RTSP/TCP · 稳定";
+}
+
+QString playbackDisplayLabel(const PlaybackSnapshot& snapshot)
+{
+    if (snapshot.source_kind == PlaybackSourceKind::NetworkLive) {
+        if (snapshot.protocol == PlaybackProtocol::Rtsp && snapshot.rtsp_transport) {
+            return rtspLabel(*snapshot.rtsp_transport);
+        }
+        return "网络直播";
+    }
+    return QString::fromStdString(snapshot.display_name);
+}
+
 } // namespace
 
 // ============================================================
@@ -55,7 +88,7 @@ bool canSeek(const PlaybackSnapshot& snapshot)
 // ============================================================
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
-    , current_playlist_index_(0)
+    , current_playlist_index_(-1)
     , db_connected_(false)
 {
     // 创建核心组件
@@ -114,6 +147,7 @@ void MainWindow::setupMenuBar()
     // 文件菜单
     QMenu* menu_file = menuBar()->addMenu("文件");
     menu_file->addAction("打开文件(&O)", QKeySequence(), this, &MainWindow::openFile);
+    menu_file->addAction("打开网络媒体…", this, &MainWindow::openNetworkMedia);
     menu_file->addAction("添加到播放列表", this, &MainWindow::addToPlaylist);
     menu_file->addSeparator();
     menu_file->addAction("退出(Esc)", QKeySequence(Qt::Key_Escape), this, &QWidget::close);
@@ -137,14 +171,14 @@ void MainWindow::setupMenuBar()
         if (isClosing()) return;
         QScopedValueRollback modal_scope(modal_depth_, modal_depth_ + 1);
         QMessageBox::information(this, "快捷键说明",
-            "SPACE - 播放/暂停\n"
-            "LEFT/RIGHT - 后退/前进5秒\n"
+            "SPACE - 播放/暂停（本地文件支持暂停）\n"
+            "LEFT/RIGHT - 本地文件后退/前进5秒\n"
             "UP/DOWN - 音量增大/减小\n"
             "PAGEUP/PAGEDOWN - 上一曲/下一曲\n"
             "ESC - 退出程序\n"
             "E - 切换视频特效\n"
             "V - 切换频谱可视化\n"
-            "1/2/3/4 - 播放速度 0.5x/1.0x/1.5x/2.0x\n"
+            "1/2/3/4 - 本地文件速度 0.5x/1.0x/1.5x/2.0x\n"
             "M - 静音/取消静音\n"
             "F - 切换收藏");
     });
@@ -230,7 +264,7 @@ void MainWindow::setupToolBar()
     toolbar->addWidget(new QLabel(" 速度:"));
     combo_speed_ = new QComboBox();
     combo_speed_->addItems({"0.25x", "0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x", "4.0x"});
-    combo_speed_->setCurrentIndex(3);  // 默认1.0x
+    combo_speed_->setCurrentIndex(local_speed_index_);
     combo_speed_->setMaximumWidth(80);
     toolbar->addWidget(combo_speed_);
 
@@ -283,9 +317,10 @@ void MainWindow::setupDockWidgets()
     QObject::connect(btn_add, &QPushButton::clicked, this, &MainWindow::addToPlaylist);
     QObject::connect(btn_remove, &QPushButton::clicked, this, &MainWindow::removeFromPlaylist);
     QObject::connect(btn_clear, &QPushButton::clicked, this, [this]() {
+        if (isClosing()) return;
         list_playlist_->clear();
         playlist_.clear();
-        current_playlist_index_ = 0;
+        current_playlist_index_ = -1;
     });
     QObject::connect(list_playlist_, &QListWidget::itemDoubleClicked,
         this, &MainWindow::playlistItemDoubleClicked);
@@ -346,7 +381,7 @@ void MainWindow::setupBottomBar()
     // 状态栏
     label_debug_stats_ = new QLabel("FPS -- | A/V -- ms | Drop -- | A -- / V -- | Buf -- ms");
     statusBar()->addPermanentWidget(label_debug_stats_);
-    statusBar()->showMessage("就绪 - 拖放或打开文件开始播放");
+    statusBar()->showMessage("就绪 - 打开文件或网络媒体开始播放");
 
     // 将视频和底部栏组合为中央部件
     QWidget* central_container = new QWidget();
@@ -644,15 +679,69 @@ void MainWindow::openFile()
 
     if (isClosing() || filename.isEmpty()) return;
 
-    std::string file_path = filename.toStdString();
+    const int row = appendPlaylistEntry(PlaybackSource::localFile(filename.toStdString()));
+    if (row >= 0) openPlaylistEntry(row);
+    else statusBar()->showMessage("请选择本地文件；RTSP 地址请使用“打开网络媒体”。");
+}
 
-    // 添加到播放列表
-    playlist_.push_back(file_path);
-    current_playlist_index_ = (int)playlist_.size() - 1;
-    list_playlist_->addItem(QFileInfo(filename).fileName());
-    list_playlist_->setCurrentRow(current_playlist_index_);
+// 输入框以密码模式保存完整连接地址。只有成功校验的源对象离开对话框。
+void MainWindow::openNetworkMedia()
+{
+    if (isClosing()) return;
+    QScopedValueRollback modal_scope(modal_depth_, modal_depth_ + 1);
+    QDialog dialog(this);
+    dialog.setObjectName("networkMediaDialog");
+    dialog.setWindowTitle("打开网络媒体");
 
-    requestLoadAndPlay(file_path);
+    auto* form = new QFormLayout(&dialog);
+    auto* url_input = new QLineEdit(&dialog);
+    url_input->setObjectName("networkUrlInput");
+    url_input->setMinimumWidth(350);
+    url_input->setPlaceholderText("rtsp://主机:端口/流名");
+    url_input->setEchoMode(QLineEdit::Password);
+    url_input->setInputMethodHints(Qt::ImhHiddenText | Qt::ImhSensitiveData | Qt::ImhNoPredictiveText);
+    form->addRow("RTSP 地址：", url_input);
+
+    auto* transport = new QComboBox(&dialog);
+    transport->setObjectName("rtspTransportSelector");
+    transport->addItem("TCP", static_cast<int>(RtspTransport::Tcp));
+    transport->addItem("UDP", static_cast<int>(RtspTransport::Udp));
+    form->addRow("传输方式：", transport);
+    form->addRow("播放模式：", new QLabel("稳定", &dialog));
+
+    auto* error_label = new QLabel(&dialog);
+    error_label->setObjectName("networkUrlError");
+    error_label->setWordWrap(true);
+    form->addRow(error_label);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Open | QDialogButtonBox::Cancel, &dialog);
+    buttons->setObjectName("networkDialogButtons");
+    buttons->button(QDialogButtonBox::Open)->setText("打开");
+    buttons->button(QDialogButtonBox::Cancel)->setText("取消");
+    form->addRow(buttons);
+
+    std::optional<PlaybackSource> selected;
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
+        if (isClosing()) { dialog.reject(); return; }
+        const auto selected_transport = static_cast<RtspTransport>(transport->currentData().toInt());
+        auto result = createStableRtspSource(url_input->text().toStdString(), selected_transport);
+        if (!result.source) {
+            error_label->setText(result.error == RtspSourceError::UnsupportedProtocol
+                ? "当前版本仅支持 RTSP 直播地址。" : "请输入有效的 RTSP 地址。");
+            url_input->setFocus();
+            return;
+        }
+        selected = std::move(result.source);
+        url_input->setText(QString{}); // 同时清除输入框的编辑历史。
+        dialog.accept();
+    });
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    connect(&dialog, &QDialog::finished, url_input, [url_input] { url_input->setText(QString{}); });
+    connect(url_input, &QLineEdit::textEdited, error_label, &QLabel::clear);
+    url_input->setFocus();
+
+    if (dialog.exec() != QDialog::Accepted || isClosing() || !selected) return;
+    openPlaylistEntry(appendPlaylistEntry(std::move(*selected)));
 }
 
 // 根据当前请求状态决定播放、暂停或从列表重新打开。
@@ -660,14 +749,14 @@ void MainWindow::togglePlayPause()
 {
     if (isClosing()) return;
     const auto snapshot = player_->getPlaybackSnapshot();
-    if (snapshot.request_id != playback_request_id_) return;
+    if (snapshot.request_id != playback_request_id_ || !canTogglePlayback(snapshot)) return;
     if (snapshot.is_playing || snapshot.is_paused) {
         player_->togglePlayPause();
-    } else if (canOpenSelectedFile(snapshot.state)) {
+    } else if (canOpenSelectedSource(snapshot.state)) {
         if (playlist_.empty()) {
             openFile();
         } else {
-            requestLoadAndPlay(playlist_[current_playlist_index_]);
+            openPlaylistEntry(std::max(0, current_playlist_index_));
         }
     }
 }
@@ -718,29 +807,26 @@ void MainWindow::changeVolume(int volume)
 
 void MainWindow::changeSpeed(int index)
 {
-    if (isClosing() || !combo_speed_->isEnabled()) return;
-    QStringList speeds = {"0.25", "0.5", "0.75", "1.0", "1.25", "1.5", "2.0", "4.0"};
-    if (index >= 0 && index < speeds.size()) {
-        float speed = speeds[index].toFloat();
-        player_->setSpeed(speed);
-        statusBar()->showMessage(QString("播放速度: %1x").arg(speeds[index]));
-    }
+    if (isClosing() || index < 0 || index >= static_cast<int>(kPlaybackSpeeds.size())) return;
+    const auto snapshot = player_->getPlaybackSnapshot();
+    if (snapshot.request_id != playback_request_id_ || snapshot.source_kind != PlaybackSourceKind::LocalFile) return;
+    local_speed_index_ = index;
+    player_->setSpeed(kPlaybackSpeeds[index]);
+    statusBar()->showMessage(QString("播放速度: %1").arg(combo_speed_->itemText(index)));
 }
 
 void MainWindow::nextFile()
 {
     if (isClosing() || playlist_.empty()) return;
-    current_playlist_index_ = (current_playlist_index_ + 1) % (int)playlist_.size();
-    list_playlist_->setCurrentRow(current_playlist_index_);
-    requestLoadAndPlay(playlist_[current_playlist_index_]);
+    openPlaylistEntry((current_playlist_index_ + 1) % static_cast<int>(playlist_.size()));
 }
 
 void MainWindow::prevFile()
 {
     if (isClosing() || playlist_.empty()) return;
-    current_playlist_index_ = (current_playlist_index_ - 1 + (int)playlist_.size()) % (int)playlist_.size();
-    list_playlist_->setCurrentRow(current_playlist_index_);
-    requestLoadAndPlay(playlist_[current_playlist_index_]);
+    const int count = static_cast<int>(playlist_.size());
+    const int row = current_playlist_index_ < 0 ? count - 1 : (current_playlist_index_ - 1 + count) % count;
+    openPlaylistEntry(row);
 }
 
 void MainWindow::toggleEffect()
@@ -808,10 +894,18 @@ void MainWindow::transcodeDialog()
     QString input = QFileDialog::getOpenFileName(this, "选择源文件", "",
         "媒体文件 (*.mp4 *.mkv *.avi *.mov *.flv);;所有文件 (*.*)");
     if (isClosing() || input.isEmpty()) return;
+    if (!PlaybackSource::localFile(input.toStdString()).isValid()) {
+        statusBar()->showMessage("转码源请选择本地文件。");
+        return;
+    }
 
     QString output = QFileDialog::getSaveFileName(this, "保存转码文件", "",
         "MP4 (*.mp4);;MKV (*.mkv);;AVI (*.avi)");
     if (isClosing() || output.isEmpty()) return;
+    if (!PlaybackSource::localFile(output.toStdString()).isValid()) {
+        statusBar()->showMessage("转码目标请选择本地文件。");
+        return;
+    }
     startTranscode(input, output);
 }
 
@@ -873,33 +967,32 @@ void MainWindow::addToPlaylist()
         "媒体文件 (*.mp4 *.mkv *.avi *.mov *.flv *.wmv *.mp3 *.wav);;所有文件 (*.*)");
     if (isClosing()) return;
 
+    bool rejected = false;
     for (const QString& file : files) {
-        playlist_.push_back(file.toStdString());
-        list_playlist_->addItem(QFileInfo(file).fileName());
+        if (appendPlaylistEntry(PlaybackSource::localFile(file.toStdString())) < 0) rejected = true;
     }
+    if (rejected) statusBar()->showMessage("非本地地址未添加；RTSP 请使用“打开网络媒体”。");
 }
 
 void MainWindow::removeFromPlaylist()
 {
     if (isClosing()) return;
     int row = list_playlist_->currentRow();
-    if (row < 0) return;
+    if (row < 0 || row >= static_cast<int>(playlist_.size())) return;
 
-    list_playlist_->takeItem(row);
+    delete list_playlist_->takeItem(row);
     playlist_.erase(playlist_.begin() + row);
-    if (current_playlist_index_ >= (int)playlist_.size()) {
-        current_playlist_index_ = 0;
+    if (row < current_playlist_index_) {
+        --current_playlist_index_;
+    } else if (row == current_playlist_index_ && row >= static_cast<int>(playlist_.size())) {
+        current_playlist_index_ = playlist_.empty() ? -1 : 0;
     }
 }
 
 void MainWindow::playlistItemDoubleClicked(QListWidgetItem* item)
 {
     if (isClosing()) return;
-    int row = list_playlist_->row(item);
-    if (row < 0 || row >= (int)playlist_.size()) return;
-
-    current_playlist_index_ = row;
-    requestLoadAndPlay(playlist_[row]);
+    openPlaylistEntry(list_playlist_->row(item));
 }
 
 // 只读取一次快照。旧请求即使完成，也不更新界面或登记播放历史。
@@ -909,30 +1002,38 @@ void MainWindow::updatePlaybackInfo()
     const auto snapshot = player_->getPlaybackSnapshot();
     if (snapshot.request_id != playback_request_id_) return;
     updatePlaybackControls(snapshot);
+    updateMediaInfoPanel(snapshot);
+    syncLocalLibrary(snapshot);
+}
 
+// 文件显示容器、总时长；直播展示协议与轨道信息，不读取连接地址或文件字段。
+void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
+{
     const auto& info = snapshot.media_info;
+    const bool live = snapshot.source_kind == PlaybackSourceKind::NetworkLive;
     QString info_text;
-    if (!info.file_name.empty()) {
+    if (live) {
+        info_text += QString("<h3>%1</h3><p>类型: 直播</p>").arg(playbackDisplayLabel(snapshot).toHtmlEscaped());
+    } else if (!info.file_name.empty()) {
         info_text += QString("<h3>%1</h3>").arg(QString::fromStdString(info.file_name).toHtmlEscaped());
         info_text += QString("<p>格式: %1</p>").arg(QString::fromStdString(info.format_name).toHtmlEscaped());
         info_text += QString("<p>时长: %1秒</p>").arg(info.duration, 0, 'f', 1);
+    }
 
-        if (info.has_video) {
-            info_text += "<hr><h4>视频</h4>";
-            info_text += QString("<p>编码: %1</p>").arg(QString::fromStdString(info.video_info.codec_name).toHtmlEscaped());
-            info_text += QString("<p>分辨率: %1x%2</p>").arg(info.video_info.width).arg(info.video_info.height);
-            info_text += QString("<p>帧率: %1 fps</p>").arg(info.video_info.frame_rate, 0, 'f', 1);
-            info_text += QString("<p>特效: %1</p>").arg(
-                QString::fromStdString(videoEffectToString(player_->getEffect())));
-        }
+    if (info.has_video) {
+        info_text += "<hr><h4>视频</h4>";
+        info_text += QString("<p>编码: %1</p>").arg(QString::fromStdString(info.video_info.codec_name).toHtmlEscaped());
+        info_text += QString("<p>分辨率: %1x%2</p>").arg(info.video_info.width).arg(info.video_info.height);
+        info_text += QString("<p>帧率: %1 fps</p>").arg(info.video_info.frame_rate, 0, 'f', 1);
+        info_text += QString("<p>特效: %1</p>").arg(
+            QString::fromStdString(videoEffectToString(player_->getEffect())));
+    }
 
-        if (info.has_audio) {
-            info_text += "<hr><h4>音频</h4>";
-            info_text += QString("<p>编码: %1</p>").arg(QString::fromStdString(info.audio_info.codec_name).toHtmlEscaped());
-            info_text += QString("<p>采样率: %1 Hz</p>").arg(info.audio_info.sample_rate);
-            info_text += QString("<p>声道: %1</p>").arg(info.audio_info.channels);
-        }
-
+    if (info.has_audio) {
+        info_text += "<hr><h4>音频</h4>";
+        info_text += QString("<p>编码: %1</p>").arg(QString::fromStdString(info.audio_info.codec_name).toHtmlEscaped());
+        info_text += QString("<p>采样率: %1 Hz</p>").arg(info.audio_info.sample_rate);
+        info_text += QString("<p>声道: %1</p>").arg(info.audio_info.channels);
     }
     if (info_text != last_media_info_html_) {
         int scroll_value = text_media_info_->verticalScrollBar()->value();
@@ -940,26 +1041,39 @@ void MainWindow::updatePlaybackInfo()
         text_media_info_->verticalScrollBar()->setValue(scroll_value);
         last_media_info_html_ = info_text;
     }
-    syncLocalLibrary(snapshot);
 }
 
 // 根据同一快照刷新播放状态、定位能力、进度和实时统计。
 void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
 {
+    const bool live = snapshot.source_kind == PlaybackSourceKind::NetworkLive;
     btn_play_->setText(snapshot.is_playing && !snapshot.is_paused ? "⏸" : "▶");
+    btn_play_->setEnabled(canTogglePlayback(snapshot));
+    btn_play_->setToolTip(live && !canTogglePlayback(snapshot) ? "直播暂不支持暂停，请使用停止。" : "播放/暂停 (Space)");
     const bool seekable = canSeek(snapshot);
     slider_progress_->setEnabled(seekable);
-    combo_speed_->setEnabled(snapshot.source_kind == PlaybackSourceKind::LocalFile ||
-                             snapshot.capabilities.can_change_speed);
+    slider_progress_->setToolTip(live ? "直播不可定位" : "点击或拖动跳转播放位置");
+    combo_speed_->setEnabled(!live && (snapshot.source_kind == PlaybackSourceKind::LocalFile ||
+                                       snapshot.capabilities.can_change_speed));
+    // 直播的固定 1.0x 仅改变显示，不发送速度命令或覆盖文件偏好。
+    const int visible_speed = live ? kNormalSpeedIndex : local_speed_index_;
+    if (combo_speed_->currentIndex() != visible_speed) {
+        const QSignalBlocker blocker(combo_speed_);
+        combo_speed_->setCurrentIndex(visible_speed);
+    }
 
+    // 打开媒体后后台可能仍在等待首份输出。首份音频或视频到达才显示直播正在播放。
+    const auto displayed_state = live && snapshot.state == PlaybackState::Playing && !snapshot.live_elapsed_seconds
+        ? PlaybackState::Buffering : snapshot.state;
     // 状态变化时才写状态栏，保留音量、倍速或特效操作出现时的提示。
-    if (snapshot.request_id != displayed_request_id_ || snapshot.state != displayed_state_) {
-        const QString name = QString::fromStdString(snapshot.display_name);
+    if (snapshot.request_id != displayed_request_id_ || displayed_state != displayed_state_) {
+        const QString name = playbackDisplayLabel(snapshot);
         QString status;
-        switch (snapshot.state) {
+        switch (displayed_state) {
             case PlaybackState::Idle: status = "已停止"; break;
             case PlaybackState::Opening: status = "正在加载: " + name; break;
-            case PlaybackState::Buffering: status = "正在缓冲: " + name; break;
+            case PlaybackState::Buffering: status = (live && !snapshot.live_elapsed_seconds
+                ? "已连接，等待音视频: " : "正在缓冲: ") + name; break;
             case PlaybackState::Playing: status = "正在播放: " + name; break;
             case PlaybackState::Draining: status = "正在播放: " + name; break;
             case PlaybackState::Paused: status = "已暂停"; break;
@@ -970,7 +1084,7 @@ void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
         }
         statusBar()->showMessage(status);
         displayed_request_id_ = snapshot.request_id;
-        displayed_state_ = snapshot.state;
+        displayed_state_ = displayed_state;
     }
 
     const auto formatTime = [](double seconds) {
@@ -979,13 +1093,21 @@ void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
     };
     const double current = std::isfinite(snapshot.current_seconds) ? std::max(0.0, snapshot.current_seconds) : 0.0;
     const double duration = snapshot.duration_seconds;
-    const bool known_duration = snapshot.capabilities.duration_known && std::isfinite(duration) && duration > 0.0;
-    label_time_->setText(formatTime(current));
+    const bool known_duration = !live && snapshot.capabilities.duration_known && std::isfinite(duration) && duration > 0.0;
+    if (live) {
+        const auto elapsed = snapshot.live_elapsed_seconds;
+        label_time_->setText(QString("已播放 %1").arg(elapsed && std::isfinite(*elapsed)
+            ? formatTime(std::max(0.0, *elapsed)) : QString("--:--")));
+    } else {
+        label_time_->setText(formatTime(current));
+    }
     if (!slider_progress_->isSliderDown() || !seekable) {
         const double ratio = known_duration ? std::clamp(current / duration, 0.0, 1.0) : 0.0;
         slider_progress_->setValue(static_cast<int>(ratio * 1000));
     }
-    if (known_duration) {
+    if (live) {
+        label_duration_->setText("直播");
+    } else if (known_duration) {
         label_duration_->setText(formatTime(duration));
     } else {
         label_duration_->setText(snapshot.state == PlaybackState::Idle ? "00:00" : "--:--");
@@ -1009,7 +1131,8 @@ void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
 // GUI 持有数据库连接。每个成功打开的本地请求最多做一次查询或入库，再核对编号后记录历史。
 void MainWindow::syncLocalLibrary(const PlaybackSnapshot& snapshot)
 {
-    if (library_request_id_ == 0 || snapshot.request_id != library_request_id_) return;
+    if (snapshot.source_kind != PlaybackSourceKind::LocalFile || library_request_id_ == 0 ||
+        snapshot.request_id != library_request_id_) return;
     if (snapshot.state == PlaybackState::Failed || snapshot.state == PlaybackState::Idle ||
         snapshot.state == PlaybackState::Stopping) {
         library_request_id_ = 0;
@@ -1018,7 +1141,7 @@ void MainWindow::syncLocalLibrary(const PlaybackSnapshot& snapshot)
     if (snapshot.state == PlaybackState::Opening || snapshot.media_info.file_path.empty()) return;
 
     library_request_id_ = 0;
-    if (!db_connected_ || snapshot.source_kind != PlaybackSourceKind::LocalFile) return;
+    if (!db_connected_) return;
     auto info = snapshot.media_info;
     MediaInfo db_info;
     if (database_->getMediaByPath(info.file_path, db_info)) {
@@ -1058,39 +1181,58 @@ void MainWindow::toggleMute()
 // ============================================================
 // 辅助方法
 // ============================================================
-// 打开对话框、播放列表、拖放及启动文件统一提交给控制器。
-void MainWindow::requestLoadAndPlay(const std::string& path)
+// 本地和直播共用列表，但控件永远只保存脱敏标签，不持有原地址。
+int MainWindow::appendPlaylistEntry(PlaybackSource source)
 {
-    requestPlayback(PlaybackSource::localFile(path));
+    if (isClosing() || !source.isValid()) return -1;
+    QString label;
+    if (source.kind() == PlaybackSourceKind::NetworkLive && source.protocol() == PlaybackProtocol::Rtsp) {
+        label = rtspLabel(source.liveOptions()->rtsp_transport) +
+                QString(" #%1").arg(next_network_playlist_number_++);
+    } else {
+        label = QString::fromStdString(source.displayName());
+    }
+    playlist_.push_back(std::move(source));
+    list_playlist_->addItem(label);
+    return static_cast<int>(playlist_.size()) - 1;
 }
 
-// 关闭开始后拒绝新的源请求。现有菜单、拖放和命令行仍只构造本地源。
+// 列表双击、上一项/下一项和初始输入保留每条源各自的传输设置。
+void MainWindow::openPlaylistEntry(int row)
+{
+    if (isClosing() || row < 0 || row >= static_cast<int>(playlist_.size())) return;
+    if (requestPlayback(playlist_[row]) == 0) return;
+    current_playlist_index_ = row;
+    list_playlist_->setCurrentRow(row);
+}
+
+// 关闭开始后拒绝新的源请求，只有本地文件登记待处理的媒体库请求。
 std::uint64_t MainWindow::requestPlayback(const PlaybackSource& source)
 {
-    if (isClosing()) return 0;
+    if (isClosing() || !source.isValid()) return 0;
     const auto request = player_->requestOpen(source);
     if (request == 0) return 0;
     playback_request_id_ = request;
     library_request_id_ = source.kind() == PlaybackSourceKind::LocalFile ? request : 0;
     // 立即刷新请求对应的控件，媒体库同步仍由定时器处理。
-    updatePlaybackControls(player_->getPlaybackSnapshot());
-    if (!last_media_info_html_.isEmpty()) {
-        text_media_info_->clear();
-        last_media_info_html_.clear();
-    }
+    const auto snapshot = player_->getPlaybackSnapshot();
+    updatePlaybackControls(snapshot);
+    updateMediaInfoPanel(snapshot);
     return request;
 }
 
 void MainWindow::setInitialFiles(const std::vector<std::string>& files)
 {
     if (isClosing() || files.empty()) return;
-    current_playlist_index_ = static_cast<int>(playlist_.size());
+    int first_row = -1;
+    bool rejected = false;
     for (const auto& file : files) {
-        playlist_.push_back(file);
-        list_playlist_->addItem(QString::fromStdString(PlaybackSource::localFile(file).displayName()));
+        const int row = appendPlaylistEntry(PlaybackSource::localFile(file));
+        if (row < 0) rejected = true;
+        else if (first_row < 0) first_row = row;
     }
-    list_playlist_->setCurrentRow(current_playlist_index_);
-    requestLoadAndPlay(files.front());
+    if (first_row >= 0) openPlaylistEntry(first_row);
+    else if (rejected) statusBar()->showMessage("启动参数只接受本地文件；RTSP 请使用“打开网络媒体”。");
 }
 
 bool MainWindow::connectDatabase(const std::string& host, const std::string& user,
@@ -1181,10 +1323,12 @@ void MainWindow::keyPressEvent(QKeyEvent* event)
     QMainWindow::keyPressEvent(event);
 }
 
-// 拖放支持
+// 桌面拖放只处理本地文件 URL，不把网络地址自动转换成直播请求。
 void MainWindow::dragEnterEvent(QDragEnterEvent* event)
 {
-    if (!isClosing() && event->mimeData()->hasUrls()) {
+    if (isClosing()) return;
+    const auto urls = event->mimeData()->urls();
+    if (std::any_of(urls.cbegin(), urls.cend(), [](const QUrl& url) { return url.isLocalFile(); })) {
         event->acceptProposedAction();
     }
 }
@@ -1195,22 +1339,18 @@ void MainWindow::dropEvent(QDropEvent* event)
         event->ignore();
         return;
     }
-    const auto old_size = playlist_.size();
     const QList<QUrl> urlList = event->mimeData()->urls();
+    int last_row = -1;
     for (const QUrl& url : urlList) {
-        QString file = url.toLocalFile();
-        if (!file.isEmpty()) {
-            playlist_.push_back(file.toStdString());
-            list_playlist_->addItem(QFileInfo(file).fileName());
-        }
+        if (!url.isLocalFile()) continue;
+        const int row = appendPlaylistEntry(PlaybackSource::localFile(url.toLocalFile().toStdString()));
+        if (row >= 0) last_row = row;
     }
 
-    if (playlist_.size() == old_size) return;
+    if (last_row < 0) return;
     event->acceptProposedAction();
     const auto snapshot = player_->getPlaybackSnapshot();
-    if (snapshot.request_id == playback_request_id_ && canOpenSelectedFile(snapshot.state)) {
-        current_playlist_index_ = (int)playlist_.size() - 1;
-        list_playlist_->setCurrentRow(current_playlist_index_);
-        requestLoadAndPlay(playlist_[current_playlist_index_]);
+    if (snapshot.request_id == playback_request_id_ && canOpenSelectedSource(snapshot.state)) {
+        openPlaylistEntry(last_row);
     }
 }

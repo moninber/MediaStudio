@@ -166,6 +166,7 @@ if(BUILD_TESTING)
     )
     target_link_libraries(MediaStudioPlaybackTests PRIVATE
         Threads::Threads
+        Qt6::Core
         FFmpeg::avcodec FFmpeg::avformat FFmpeg::avutil FFmpeg::avfilter
         FFmpeg::swresample FFmpeg::swscale
     )
@@ -176,16 +177,19 @@ if(BUILD_TESTING)
 
     # 测试可直接从构建目录运行，不依赖播放器部署步骤或已配置的全局 PATH。
     get_filename_component(mediastudio_compiler_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
-    foreach(test_case IN ITEMS contracts local-file rtsp-cancel rtsp-timeout)
+    foreach(test_case IN ITEMS contracts local-file rtsp-cancel rtsp-timeout rtsp-stable)
         add_test(NAME MediaStudio.Playback.${test_case} COMMAND MediaStudioPlaybackTests ${test_case})
         set_tests_properties(MediaStudio.Playback.${test_case} PROPERTIES TIMEOUT 18)
         if(WIN32)
             set_property(TEST MediaStudio.Playback.${test_case} PROPERTY ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:${MEDIASTUDIO_FFMPEG_ROOT}/bin"
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
                 "PATH=path_list_prepend:${mediastudio_compiler_bin}"
             )
         endif()
     endforeach()
+    # CTest 也检查进程输出，覆盖 FFmpeg 的 C 级 stderr 与 Qt 调试日志。
+    set_property(TEST MediaStudio.Playback.rtsp-stable PROPERTY FAIL_REGULAR_EXPRESSION "MediaStudioSecret[0-9A-Za-z]+")
 
     # 会话和关窗用例链接实际主窗口、控制器及显示控件，离屏执行，无需数据库或音频设备。
     add_executable(MediaStudioSessionTests
@@ -219,7 +223,7 @@ if(BUILD_TESTING)
 
     foreach(test_case IN ITEMS controller-local controller-supersede controller-blocked-read packet-epochs widget-epochs
                           window-close-open window-close-probe window-close-read window-stop-reopen window-close-transcode
-                          window-close-modal)
+                          window-close-modal window-mixed-rtsp)
         set(test_name MediaStudio.Session.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES
@@ -240,6 +244,7 @@ if(BUILD_TESTING)
             )
         endif()
     endforeach()
+    set_property(TEST MediaStudio.Session.window-mixed-rtsp PROPERTY FAIL_REGULAR_EXPRESSION "MediaStudioSecret[0-9A-Za-z]+")
 endif()
 
 if(WIN32)

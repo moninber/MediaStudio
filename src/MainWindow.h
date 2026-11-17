@@ -50,6 +50,7 @@
 #include <cstdint>
 #include <memory>
 #include <thread>
+#include <vector>
 
 #include "VideoWidget.h"
 #include "PlayerController.h"
@@ -78,6 +79,7 @@ public:
 private slots:
     // 播放控制槽函数（由UI事件触发）
     void openFile();
+    void openNetworkMedia();
     void togglePlayPause();
     void stopPlayback();
     void seekPosition(int position);
@@ -97,6 +99,7 @@ private slots:
 
 private:
     friend struct MainWindowCloseTestAccess;
+    friend struct MainWindowNetworkTestAccess;
 
     // UI构建函数
     void setupUI();
@@ -108,11 +111,13 @@ private:
     void setupShortcuts();
     void applyDarkTheme();
     void connectSignals();
-    void requestLoadAndPlay(const std::string& path);
+    int appendPlaylistEntry(PlaybackSource source);
+    void openPlaylistEntry(int row);
     std::uint64_t requestPlayback(const PlaybackSource& source);
     void startTranscode(const QString& input, const QString& output);
     void seekRelative(double offset);
     void updatePlaybackControls(const PlaybackSnapshot& snapshot);
+    void updateMediaInfoPanel(const PlaybackSnapshot& snapshot);
     void syncLocalLibrary(const PlaybackSnapshot& snapshot);
 
     enum class CloseState { Running, WaitingForWorkers, Ready };
@@ -157,9 +162,11 @@ private:
     // 模态调用退出后再销毁窗口，避免其嵌套事件循环中重入关闭。
     int modal_depth_ = 0;
 
-    // 播放列表数据
-    std::vector<std::string> playlist_;
+    // 混合列表只在内存中持有源；Qt 列表行仅保存可显示名称。
+    std::vector<PlaybackSource> playlist_;
     int current_playlist_index_;
+    std::uint64_t next_network_playlist_number_ = 1;
+    int local_speed_index_ = 3;
     int last_volume_ = 50;
     bool is_muted_ = false;
     // 请求编号和完成标记只由界面线程操作。

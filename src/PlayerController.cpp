@@ -39,6 +39,7 @@ void PlayerController::resetSnapshotLocked(std::uint64_t request_id, PlaybackSta
     snapshot_ = {};
     snapshot_.request_id = request_id;
     snapshot_.state = state;
+    live_output_started_at_.reset();
     current_time_ = 0.0;
     duration_ = 0.0;
 }
@@ -67,6 +68,10 @@ std::uint64_t PlayerController::requestOpen(const PlaybackSource& source)
     snapshot_.connection_attempt_id = epoch.connection_attempt_id;
     snapshot_.generation = epoch.generation;
     snapshot_.source_kind = source.kind();
+    snapshot_.protocol = source.protocol();
+    if (snapshot_.protocol == PlaybackProtocol::Rtsp && source.liveOptions()) {
+        snapshot_.rtsp_transport = source.liveOptions()->rtsp_transport;
+    }
     snapshot_.display_name = source.displayName();
     snapshot_.capabilities = initialPlaybackCapabilities(source.kind(), false);
     resume_state_ = PlaybackState::Playing;
@@ -149,7 +154,8 @@ void PlayerController::togglePlayPause()
 void PlayerController::seek(double seconds)
 {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
-    if (shutting_down_ || !playing_ || !snapshot_.capabilities.can_seek || !std::isfinite(seconds)) return;
+    if (shutting_down_ || !playing_ || snapshot_.source_kind == PlaybackSourceKind::NetworkLive ||
+        !snapshot_.capabilities.can_seek || !std::isfinite(seconds)) return;
     pending_seek_ = std::clamp(seconds, 0.0, duration_.load());
     seek_requested_ = true;
 }
@@ -163,7 +169,10 @@ void PlayerController::setVolume(float volume)
 void PlayerController::setSpeed(float speed)
 {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
-    if (!shutting_down_ && std::isfinite(speed)) speed_ = std::clamp(speed, 0.25f, 4.0f);
+    // 网络直播固定 1.0x；这里保存的始终是本地文件倍速偏好。
+    if (!shutting_down_ && snapshot_.source_kind == PlaybackSourceKind::LocalFile && std::isfinite(speed)) {
+        speed_ = std::clamp(speed, 0.25f, 4.0f);
+    }
 }
 
 void PlayerController::setEffect(VideoEffect effect)
@@ -186,6 +195,10 @@ PlaybackSnapshot PlayerController::getPlaybackSnapshot() const
     snapshot.is_paused = paused_.load();
     snapshot.current_seconds = current_time_.load();
     snapshot.duration_seconds = duration_.load();
+    if (live_output_started_at_) {
+        snapshot.live_elapsed_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - *live_output_started_at_).count();
+    }
     snapshot.stats.audio_queue_packets = audio_packets_.size();
     snapshot.stats.video_queue_packets = video_packets_.size();
     return snapshot;
@@ -247,6 +260,11 @@ void PlayerController::supervisorLoop()
         pending_seek_.reset();
         seek_requested_ = false;
         snapshot_.stats.audio_buffer_seconds = 0.0;
+        if (live_output_started_at_) {
+            snapshot_.live_elapsed_seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - *live_output_started_at_).count();
+            live_output_started_at_.reset();
+        }
         snapshot_.state = error ? PlaybackState::Failed : PlaybackState::Ended;
         snapshot_.last_error = error;
     }
@@ -280,6 +298,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
 {
     if (request.io->isCancelled()) return {};
     const bool local_file = request.source.kind() == PlaybackSourceKind::LocalFile;
+    const bool live = request.source.kind() == PlaybackSourceKind::NetworkLive;
     const bool use_video = decoder_.hasVideo();
 
     std::atomic<float> active_speed(local_file ? speed_.load() : 1.0f);
@@ -418,6 +437,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                     audio_clock = sample;
                     snapshot_.stats.audio_buffer_seconds = sample.queued_seconds;
                     if (sample.position && !paused_) current_time_ = *sample.position;
+                    if (live && sample.position && !live_output_started_at_) live_output_started_at_ = now;
                 });
             };
             auto ready = [&](PlaybackEpoch epoch) {
@@ -587,7 +607,10 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                     if (!paused_ && (audio_clock.epoch != epoch || !audio_clock.position)) {
                         current_time_ = frame.pts;
                     }
-                    if (accepted) snapshot_.has_current_video_output = true;
+                    if (accepted) {
+                        snapshot_.has_current_video_output = true;
+                        if (live && !live_output_started_at_) live_output_started_at_ = now;
+                    }
                     if (sync_to_audio) snapshot_.stats.av_diff_ms = diff * 1000.0;
                     if (dropped) ++snapshot_.stats.dropped_frames_total;
                     if (elapsed >= 1.0) {

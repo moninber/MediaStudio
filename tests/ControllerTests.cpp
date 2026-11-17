@@ -4,11 +4,20 @@
 #include "VideoWidget.h"
 
 #include <QApplication>
+#include <QComboBox>
+#include <QDialogButtonBox>
 #include <QEventLoop>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
 #include <QPointer>
+#include <QPushButton>
+#include <QSlider>
+#include <QStatusBar>
 #include <QTemporaryDir>
+#include <QTextEdit>
 #include <QTimer>
 
 #include <algorithm>
@@ -42,6 +51,55 @@ struct MainWindowCloseTestAccess {
     {
         window.startTranscode(input, output);
     }
+};
+
+// 观察实际窗口的播放控件与媒体库请求路由，不模拟控制器或数据库接口。
+struct MainWindowNetworkTestAccess {
+    struct Controls {
+        bool seek_enabled;
+        bool speed_enabled;
+        int speed_index;
+        QString elapsed;
+        QString duration;
+        QString metadata;
+        std::uint64_t library_request;
+    };
+
+    // 同步读取窗口实际渲染的数据与待登记的本地播放请求号。
+    static Controls controls(const MainWindow& window)
+    {
+        return {window.slider_progress_->isEnabled(), window.combo_speed_->isEnabled(), window.combo_speed_->currentIndex(),
+                window.label_time_->text(), window.label_duration_->text(), window.text_media_info_->toPlainText(),
+                window.library_request_id_};
+    }
+
+    // 检查网络地址只留在内存源，不进入 Qt 列表可见或附带字段。
+    static bool hasSafeLiveRow(const MainWindow& window, const std::string& raw)
+    {
+        if (window.playlist_.size() != 3 || window.list_playlist_->count() != 3 || window.list_playlist_->currentRow() != 2 ||
+            window.playlist_[0].kind() != PlaybackSourceKind::LocalFile ||
+            window.playlist_[1].kind() != PlaybackSourceKind::LocalFile ||
+            window.playlist_[2].kind() != PlaybackSourceKind::NetworkLive || window.playlist_[2].address() != raw) return false;
+        const auto* item = window.list_playlist_->item(2);
+        return item->text().contains("RTSP/UDP") && !item->text().contains("MediaStudioSecret") &&
+               item->toolTip().isEmpty() && !item->data(Qt::UserRole).isValid();
+    }
+
+    // 从文件倍速控件实际触发速度选择。
+    static void chooseSpeed(MainWindow& window, int index) { window.combo_speed_->setCurrentIndex(index); }
+
+    // 直调界面和后端双重定位/倍速入口，验证禁用判断不依赖控件灰显。
+    static void attemptLiveMutations(MainWindow& window)
+    {
+        window.seekPosition(999);
+        window.seekRelative(500.0);
+        window.changeSpeed(7);
+        window.player_->seek(500.0);
+        window.player_->setSpeed(4.0f);
+    }
+
+    // 读取控制器保存的本地首选速度，和当前源的播放能力独立验证。
+    static float preferredSpeed(const MainWindow& window) { return window.player_->getSpeed(); }
 };
 
 namespace {
@@ -595,6 +653,128 @@ void testWindowStopReopen()
     closeWindow(window.view, reopened.request_id, "local-playing");
 }
 
+// 用真实网络对话框和播放列表走一遍本地→直播→本地，检查显示、能力和数据库路由。
+void testWindowMixedRtsp()
+{
+    using Access = MainWindowNetworkTestAccess;
+    const VideoFixtures fixtures;
+    RtspBlackhole server(RtspBlackhole::StallAt::VideoReadPacket, testRtspAddress(), RtspBlackhole::SetupTransport::Udp);
+    TestWindow window;
+    auto& view = *window.view;
+    window.view->setInitialFiles({fixtures.first().u8string(), fixtures.second().u8string()});
+    const auto first = MainWindowCloseTestAccess::snapshot(view).request_id;
+    require(first > 0 && Access::controls(view).library_request == first, "local source did not enter media-library routing");
+    waitInQt([&] {
+        const auto snapshot = MainWindowCloseTestAccess::snapshot(view);
+        const auto controls = Access::controls(view);
+        return snapshot.request_id == first && snapshot.state == PlaybackState::Playing && snapshot.has_current_video_output &&
+               snapshot.media_info.video_info.width == 64 && controls.seek_enabled && controls.speed_enabled;
+    }, 2s, "initial local file did not enable seek and speed");
+    Access::chooseSpeed(view, 6);
+    require(std::abs(Access::preferredSpeed(view) - 2.0f) < 0.01f, "local speed combo did not request 2x");
+
+    auto raw = server.url() + "?token=MediaStudioSecretWindowQuery";
+    raw.insert(7, "MediaStudioSecretWindowUser:MediaStudioSecretWindowPassword@");
+    // 命令行、拖放等本地入口的共用路由不能把带凭据的 URL 打开成文件。
+    window.view->setInitialFiles({raw});
+    require(MainWindowCloseTestAccess::snapshot(view).request_id == first &&
+            !view.statusBar()->currentMessage().contains("MediaStudioSecret"), "local entry routed or displayed a network URL");
+
+    bool masked = false;
+    bool invalid_rejected = false;
+    bool default_tcp = false;
+    bool cleared_after_open = false;
+    QTimer dialog_deadline;
+    dialog_deadline.setSingleShot(true);
+    QObject::connect(&dialog_deadline, &QTimer::timeout, &view, [&] {
+        if (auto* active = qobject_cast<QDialog*>(QApplication::activeModalWidget())) active->reject();
+    });
+    dialog_deadline.start(1000);
+    QTimer::singleShot(0, &view, [&] {
+        auto* dialog = view.findChild<QDialog*>("networkMediaDialog");
+        if (!dialog) return;
+        auto* input = dialog->findChild<QLineEdit*>("networkUrlInput");
+        auto* transport = dialog->findChild<QComboBox*>("rtspTransportSelector");
+        auto* error = dialog->findChild<QLabel*>("networkUrlError");
+        auto* buttons = dialog->findChild<QDialogButtonBox*>("networkDialogButtons");
+        if (!input || !transport || !error || !buttons || !buttons->button(QDialogButtonBox::Open)) {
+            dialog->reject();
+            return;
+        }
+        auto* open = buttons->button(QDialogButtonBox::Open);
+        default_tcp = transport->count() == 2 && transport->currentData().toInt() == static_cast<int>(RtspTransport::Tcp);
+        input->setText("https://example.test/video?token=MediaStudioSecretInvalidDialog");
+        open->click();
+        invalid_rejected = dialog->isVisible() && !error->text().isEmpty() && !error->text().contains("MediaStudioSecret") &&
+            MainWindowCloseTestAccess::snapshot(view).request_id == first;
+        input->setText(QString::fromStdString(raw));
+        masked = input->echoMode() == QLineEdit::Password && !input->displayText().contains("MediaStudioSecret");
+        QObject::connect(dialog, &QDialog::finished, input, [&] { cleared_after_open = input->text().isEmpty(); });
+        transport->setCurrentIndex(transport->findData(static_cast<int>(RtspTransport::Udp)));
+        open->click();
+    });
+    require(QMetaObject::invokeMethod(&view, "openNetworkMedia", Qt::DirectConnection),
+            "could not invoke production network dialog slot");
+    dialog_deadline.stop();
+    require(masked && invalid_rejected && default_tcp && cleared_after_open,
+            "network dialog did not safely validate, mask, default to TCP or clear its address");
+
+    const auto live_id = MainWindowCloseTestAccess::snapshot(view).request_id;
+    require(live_id > first && Access::hasSafeLiveRow(view, raw) && Access::controls(view).library_request == 0,
+            "RTSP source did not enter the safe mixed playlist route or reached media-library routing");
+    PlaybackSnapshot live;
+    waitInQt([&] {
+        live = MainWindowCloseTestAccess::snapshot(view);
+        const auto controls = Access::controls(view);
+        return live.request_id == live_id && live.state == PlaybackState::Playing && live.has_current_video_output &&
+               live.media_info.video_info.width == 32 && live.live_elapsed_seconds && *live.live_elapsed_seconds > 0.0 &&
+               controls.duration == QString::fromUtf8(u8"直播") && controls.elapsed.startsWith(QString::fromUtf8(u8"已播放 ")) &&
+               !controls.elapsed.endsWith("--:--") && controls.metadata.contains("32x32");
+    }, 3s, "live source did not display video, elapsed time and protocol metadata");
+    const auto live_controls = Access::controls(view);
+    require(live.source_kind == PlaybackSourceKind::NetworkLive && live.protocol == PlaybackProtocol::Rtsp &&
+            live.rtsp_transport == RtspTransport::Udp && server.setupTransport() == RtspBlackhole::SetupTransport::Udp &&
+            !live.capabilities.can_seek && !live.capabilities.can_change_speed && !live.capabilities.duration_known &&
+            !live_controls.seek_enabled && !live_controls.speed_enabled && live_controls.library_request == 0 &&
+            live.display_name == "RTSP" && live.media_info.file_path.empty() && live.media_info.db_id < 0 &&
+            !live_controls.metadata.contains("MediaStudioSecret") && !view.statusBar()->currentMessage().contains("MediaStudioSecret"),
+            "live capabilities, transport, metadata, or library isolation differed from the RTSP source contract");
+
+    Access::attemptLiveMutations(view);
+    PlaybackSnapshot after_mutations;
+    waitInQt([&] {
+        after_mutations = MainWindowCloseTestAccess::snapshot(view);
+        return after_mutations.live_elapsed_seconds && *after_mutations.live_elapsed_seconds > *live.live_elapsed_seconds + 0.1;
+    }, 1s, "live clock did not continue after forbidden mutations");
+    require(after_mutations.request_id == live.request_id && after_mutations.generation == live.generation &&
+            !after_mutations.last_error && std::abs(Access::preferredSpeed(view) - 2.0f) < 0.01f,
+            "live position/speed commands changed the session or local speed preference");
+
+    require(QMetaObject::invokeMethod(&view, "prevFile", Qt::DirectConnection), "could not activate mixed-list previous action");
+    const auto second = MainWindowCloseTestAccess::snapshot(view).request_id;
+    require(second > live_id && Access::controls(view).library_request == second,
+            "switching through the mixed playlist did not restore local database routing");
+    waitInQt([&] {
+        const auto snapshot = MainWindowCloseTestAccess::snapshot(view);
+        const auto controls = Access::controls(view);
+        return snapshot.request_id == second && snapshot.state == PlaybackState::Playing && snapshot.has_current_video_output &&
+               snapshot.source_kind == PlaybackSourceKind::LocalFile && snapshot.media_info.video_info.width == 80 &&
+               snapshot.capabilities.can_seek && snapshot.capabilities.can_change_speed && controls.seek_enabled &&
+               controls.speed_enabled && controls.speed_index == 6 && !server.isHoldingConnection();
+    }, 2s, "returning to the second file did not restore the saved controls or close the RTSP peer");
+    require(std::abs(Access::preferredSpeed(view) - 2.0f) < 0.01f, "returned local file lost 2x speed");
+
+    // 2x 播放约 0.6 秒即可推进 1.2 秒媒体时间，期限给帧和调度留出余量。
+    const auto resumed_at = Clock::now();
+    const auto position = MainWindowCloseTestAccess::snapshot(view).current_seconds;
+    waitInQt([&] { return MainWindowCloseTestAccess::snapshot(view).current_seconds >= position + 1.2; },
+             1s, "returned local video did not actually advance at the restored 2x speed");
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - resumed_at).count();
+    std::cout << "dialog_validation=1 mixed_file_rtsp_udp_file=1 local_speed_restored=1"
+              << " local_video_1200_media_ms_elapsed=" << elapsed_ms << " live_library_route_skipped=1\n";
+    closeWindow(window.view, second, "mixed-rtsp-local-playing");
+}
+
 // 验证真实转码输入受阻时可关窗，并覆盖启动命令后立即关窗的竞争窗口。
 void testWindowCloseTranscode()
 {
@@ -723,6 +903,7 @@ int main(int argc, char* argv[])
         else if (mode == "window-stop-reopen") testWindowStopReopen();
         else if (mode == "window-close-transcode") testWindowCloseTranscode();
         else if (mode == "window-close-modal") testWindowCloseModal();
+        else if (mode == "window-mixed-rtsp") testWindowMixedRtsp();
         else if (mode == "widget-epochs") testWidgetEpochs();
         else throw std::runtime_error("unknown session test");
         return 0;

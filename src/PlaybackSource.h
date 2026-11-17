@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <optional>
 #include <string>
 
 // 源类型由调用方显式选择，不根据扩展名或“是否网络”猜测播放行为。
@@ -33,19 +34,30 @@ public:
     const std::string& displayName() const noexcept { return display_name_; }
     // 仅直播源提供直播选项，避免点播误读直播预设。
     const LiveSourceOptions* liveOptions() const noexcept;
-    // 检查地址与源类型的基本匹配，不在此阶段探测网络或文件。
-    bool isValid() const noexcept;
+    // 返回创建时的地址验证结果，不再次解析或探测网络和文件。
+    bool isValid() const noexcept { return valid_ && !address_.empty(); }
 
 private:
     // 由三种工厂构造，避免调用方自行拼装不一致的源类型和显示名。
-    PlaybackSource(PlaybackSourceKind kind, std::string address, std::string display_name,
+    PlaybackSource(PlaybackSourceKind kind, std::string address, std::string display_name, bool valid,
                    LiveSourceOptions options = {});
 
     PlaybackSourceKind kind_;
     std::string address_;
     std::string display_name_;
+    bool valid_;
     LiveSourceOptions live_options_;
 };
+
+enum class RtspSourceError { None, UnsupportedProtocol, InvalidAddress };
+
+// 用户入口只建立稳定 RTSP 源，错误由调用方翻译为不含地址的提示。
+struct RtspSourceValidation {
+    std::optional<PlaybackSource> source;
+    RtspSourceError error;
+};
+
+RtspSourceValidation createStableRtspSource(std::string url, RtspTransport transport);
 
 enum class PauseBehavior { KeepPosition, DisconnectLive, FreezeVod };
 enum class EndOfStreamBehavior { Drain, RecoverLive };

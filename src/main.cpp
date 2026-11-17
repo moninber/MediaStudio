@@ -24,9 +24,38 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <windows.h>
 #include <objbase.h>
 #include "MainWindow.h"
+
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavutil/version.h>
+}
+
+namespace {
+
+// RTSP 是解复用器；TCP、UDP 等由 URL 协议层提供。这里记录当前进程加载的库能力。
+void logPlaybackRuntime()
+{
+    const auto version = avformat_version();
+    std::cout << "[FFmpeg] libavformat " << AV_VERSION_MAJOR(version) << '.'
+              << AV_VERSION_MINOR(version) << '.' << AV_VERSION_MICRO(version)
+              << "; rtsp demuxer=" << (av_find_input_format("rtsp") ? "yes" : "no")
+              << "; runtime input protocols:";
+    void* cursor = nullptr;
+    while (const char* name = avio_enum_protocols(&cursor, 0)) {
+        const std::string_view protocol(name);
+        if (protocol == "tcp" || protocol == "udp" || protocol == "rtmp" || protocol == "srt" ||
+            protocol == "http" || protocol == "https") {
+            std::cout << ' ' << protocol;
+        }
+    }
+    std::cout << std::endl;
+}
+
+} // namespace
 
 int main(int argc, char* argv[])
 {
@@ -55,6 +84,7 @@ int main(int argc, char* argv[])
     app.setApplicationName("MediaStudio");
     app.setApplicationVersion("1.0");
     app.setOrganizationName("MediaStudio");
+    logPlaybackRuntime();
 
     // --------------------------------------------------------
     // 创建主窗口

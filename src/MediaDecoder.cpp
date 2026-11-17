@@ -11,13 +11,14 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <utility>
 
 namespace {
 
-thread_local bool suppress_network_ffmpeg_log = false;
+std::atomic<unsigned> playback_ffmpeg_users{0};
 constexpr long double TimestampUpperBound = 0x1p63L;
 
 // 流时间基无效时，解码器继续使用原有的时间戳回退路径。
@@ -26,30 +27,14 @@ bool hasValidTimeBase(AVRational time_base) noexcept
     return time_base.num > 0 && time_base.den > 0;
 }
 
-// 网络封装 I/O 在调用线程执行，禁止其输出可能包含 URL 的自由文本。
-// 本地文件和转码仍走 FFmpeg 默认日志；独立协议库的异步日志不经过此线程作用域。
+// RTSP 对端文本和本地清单中的嵌套 URL 都可能含凭据，即便协议检查最终拒绝打开。
+// 涉及 FFmpeg 内部线程，播放输入存活期间只保留应用自己输出的诊断。
 void ffmpegLogCallback(void* context, int level, const char* format, va_list args)
 {
-    if (!suppress_network_ffmpeg_log) {
+    if (playback_ffmpeg_users.load(std::memory_order_acquire) == 0) {
         av_log_default_callback(context, level, format, args);
     }
 }
-
-class ScopedNetworkFfmpegLog {
-public:
-    // 仅在本次 FFmpeg 调用所在的线程抑制原始网络诊断，可嵌套使用。
-    explicit ScopedNetworkFfmpegLog(bool network) noexcept
-        : previous_(suppress_network_ffmpeg_log)
-    {
-        suppress_network_ffmpeg_log = previous_ || network;
-    }
-
-    // 离开网络调用后恢复该线程原来的日志策略。
-    ~ScopedNetworkFfmpegLog() { suppress_network_ffmpeg_log = previous_; }
-
-private:
-    const bool previous_;
-};
 
 // 将打开各阶段的失败区分为主动取消、期限到达和普通 FFmpeg 错误。
 MediaOpenResult classifyOpenResult(int error, MediaIoStopReason reason, MediaOpenStage stage)
@@ -176,18 +161,23 @@ MediaOpenResult MediaDecoder::open(const PlaybackSource& source, std::shared_ptr
     if (!source.isValid()) {
         return {MediaOpenStatus::Error, AVERROR(EINVAL), MediaOpenStage::Validation};
     }
-    if (source.kind() == PlaybackSourceKind::NetworkVod) {
+    const bool local_file = source.kind() == PlaybackSourceKind::LocalFile;
+    if (!local_file && source.protocol() != PlaybackProtocol::Rtsp) {
         return {MediaOpenStatus::Error, AVERROR(ENOSYS), MediaOpenStage::Validation};
     }
 
-    const bool local_file = source.kind() == PlaybackSourceKind::LocalFile;
+    const auto* input_format = local_file ? nullptr : av_find_input_format("rtsp");
+    if (!local_file && !input_format) {
+        return {MediaOpenStatus::Error, AVERROR_DEMUXER_NOT_FOUND, MediaOpenStage::Validation};
+    }
+
     const PlaybackPolicy policy = playbackPolicy(source);
     const std::string network_address = local_file ? std::string{} : normalizeFfmpegNetworkScheme(source.address());
     const char* input_address = local_file ? source.address().c_str() : network_address.c_str();
     io_ = io ? std::move(io) : std::make_shared<MediaIoControl>();
+    playback_ffmpeg_users.fetch_add(1, std::memory_order_acq_rel);
     network_input_ = !local_file;
     read_timeout_ = policy.read_timeout;
-    const ScopedNetworkFfmpegLog network_log(network_input_);
 
     // 用安全显示名和原始错误号记录失败，关闭时保留 FFmpeg 回调对象。
     const auto fail = [&](MediaOpenResult result) {
@@ -202,16 +192,17 @@ MediaOpenResult MediaDecoder::open(const PlaybackSource& source, std::shared_ptr
         return fail({MediaOpenStatus::Cancelled, AVERROR_EXIT, MediaOpenStage::OpenInput});
     }
 
-    // RTSP 的传输选项不传给本地、RTMP 或 SRT。
+    // 本地源只启用文件协议，阻止容器间接打开网络；RTSP 只启用所选传输所需的协议。
     AVDictionary* options = nullptr;
-    if (!local_file && source.protocol() == PlaybackProtocol::Rtsp) {
-        const char* transport = source.liveOptions()->rtsp_transport == RtspTransport::Udp
-            ? "udp" : "tcp";
-        const int ret = av_dict_set(&options, "rtsp_transport", transport, 0);
-        if (ret < 0) {
-            av_dict_free(&options);
-            return fail(classifyOpenResult(ret, io_->stopReason(), MediaOpenStage::OpenInput));
-        }
+    const bool udp = !local_file && source.liveOptions()->rtsp_transport == RtspTransport::Udp;
+    const char* allowed_protocols = local_file ? "file" : (udp ? "tcp,udp,rtp" : "tcp");
+    int options_result = av_dict_set(&options, "protocol_whitelist", allowed_protocols, 0);
+    if (options_result >= 0 && !local_file) {
+        options_result = av_dict_set(&options, "rtsp_transport", udp ? "udp" : "tcp", 0);
+    }
+    if (options_result < 0) {
+        av_dict_free(&options);
+        return fail(classifyOpenResult(options_result, io_->stopReason(), MediaOpenStage::OpenInput));
     }
 
     // 打开前分配格式上下文并挂上回调，涵盖连接及读取文件头的阻塞。
@@ -222,7 +213,7 @@ MediaOpenResult MediaDecoder::open(const PlaybackSource& source, std::shared_ptr
     }
     format_ctx_->interrupt_callback = {MediaIoControl::interruptCallback, io_.get()};
     io_->armDeadline(policy.open_timeout);
-    const int open_ret = avformat_open_input(&format_ctx_, input_address, nullptr, &options);
+    const int open_ret = avformat_open_input(&format_ctx_, input_address, input_format, &options);
     av_dict_free(&options);
     const auto open_result = classifyOpenResult(open_ret, io_->stopReason(), MediaOpenStage::OpenInput);
     if (open_result.status != MediaOpenStatus::Opened) {
@@ -379,10 +370,13 @@ void MediaDecoder::close()
     if (format_ctx_) {
         // 部分协议在关闭时会发送控制消息，不清除取消或延长已有期限。
         io_->limitDeadline(read_timeout_);
-        const ScopedNetworkFfmpegLog network_log(network_input_);
         avformat_close_input(&format_ctx_);
     }
-    io_.reset();
+    // 打开时 io_ 与日志计数同时建立，封装和解码器销毁后才能恢复默认日志。
+    if (io_) {
+        io_.reset();
+        playback_ffmpeg_users.fetch_sub(1, std::memory_order_acq_rel);
+    }
     read_timeout_ = std::chrono::milliseconds{0};
     network_input_ = false;
     read_deadline_active_ = false;
@@ -403,6 +397,8 @@ void MediaDecoder::close()
 
 bool MediaDecoder::setPlaybackSpeed(float speed)
 {
+    if (!std::isfinite(speed)) return false;
+    if (network_input_) return std::fabs(speed - 1.0f) < 0.001f;
     float clamped_speed = std::max(0.25f, std::min(4.0f, speed));
     if (std::fabs(playback_speed_ - clamped_speed) < 0.001f) {
         return true;
@@ -633,7 +629,6 @@ MediaReadResult MediaDecoder::readPacketResult(AVPacket* packet)
         io_->armDeadline(read_timeout_);
         read_deadline_active_ = true;
     }
-    const ScopedNetworkFfmpegLog network_log(network_input_);
     while (true) {
         const auto reason = io_->stopReason();
         if (reason != MediaIoStopReason::None) {
@@ -1032,7 +1027,7 @@ bool MediaDecoder::convertAudioFrame(AVFrame* frame, DecodedFrame& out_frame)
 // ============================================================
 bool MediaDecoder::seek(double seconds)
 {
-    if (!format_ctx_ || !std::isfinite(seconds) || seconds < 0.0) {
+    if (!format_ctx_ || network_input_ || !std::isfinite(seconds) || seconds < 0.0) {
         return false;
     }
 
@@ -1115,7 +1110,7 @@ void MediaDecoder::extractMediaInfo(bool localFile)
 
     // 文件格式信息
     media_info_.format_name = format_ctx_->iformat->name;
-    media_info_.duration = (format_ctx_->duration > 0)
+    media_info_.duration = (localFile && format_ctx_->duration > 0)
         ? static_cast<double>(format_ctx_->duration) / AV_TIME_BASE
         : 0.0;
     media_info_.file_size = localFile && format_ctx_->pb ? avio_size(format_ctx_->pb) : 0;
@@ -1128,14 +1123,15 @@ void MediaDecoder::extractMediaInfo(bool localFile)
         media_info_.video_info.height = video_codec_ctx_->height;
         // r_frame_rate 对某些容器（如MP4）可能返回异常值（如1000fps）
         // 优先使用 avg_frame_rate，再用 r_frame_rate，最后fallback到25fps
+        const auto valid_fps = [](double fps) { return std::isfinite(fps) && fps > 0.0 && fps <= 120.0; };
         double fps = av_q2d(vstream->avg_frame_rate);
-        if (fps <= 0 || fps > 120) fps = av_q2d(vstream->r_frame_rate);
-        if (fps <= 0 || fps > 120) fps = 25.0;
+        if (!valid_fps(fps)) fps = av_q2d(vstream->r_frame_rate);
+        if (!valid_fps(fps)) fps = 25.0;
         media_info_.video_info.frame_rate = fps;
-        if (media_info_.duration <= 0.0 && vstream->duration > 0) {
+        if (localFile && media_info_.duration <= 0.0 && vstream->duration > 0 && hasValidTimeBase(vstream->time_base)) {
             media_info_.duration = vstream->duration * av_q2d(vstream->time_base);
         }
-        if (media_info_.duration <= 0.0 && vstream->nb_frames > 0 && fps > 0.0) {
+        if (localFile && media_info_.duration <= 0.0 && vstream->nb_frames > 0 && fps > 0.0) {
             media_info_.duration = static_cast<double>(vstream->nb_frames) / fps;
         }
         media_info_.video_info.codec_name = avcodec_get_name(video_codec_ctx_->codec_id);
@@ -1144,7 +1140,11 @@ void MediaDecoder::extractMediaInfo(bool localFile)
         }
         media_info_.video_info.bit_rate = video_codec_ctx_->bit_rate;
         media_info_.video_info.duration = media_info_.duration;
-        media_info_.video_info.total_frames = (int)(media_info_.duration * media_info_.video_info.frame_rate);
+        if (localFile) {
+            const double frames = media_info_.duration * fps;
+            media_info_.video_info.total_frames =
+                static_cast<int>(std::min(frames, static_cast<double>(std::numeric_limits<int>::max())));
+        }
     }
 
     // 音频流信息

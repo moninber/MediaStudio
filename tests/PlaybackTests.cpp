@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -396,6 +397,65 @@ void testRtspBlackhole(bool cancel)
     throw std::runtime_error("no blocked RTSP read after draining fixture packets");
 }
 
+// 用同一个稳定模式入口校验原始地址，并观察 TCP/UDP SETUP 和相应的 RTP 数据。
+void testStableRtsp()
+{
+    const std::string address = "RTSP://MediaStudioSecretUser:p%40ss@example.test:554/stream?token=MediaStudioSecretQuery";
+    const auto accepted = createStableRtspSource(address, RtspTransport::Tcp);
+    require(accepted.source && accepted.error == RtspSourceError::None &&
+            accepted.source->address() == address && accepted.source->displayName() == "RTSP" &&
+            accepted.source->kind() == PlaybackSourceKind::NetworkLive &&
+            accepted.source->protocol() == PlaybackProtocol::Rtsp, "stable validation changed or exposed the RTSP address");
+    auto unsupported = createStableRtspSource("https://example.test/watch?token=MediaStudioSecretUnsupported",
+                                              RtspTransport::Udp);
+    require(!unsupported.source && unsupported.error == RtspSourceError::UnsupportedProtocol,
+            "stable entry accepted an unsupported protocol");
+    for (const std::string_view invalid : {"rtsp:///no-host", "rtsp://example.test:65536/live", "rtsp://example.test/with space"}) {
+        const auto rejected = createStableRtspSource(std::string(invalid), RtspTransport::Tcp);
+        require(!rejected.source && rejected.error == RtspSourceError::InvalidAddress,
+                "stable entry accepted a malformed RTSP address");
+    }
+
+    const auto bind_address = std::getenv("MEDIASTUDIO_TEST_RTSP_ADDRESS");
+    const std::string local = bind_address ? bind_address : "127.0.0.1";
+    for (const auto transport : {RtspTransport::Tcp, RtspTransport::Udp}) {
+        using Setup = RtspBlackhole::SetupTransport;
+        const auto expected = transport == RtspTransport::Tcp ? Setup::Tcp : Setup::Udp;
+        RtspBlackhole server(RtspBlackhole::StallAt::ReadPacket, local, expected);
+        auto raw = server.url() + "?token=MediaStudioSecretQuery";
+        raw.insert(7, "MediaStudioSecretUser:MediaStudioSecretPassword@");
+        const auto validated = createStableRtspSource(raw, transport);
+        require(validated.source && validated.source->address() == raw, "fixture credentials or query changed during validation");
+        const auto* options = validated.source->liveOptions();
+        require(options && options->rtsp_transport == transport && options->preset == LivePreset::Stable &&
+                !options->auto_reconnect, "stable transport selection changed or enabled automatic reconnect");
+
+        MediaDecoder decoder;
+        const auto opened = decoder.open(*validated.source);
+        require(opened.status == MediaOpenStatus::Opened && decoder.hasAudio() && server.setupTransport() == expected,
+                "stable RTSP did not negotiate selected RTP transport and probe real audio");
+        const auto& info = decoder.getMediaInfo();
+        require(info.file_path.empty() && info.file_name == "RTSP", "network credentials reached media metadata");
+        auto packet = makePacket();
+        require(decoder.readPacketResult(packet.get()).status == MediaReadStatus::Packet && decoder.isAudioPacket(packet.get()),
+                "stable RTSP transport negotiated without delivering RTP audio");
+        std::cout << "stable_rtsp_setup=" << (transport == RtspTransport::Tcp ? "TCP" : "UDP")
+                  << " rtp_audio_packet=1\n";
+    }
+
+    // RTSP 403 诊断可携带原始请求目标。CTest 另外检查 stderr 中没有测试凭据与查询参数。
+    RtspBlackhole rejecting(RtspBlackhole::StallAt::RejectOpen, local);
+    const auto private_url = rejecting.url() + "?token=MediaStudioSecretRejected";
+    const auto private_source = createStableRtspSource(private_url, RtspTransport::Tcp);
+    require(private_source.source.has_value(), "could not construct rejected private RTSP request");
+    MediaDecoder decoder;
+    const auto result = decoder.open(*private_source.source);
+    require(result.status == MediaOpenStatus::Error && result.stage == MediaOpenStage::OpenInput &&
+            result.ffmpegError == AVERROR_HTTP_FORBIDDEN,
+            "private URL rejection did not reach the FFmpeg RTSP open failure path");
+    std::cout << "stable_rtsp_rejected_safe=1\n";
+}
+
 } // namespace
 
 // 每个 CTest 启动一个进程，夹具或解码器异常时仍由外层超时保护。
@@ -415,8 +475,10 @@ int main(int argc, char* argv[])
             testRtspBlackhole(true);
         } else if (mode == "rtsp-timeout" && argc == 2) {
             testRtspBlackhole(false);
+        } else if (mode == "rtsp-stable" && argc == 2) {
+            testStableRtsp();
         } else {
-            throw std::runtime_error("expected contracts, local-file, external-local <path>, rtsp-cancel or rtsp-timeout");
+            throw std::runtime_error("expected contracts, local-file, external-local <path>, rtsp-cancel, rtsp-timeout or rtsp-stable");
         }
         return 0;
     } catch (const std::exception& error) {

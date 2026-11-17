@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
@@ -53,6 +54,67 @@ void setNonBlocking(SOCKET socket)
     }
 }
 
+// 为 RTP/RTCP 绑定相邻 UDP 端口，仅监听与 RTSP 控制连接相同的地址。
+class UdpStream {
+public:
+    explicit UdpStream(sockaddr_in address)
+    {
+        address.sin_port = 0;
+        for (int retry = 0; retry < 64; ++retry) {
+            auto rtp = std::make_unique<Socket>(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+            auto rtcp = std::make_unique<Socket>(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+            if (rtp->handle == INVALID_SOCKET || rtcp->handle == INVALID_SOCKET) socketError("UDP socket");
+            int length = sizeof(address);
+            if (bind(rtp->handle, reinterpret_cast<sockaddr*>(&address), length) == SOCKET_ERROR ||
+                getsockname(rtp->handle, reinterpret_cast<sockaddr*>(&address), &length) == SOCKET_ERROR) {
+                socketError("UDP bind/getsockname");
+            }
+            port_ = ntohs(address.sin_port);
+            address.sin_port = htons(static_cast<unsigned short>(port_ + 1));
+            const bool bound = (port_ % 2 == 0) &&
+                bind(rtcp->handle, reinterpret_cast<sockaddr*>(&address), length) != SOCKET_ERROR;
+            address.sin_port = 0;
+            if (bound) {
+                rtp_ = std::move(rtp);
+                rtcp_ = std::move(rtcp);
+                return;
+            }
+        }
+        throw std::runtime_error("could not reserve local RTP/RTCP ports");
+    }
+
+    // 报告 SETUP 的服务端端口对，发送实际 RTP 时剥去 TCP 交错帧头。
+    std::string portPair() const { return std::to_string(port_) + '-' + std::to_string(port_ + 1); }
+    bool sendRtp(sockaddr_in peer, unsigned short client_port, std::string_view packet) const
+    {
+        packet.remove_prefix(4);
+        peer.sin_port = htons(client_port);
+        return sendto(rtp_->handle, packet.data(), static_cast<int>(packet.size()), 0,
+                      reinterpret_cast<sockaddr*>(&peer), sizeof(peer)) == static_cast<int>(packet.size());
+    }
+
+private:
+    std::unique_ptr<Socket> rtp_;
+    std::unique_ptr<Socket> rtcp_;
+    unsigned short port_ = 0;
+};
+
+// 从 SETUP 请求中读取相邻的客户端 UDP 端口，不接受缺失或不完整的端口参数。
+unsigned short readClientPort(std::string_view request)
+{
+    constexpr std::string_view prefix = "client_port=";
+    const auto position = request.find(prefix);
+    if (position == std::string_view::npos) return 0;
+    request.remove_prefix(position + prefix.size());
+    const auto end = request.data() + request.size();
+    unsigned short first = 0;
+    unsigned short second = 0;
+    const auto rtp = std::from_chars(request.data(), end, first);
+    if (rtp.ec != std::errc{} || rtp.ptr == end || *rtp.ptr != '-' || first == 0) return 0;
+    const auto rtcp = std::from_chars(rtp.ptr + 1, end, second);
+    return rtcp.ec == std::errc{} && second == first + 1 ? first : 0;
+}
+
 // 静态负载类型 0 是 PCMU；每包 160 个采样，RTP 时间戳按 20 ms 递增。
 std::array<unsigned char, 176> pcmuRtp(std::uint16_t sequence)
 {
@@ -93,8 +155,9 @@ std::array<unsigned char, 28> h264Rtp(std::uint16_t sequence)
 class RtspBlackhole::Impl {
 public:
     // 先绑定再启动线程；若初始化失败，由成员析构关闭监听 socket。
-    Impl(StallAt stall, const std::string& bind_address)
-        : listener_(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)), stall_(stall), bind_address_(bind_address)
+    Impl(StallAt stall, const std::string& bind_address, SetupTransport transport)
+        : listener_(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)), stall_(stall), bind_address_(bind_address),
+          expected_transport_(transport)
     {
         if (listener_.handle == INVALID_SOCKET) socketError("socket");
         sockaddr_in address{};
@@ -115,6 +178,7 @@ public:
         }
         setNonBlocking(listener_.handle);
         url_ = "rtsp://" + bind_address_ + ":" + std::to_string(ntohs(address.sin_port)) + "/blackhole";
+        if (expected_transport_ == SetupTransport::Udp) udp_ = std::make_unique<UdpStream>(address);
         worker_ = std::thread([this] {
             try {
                 serve();
@@ -134,6 +198,7 @@ public:
 
     std::string url() const { return url_; }
     bool isHoldingConnection() const noexcept { return holding_.load(); }
+    SetupTransport setupTransport() const noexcept { return setup_transport_.load(); }
 
 private:
     // 夹具自身的期限是故障保护；正常测试在此之前由 FFmpeg 返回。
@@ -194,13 +259,15 @@ private:
         }
     }
 
-    // 纯视频流量小于控制器预读阈值，随后发送半包，使下一次读取等待剩余字节。
-    bool sendVideoThenStall(SOCKET socket)
+    // 纯视频流量小于预读阈值；UDP 丢弃后续数据，TCP 则用半包等待剩余字节。
+    bool sendVideoThenStall(SOCKET socket, const sockaddr_in& peer, unsigned short client_port)
     {
         for (std::uint16_t seq = 1; seq <= 60; ++seq) {
             const auto packet = h264Rtp(seq);
-            if (!writeAll(socket, {reinterpret_cast<const char*>(packet.data()), packet.size()})) return false;
+            const std::string_view bytes{reinterpret_cast<const char*>(packet.data()), packet.size()};
+            if (udp_ ? !udp_->sendRtp(peer, client_port, bytes) : !writeAll(socket, bytes)) return false;
         }
+        if (udp_) return true;
         const auto incomplete = h264Rtp(61);
         return writeAll(socket, {reinterpret_cast<const char*>(incomplete.data()), 5});
     }
@@ -209,11 +276,14 @@ private:
     void serve()
     {
         if (!waitSocket(listener_.handle, true)) return;
-        const Socket peer(accept(listener_.handle, nullptr, nullptr));
+        sockaddr_in peer_address{};
+        int peer_length = sizeof(peer_address);
+        const Socket peer(accept(listener_.handle, reinterpret_cast<sockaddr*>(&peer_address), &peer_length));
         if (peer.handle == INVALID_SOCKET) socketError("accept");
         setNonBlocking(peer.handle);
         const bool probing = stall_ == StallAt::ProbeStreams;
         const bool video = probing || stall_ == StallAt::VideoReadPacket;
+        unsigned short client_port = 0;
         std::string pending;
         while (!stopping_.load()) {
             const auto request = readRequest(peer.handle, pending);
@@ -232,6 +302,13 @@ private:
             if (method == "OPTIONS") {
                 reply += "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n";
             } else if (method == "DESCRIBE") {
+                if (stall_ == StallAt::RejectOpen) {
+                    // 模拟错误诊断带回请求目标，验证播放器不会输出其中的查询参数。
+                    const auto target = request.substr(9, request.find(' ', 9) - 9);
+                    reply = "RTSP/1.0 403 " + target + request.substr(cseq, cseq_end - cseq) + "\r\n\r\n";
+                    writeAll(peer.handle, reply);
+                    return;
+                }
                 std::string sdp = "v=0\r\no=- 0 0 IN IP4 " + bind_address_ + "\r\n"
                     "s=MediaStudio CTest\r\nc=IN IP4 " + bind_address_ + "\r\nt=0 0\r\na=control:*\r\n";
                 if (video) {
@@ -249,12 +326,22 @@ private:
                 reply += "Content-Type: application/sdp\r\nContent-Base: " + url_ +
                          "/\r\nContent-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
             } else if (method == "SETUP") {
-                if (request.find("RTP/AVP/TCP") == std::string::npos ||
-                    request.find("interleaved=0-1") == std::string::npos) {
-                    throw std::runtime_error("client did not request interleaved RTP/TCP");
+                const bool tcp = request.find("RTP/AVP/TCP") != std::string::npos &&
+                                 request.find("interleaved=0-1") != std::string::npos;
+                client_port = readClientPort(request);
+                const bool udp = !tcp && client_port != 0 && request.find("RTP/AVP") != std::string::npos;
+                const auto actual = tcp ? SetupTransport::Tcp : udp ? SetupTransport::Udp : SetupTransport::None;
+                setup_transport_.store(actual);
+                if (actual != expected_transport_ || actual == SetupTransport::None) {
+                    throw std::runtime_error("unexpected RTP SETUP transport");
                 }
-                reply += "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"
-                         "Session: 1234abcd;timeout=60\r\n\r\n";
+                if (tcp) {
+                    reply += "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n";
+                } else {
+                    reply += "Transport: RTP/AVP/UDP;unicast;client_port=" + std::to_string(client_port) + '-' +
+                        std::to_string(client_port + 1) + ";server_port=" + udp_->portPair() + "\r\n";
+                }
+                reply += "Session: 1234abcd;timeout=60\r\n\r\n";
             } else if (method == "PLAY") {
                 reply += "Session: 1234abcd\r\nRTP-Info: url=" + url_ +
                          "/trackID=0;seq=1;rtptime=" + (video ? "3600" : "160") + "\r\n\r\n";
@@ -270,11 +357,14 @@ private:
                     holding_.store(true);
                     continue;
                 } else if (video) {
-                    if (!sendVideoThenStall(peer.handle)) return;
+                    if (!sendVideoThenStall(peer.handle, peer_address, client_port)) return;
                 } else {
                     for (std::uint16_t seq = 1; seq <= 96; ++seq) {
                         const auto packet = pcmuRtp(seq);
-                        if (!writeAll(peer.handle, {reinterpret_cast<const char*>(packet.data()), packet.size()})) return;
+                        const std::string_view bytes{reinterpret_cast<const char*>(packet.data()), packet.size()};
+                        if (udp_ ? !udp_->sendRtp(peer_address, client_port, bytes) : !writeAll(peer.handle, bytes)) {
+                            return;
+                        }
                     }
                 }
                 // 不送更多 RTP，也不关 socket。read 必须靠客户端中断或期限结束。
@@ -287,16 +377,20 @@ private:
     Socket listener_;
     const StallAt stall_;
     const std::string bind_address_;
+    const SetupTransport expected_transport_;
+    std::unique_ptr<UdpStream> udp_;
     std::string url_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> holding_{false};
+    std::atomic<SetupTransport> setup_transport_{SetupTransport::None};
     const Clock::time_point hard_deadline_ = Clock::now() + 14s;
     std::thread worker_;
 };
 
 // 创建指定地址上的单会话夹具，地址默认仍是回环。
-RtspBlackhole::RtspBlackhole(StallAt stall, const std::string& bind_address)
-    : impl_(std::make_unique<Impl>(stall, bind_address)) {}
+RtspBlackhole::RtspBlackhole(StallAt stall, const std::string& bind_address, SetupTransport transport)
+    : impl_(std::make_unique<Impl>(stall, bind_address, transport)) {}
 RtspBlackhole::~RtspBlackhole() = default;
 std::string RtspBlackhole::url() const { return impl_->url(); }
 bool RtspBlackhole::isHoldingConnection() const noexcept { return impl_->isHoldingConnection(); }
+RtspBlackhole::SetupTransport RtspBlackhole::setupTransport() const noexcept { return impl_->setupTransport(); }

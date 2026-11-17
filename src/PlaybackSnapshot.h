@@ -50,6 +50,8 @@ struct PlaybackSnapshot {
     std::uint64_t connection_attempt_id = 0;
     std::uint64_t generation = 0;
     PlaybackSourceKind source_kind = PlaybackSourceKind::LocalFile;
+    PlaybackProtocol protocol = PlaybackProtocol::Unknown;
+    std::optional<RtspTransport> rtsp_transport;
     std::string display_name;
     PlaybackState state = PlaybackState::Idle;
     PlaybackCapabilities capabilities;
@@ -58,6 +60,7 @@ struct PlaybackSnapshot {
     bool has_current_video_output = false;  // 当前标签已有控件接收的帧，静态留帧不计入。
     double current_seconds = 0.0;
     double duration_seconds = 0.0;
+    std::optional<double> live_elapsed_seconds;  // 从本连接的首次输出起计，不使用上游 PTS。
     PlaybackStats stats;
     MediaInfo media_info;
     std::optional<PlaybackError> last_error;
