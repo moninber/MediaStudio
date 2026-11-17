@@ -37,6 +37,7 @@
 #include <optional>
 #include <system_error>
 #include <utility>
+#include <variant>
 
 namespace {
 
@@ -79,6 +80,13 @@ QString playbackDisplayLabel(const PlaybackSnapshot& snapshot)
         return "网络直播";
     }
     return QString::fromStdString(snapshot.display_name);
+}
+
+// 这些时刻相对打开请求；未采到的事件保留空值，不用 0 冒充已发生。
+QString formatMilestone(const std::optional<double>& seconds)
+{
+    return seconds && std::isfinite(*seconds) && *seconds >= 0.0
+        ? QString("%1 ms").arg(*seconds * 1000.0, 0, 'f', 0) : QString("—");
 }
 
 } // namespace
@@ -1014,6 +1022,18 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
     QString info_text;
     if (live) {
         info_text += QString("<h3>%1</h3><p>类型: 直播</p>").arg(playbackDisplayLabel(snapshot).toHtmlEscaped());
+        const auto stats = snapshot.network_stats.value_or(NetworkPlaybackStats{});
+        // 视频就绪以有效帧提交为准；频谱可隐藏画面，因此绘制有独立时刻。
+        if (info.has_audio || info.has_video) {
+            const auto audio_status = !info.has_audio ? "无轨道" : stats.first_pcm_seconds ? "已提交 PCM" : "待输出";
+            const auto video_status = !info.has_video ? "无轨道" : stats.first_video_submit_seconds ? "已提交视频帧" : "待输出";
+            info_text += QString("<p>音频: %1<br>视频: %2</p>").arg(audio_status, video_status);
+        }
+        info_text += QString("<p><b>首次事件（从打开请求计时）</b><br>收包: %1 · PCM: %2<br>视频提交: %3 · 绘制: %4"
+                             "<br>损坏帧跳过: %5</p>")
+            .arg(formatMilestone(stats.first_packet_seconds), formatMilestone(stats.first_pcm_seconds),
+                 formatMilestone(stats.first_video_submit_seconds), formatMilestone(stats.first_video_draw_seconds))
+            .arg(stats.corrupt_frames_skipped);
     } else if (!info.file_name.empty()) {
         info_text += QString("<h3>%1</h3>").arg(QString::fromStdString(info.file_name).toHtmlEscaped());
         info_text += QString("<p>格式: %1</p>").arg(QString::fromStdString(info.format_name).toHtmlEscaped());
@@ -1062,29 +1082,35 @@ void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
         combo_speed_->setCurrentIndex(visible_speed);
     }
 
-    // 打开媒体后后台可能仍在等待首份输出。首份音频或视频到达才显示直播正在播放。
-    const auto displayed_state = live && snapshot.state == PlaybackState::Playing && !snapshot.live_elapsed_seconds
-        ? PlaybackState::Buffering : snapshot.state;
     // 状态变化时才写状态栏，保留音量、倍速或特效操作出现时的提示。
-    if (snapshot.request_id != displayed_request_id_ || displayed_state != displayed_state_) {
+    if (snapshot.request_id != displayed_request_id_ || snapshot.state != displayed_state_) {
         const QString name = playbackDisplayLabel(snapshot);
         QString status;
-        switch (displayed_state) {
+        switch (snapshot.state) {
             case PlaybackState::Idle: status = "已停止"; break;
             case PlaybackState::Opening: status = "正在加载: " + name; break;
-            case PlaybackState::Buffering: status = (live && !snapshot.live_elapsed_seconds
-                ? "已连接，等待音视频: " : "正在缓冲: ") + name; break;
+            case PlaybackState::Buffering: status = (live ? "正在缓冲，等待轨道输出: " : "正在缓冲: ") + name; break;
             case PlaybackState::Playing: status = "正在播放: " + name; break;
             case PlaybackState::Draining: status = "正在播放: " + name; break;
             case PlaybackState::Paused: status = "已暂停"; break;
             case PlaybackState::Reconnecting: status = "正在重新连接: " + name; break;
             case PlaybackState::Stopping: status = "正在停止"; break;
-            case PlaybackState::Failed: status = "播放失败: " + name; break;
+            case PlaybackState::Failed: {
+                status = "播放失败: " + name;
+                if (live && snapshot.last_error) {
+                    const auto* read = std::get_if<MediaReadResult>(&*snapshot.last_error);
+                    if (read && read->stage == MediaReadStage::InitialOutput) {
+                        status = (read->status == MediaReadStatus::Timeout
+                            ? "播放失败，等待轨道输出超时: " : "播放失败，无法启动轨道输出: ") + name;
+                    }
+                }
+                break;
+            }
             case PlaybackState::Ended: status = "播放结束: " + name; break;
         }
         statusBar()->showMessage(status);
         displayed_request_id_ = snapshot.request_id;
-        displayed_state_ = displayed_state;
+        displayed_state_ = snapshot.state;
     }
 
     const auto formatTime = [](double seconds) {

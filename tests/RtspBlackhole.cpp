@@ -3,12 +3,14 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -116,13 +118,14 @@ unsigned short readClientPort(std::string_view request)
 }
 
 // 静态负载类型 0 是 PCMU；每包 160 个采样，RTP 时间戳按 20 ms 递增。
-std::array<unsigned char, 176> pcmuRtp(std::uint16_t sequence)
+std::array<unsigned char, 176> pcmuRtp(std::uint16_t sequence, std::uint32_t origin = 0,
+                                       unsigned char channel = 0)
 {
-    const std::uint32_t timestamp = sequence * 160u;
+    const std::uint32_t timestamp = origin + sequence * 160u;
     std::array<unsigned char, 176> bytes{};
     bytes.fill(0xff);
     bytes[0] = '$';
-    bytes[1] = 0;
+    bytes[1] = channel;
     bytes[2] = 0;
     bytes[3] = 172;
     bytes[4] = 0x80;
@@ -137,9 +140,9 @@ std::array<unsigned char, 176> pcmuRtp(std::uint16_t sequence)
 }
 
 // 32x32 白色 YUV420P 的 H.264 Baseline IDR，SPS/PPS 由 SDP 提供，无需运行编码器。
-std::array<unsigned char, 28> h264Rtp(std::uint16_t sequence)
+std::array<unsigned char, 28> h264Rtp(std::uint16_t sequence, std::uint32_t origin = 0)
 {
-    const std::uint32_t timestamp = sequence * 3600u;  // 90 kHz 时钟，每帧 40 ms。
+    const std::uint32_t timestamp = origin + sequence * 3600u;  // 90 kHz 时钟，每帧 40 ms。
     return {
         '$', 0, 0, 24, 0x80, 0xe0,
         static_cast<unsigned char>(sequence >> 8), static_cast<unsigned char>(sequence),
@@ -150,14 +153,28 @@ std::array<unsigned char, 28> h264Rtp(std::uint16_t sequence)
     };
 }
 
+// 与夹具的 SPS/PPS 同一次编码的非 IDR 帧，可使探测识别格式但不能满足关键包门控。
+std::array<unsigned char, 21> h264NonIdr(std::uint16_t sequence, std::uint32_t origin)
+{
+    const auto scored = h264Rtp(sequence, origin);
+    std::array<unsigned char, 21> packet{};
+    std::copy_n(scored.begin(), 16, packet.begin());
+    packet[3] = 17;
+    constexpr std::array<unsigned char, 5> non_idr{0x41, 0x9a, 0x20, 0x26, 0x8b};
+    std::copy(non_idr.begin(), non_idr.end(), packet.begin() + 16);
+    return packet;
+}
+
 } // namespace
 
 class RtspBlackhole::Impl {
 public:
     // 先绑定再启动线程；若初始化失败，由成员析构关闭监听 socket。
-    Impl(StallAt stall, const std::string& bind_address, SetupTransport transport)
+    Impl(StallAt stall, const std::string& bind_address, SetupTransport transport,
+         std::optional<StartupMedia> startup = {}, KeyVideo key_video = KeyVideo::Immediate,
+         std::uint32_t video_offset_seconds = 0)
         : listener_(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)), stall_(stall), bind_address_(bind_address),
-          expected_transport_(transport)
+          expected_transport_(transport), startup_(startup), key_video_(key_video), video_offset_seconds_(video_offset_seconds)
     {
         if (listener_.handle == INVALID_SOCKET) socketError("socket");
         sockaddr_in address{};
@@ -178,7 +195,7 @@ public:
         }
         setNonBlocking(listener_.handle);
         url_ = "rtsp://" + bind_address_ + ":" + std::to_string(ntohs(address.sin_port)) + "/blackhole";
-        if (expected_transport_ == SetupTransport::Udp) udp_ = std::make_unique<UdpStream>(address);
+        listener_address_ = address;
         worker_ = std::thread([this] {
             try {
                 serve();
@@ -199,6 +216,7 @@ public:
     std::string url() const { return url_; }
     bool isHoldingConnection() const noexcept { return holding_.load(); }
     SetupTransport setupTransport() const noexcept { return setup_transport_.load(); }
+    void releaseKeyVideo() noexcept { key_released_.store(true); }
 
 private:
     // 夹具自身的期限是故障保护；正常测试在此之前由 FFmpeg 返回。
@@ -259,17 +277,73 @@ private:
         }
     }
 
+    struct Track {
+        std::unique_ptr<UdpStream> udp;
+        unsigned short client_port = 0;
+    };
+
+    // 每条轨道使用独立的 UDP 端口对或 TCP 交错通道。
+    template<std::size_t N>
+    bool sendRtp(SOCKET socket, const sockaddr_in& peer, std::size_t track, const std::array<unsigned char, N>& packet)
+    {
+        const std::string_view bytes{reinterpret_cast<const char*>(packet.data()), packet.size()};
+        auto& target = tracks_[track];
+        return target.udp ? target.udp->sendRtp(peer, target.client_port, bytes) : writeAll(socket, bytes);
+    }
+
     // 纯视频流量小于预读阈值；UDP 丢弃后续数据，TCP 则用半包等待剩余字节。
-    bool sendVideoThenStall(SOCKET socket, const sockaddr_in& peer, unsigned short client_port)
+    bool sendVideoThenStall(SOCKET socket, const sockaddr_in& peer)
     {
         for (std::uint16_t seq = 1; seq <= 60; ++seq) {
-            const auto packet = h264Rtp(seq);
-            const std::string_view bytes{reinterpret_cast<const char*>(packet.data()), packet.size()};
-            if (udp_ ? !udp_->sendRtp(peer, client_port, bytes) : !writeAll(socket, bytes)) return false;
+            if (!sendRtp(socket, peer, 0, h264Rtp(seq))) return false;
         }
-        if (udp_) return true;
+        if (tracks_[0].udp) return true;
         const auto incomplete = h264Rtp(61);
         return writeAll(socket, {reinterpret_cast<const char*>(incomplete.data()), 5});
+    }
+
+    // RTP-Info 保持零基准，而 RTP 样本远离零：FFmpeg 解复用后的实际媒体时间约 45 分钟。
+    bool sendStartup(SOCKET socket, const sockaddr_in& peer, bool video, bool audio)
+    {
+        constexpr std::uint32_t origin_seconds = 2700;
+        // 缺少首个 IDR 时探测仍可能读满分析时长；供应超过 5 秒的非关键视频时间线。
+        constexpr std::uint16_t gate_at_frame = 150;
+        const std::uint32_t video_origin = (origin_seconds + video_offset_seconds_) * 90000;
+        const std::size_t audio_track = video ? 1u : 0u;
+        // 直播加入点的音轨先于首个可解码视频 0.4 秒，避免把预探测的非关键视频当成主时钟起点。
+        // 即时开始的测试两轨同时发送，只有视频的 RTP 时间戳可带人为偏移。
+        const auto audio_origin = origin_seconds * 8000 + (video && key_video_ == KeyVideo::AwaitRelease ? 44800 : 0);
+        const auto total = video ? gate_at_frame + 24 : 72;
+        for (std::uint16_t seq = 1; seq <= total; ++seq) {
+            if (video && seq > gate_at_frame && key_video_ == KeyVideo::NeverSend) {
+                while (!stopping_.load() && Clock::now() < hard_deadline_) {
+                    if (!sendRtp(socket, peer, 0, h264NonIdr(seq++, video_origin))) return false;
+                    std::this_thread::sleep_for(40ms);
+                }
+                return false;
+            }
+            if (video && seq > gate_at_frame && key_video_ == KeyVideo::AwaitRelease) {
+                while (!key_released_.load() && !stopping_.load() && Clock::now() < hard_deadline_) {
+                    std::this_thread::sleep_for(5ms);
+                }
+                if (!key_released_.load()) return false;
+            }
+            if (audio) {
+                const auto channel = static_cast<unsigned char>(audio_track * 2);
+                const auto first = static_cast<std::uint16_t>(seq * 2 - 1);
+                const auto second = static_cast<std::uint16_t>(seq * 2);
+                if (!sendRtp(socket, peer, audio_track, pcmuRtp(first, audio_origin, channel)) ||
+                    !sendRtp(socket, peer, audio_track, pcmuRtp(second, audio_origin, channel))) return false;
+            }
+            if (video) {
+                const bool key = key_video_ == KeyVideo::Immediate || seq > gate_at_frame;
+                const bool sent = key
+                    ? sendRtp(socket, peer, 0, h264Rtp(seq, video_origin))
+                    : sendRtp(socket, peer, 0, h264NonIdr(seq, video_origin));
+                if (!sent) return false;
+            }
+        }
+        return true;
     }
 
     // 完成最小 RTSP 握手并提供所选媒体，或收到首条请求后保持 TCP 连接但不回应。
@@ -282,8 +356,9 @@ private:
         if (peer.handle == INVALID_SOCKET) socketError("accept");
         setNonBlocking(peer.handle);
         const bool probing = stall_ == StallAt::ProbeStreams;
-        const bool video = probing || stall_ == StallAt::VideoReadPacket;
-        unsigned short client_port = 0;
+        const bool video = probing || stall_ == StallAt::VideoReadPacket ||
+                           (startup_ && *startup_ != StartupMedia::Audio);
+        const bool audio = !video || startup_ == StartupMedia::AudioVideo;
         std::string pending;
         while (!stopping_.load()) {
             const auto request = readRequest(peer.handle, pending);
@@ -318,17 +393,20 @@ private:
                     if (!probing) {
                         sdp += ";sprop-parameter-sets=Z0LACtolsBEAAAMAAQAAAwAyjxImoA==,aM4PyA==";
                     }
-                    sdp += "\r\n";
-                } else {
-                    sdp += "m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000/1\r\n";
+                    sdp += "\r\na=control:trackID=0\r\n";
                 }
-                sdp += "a=control:trackID=0\r\n";
+                if (audio) {
+                    sdp += "m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000/1\r\na=control:trackID=";
+                    sdp += video ? "1\r\n" : "0\r\n";
+                }
                 reply += "Content-Type: application/sdp\r\nContent-Base: " + url_ +
                          "/\r\nContent-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
             } else if (method == "SETUP") {
+                const std::size_t track = request.find("/trackID=1 ") != std::string::npos ? 1 : 0;
+                const std::string channels = track == 0 ? "interleaved=0-1" : "interleaved=2-3";
                 const bool tcp = request.find("RTP/AVP/TCP") != std::string::npos &&
-                                 request.find("interleaved=0-1") != std::string::npos;
-                client_port = readClientPort(request);
+                                 request.find(channels) != std::string::npos;
+                const unsigned short client_port = readClientPort(request);
                 const bool udp = !tcp && client_port != 0 && request.find("RTP/AVP") != std::string::npos;
                 const auto actual = tcp ? SetupTransport::Tcp : udp ? SetupTransport::Udp : SetupTransport::None;
                 setup_transport_.store(actual);
@@ -336,15 +414,19 @@ private:
                     throw std::runtime_error("unexpected RTP SETUP transport");
                 }
                 if (tcp) {
-                    reply += "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n";
+                    reply += "Transport: RTP/AVP/TCP;unicast;" + channels + "\r\n";
                 } else {
+                    tracks_[track].client_port = client_port;
+                    tracks_[track].udp = std::make_unique<UdpStream>(listener_address_);
                     reply += "Transport: RTP/AVP/UDP;unicast;client_port=" + std::to_string(client_port) + '-' +
-                        std::to_string(client_port + 1) + ";server_port=" + udp_->portPair() + "\r\n";
+                        std::to_string(client_port + 1) + ";server_port=" + tracks_[track].udp->portPair() + "\r\n";
                 }
                 reply += "Session: 1234abcd;timeout=60\r\n\r\n";
             } else if (method == "PLAY") {
                 reply += "Session: 1234abcd\r\nRTP-Info: url=" + url_ +
-                         "/trackID=0;seq=1;rtptime=" + (video ? "3600" : "160") + "\r\n\r\n";
+                         "/trackID=0;seq=1;rtptime=" + (video ? "3600" : "160");
+                if (video && audio) reply += ",url=" + url_ + "/trackID=1;seq=1;rtptime=160";
+                reply += "\r\n\r\n";
             } else if (method == "TEARDOWN" || method == "GET_PARAMETER") {
                 reply += "Session: 1234abcd\r\n\r\n";
             } else {
@@ -352,19 +434,18 @@ private:
             }
             if (!writeAll(peer.handle, reply) || method == "TEARDOWN") return;
             if (method == "PLAY") {
-                if (probing) {
+                if (startup_) {
+                    holding_.store(true);
+                    if (!sendStartup(peer.handle, peer_address, video, audio)) return;
+                } else if (probing) {
                     // PLAY 成功，但探测一直等缺失的解码参数。对端关闭前保留 TCP。
                     holding_.store(true);
                     continue;
                 } else if (video) {
-                    if (!sendVideoThenStall(peer.handle, peer_address, client_port)) return;
+                    if (!sendVideoThenStall(peer.handle, peer_address)) return;
                 } else {
                     for (std::uint16_t seq = 1; seq <= 96; ++seq) {
-                        const auto packet = pcmuRtp(seq);
-                        const std::string_view bytes{reinterpret_cast<const char*>(packet.data()), packet.size()};
-                        if (udp_ ? !udp_->sendRtp(peer_address, client_port, bytes) : !writeAll(peer.handle, bytes)) {
-                            return;
-                        }
+                        if (!sendRtp(peer.handle, peer_address, 0, pcmuRtp(seq))) return;
                     }
                 }
                 // 不送更多 RTP，也不关 socket。read 必须靠客户端中断或期限结束。
@@ -378,7 +459,12 @@ private:
     const StallAt stall_;
     const std::string bind_address_;
     const SetupTransport expected_transport_;
-    std::unique_ptr<UdpStream> udp_;
+    const std::optional<StartupMedia> startup_;
+    const KeyVideo key_video_;
+    const std::uint32_t video_offset_seconds_;
+    std::atomic<bool> key_released_{false};
+    sockaddr_in listener_address_{};
+    std::array<Track, 2> tracks_;
     std::string url_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> holding_{false};
@@ -390,7 +476,11 @@ private:
 // 创建指定地址上的单会话夹具，地址默认仍是回环。
 RtspBlackhole::RtspBlackhole(StallAt stall, const std::string& bind_address, SetupTransport transport)
     : impl_(std::make_unique<Impl>(stall, bind_address, transport)) {}
+RtspBlackhole::RtspBlackhole(StartupMedia media, const std::string& bind_address, SetupTransport transport,
+                           KeyVideo key_video, std::uint32_t video_offset_seconds)
+    : impl_(std::make_unique<Impl>(StallAt::ReadPacket, bind_address, transport, media, key_video, video_offset_seconds)) {}
 RtspBlackhole::~RtspBlackhole() = default;
 std::string RtspBlackhole::url() const { return impl_->url(); }
 bool RtspBlackhole::isHoldingConnection() const noexcept { return impl_->isHoldingConnection(); }
 RtspBlackhole::SetupTransport RtspBlackhole::setupTransport() const noexcept { return impl_->setupTransport(); }
+void RtspBlackhole::releaseKeyVideo() noexcept { impl_->releaseKeyVideo(); }

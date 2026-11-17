@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <utility>
 
@@ -25,6 +26,23 @@ constexpr long double TimestampUpperBound = 0x1p63L;
 bool hasValidTimeBase(AVRational time_base) noexcept
 {
     return time_base.num > 0 && time_base.den > 0;
+}
+
+// 保留时间戳是否来自媒体的区别，便于直播选用时钟锚点。
+std::optional<double> decodedTimestamp(const AVFrame& frame, AVRational time_base)
+{
+    if (!hasValidTimeBase(time_base)) return {};
+    int64_t ts = frame.best_effort_timestamp;
+    if (ts == AV_NOPTS_VALUE) ts = frame.pts;
+    if (ts == AV_NOPTS_VALUE) ts = frame.pkt_dts;
+    if (ts == AV_NOPTS_VALUE) return {};
+    const double seconds = ts * av_q2d(time_base);
+    return std::isfinite(seconds) ? std::optional<double>{seconds} : std::nullopt;
+}
+
+bool isCorrupt(const AVFrame& frame) noexcept
+{
+    return (frame.flags & AV_FRAME_FLAG_CORRUPT) || frame.decode_error_flags != 0;
 }
 
 // RTSP 对端文本和本地清单中的嵌套 URL 都可能含凭据，即便协议检查最终拒绝打开。
@@ -807,18 +825,23 @@ bool MediaDecoder::convertVideoFrame(AVFrame* frame, DecodedFrame& out_frame)
         return false;
     }
 
-    int64_t ts = frame->best_effort_timestamp;
-    if (ts == AV_NOPTS_VALUE) ts = frame->pts;
-    if (ts == AV_NOPTS_VALUE) ts = frame->pkt_dts;
+    if (network_input_ && isCorrupt(*frame)) {
+        out_frame.type = DecodedFrame::Type::Video;
+        out_frame.corrupt = true;
+        return true;
+    }
 
     const double fps = media_info_.video_info.frame_rate > 0.0
         ? media_info_.video_info.frame_rate
         : 25.0;
     double pts = 0.0;
-    if (ts != AV_NOPTS_VALUE && hasValidTimeBase(video_time_base_)) {
-        pts = ts * av_q2d(video_time_base_);
+    const auto timestamp = decodedTimestamp(*frame, video_time_base_);
+    if (timestamp) {
+        pts = *timestamp;
+        out_frame.has_valid_pts = true;
         if (!media_info_.has_audio && has_last_video_pts_ && pts <= last_video_pts_) {
             pts = last_video_pts_ + 1.0 / fps;
+            out_frame.has_valid_pts = false;
         }
     }
     else {
@@ -916,6 +939,11 @@ bool MediaDecoder::convertAudioFrame(AVFrame* frame, DecodedFrame& out_frame)
     if (!frame || !swr_ctx_ || !audio_buffer_src_ctx_ || audio_stream_index_ == -1) {
         return false;
     }
+    if (network_input_ && isCorrupt(*frame)) {
+        out_frame.type = DecodedFrame::Type::Audio;
+        out_frame.corrupt = true;
+        return true;
+    }
 
     int output_samples = (int)av_rescale_rnd(
         swr_get_delay(swr_ctx_, frame->sample_rate) + frame->nb_samples,
@@ -975,7 +1003,9 @@ bool MediaDecoder::convertAudioFrame(AVFrame* frame, DecodedFrame& out_frame)
         out_frame.data = output_buffer;
         out_frame.samples = converted_samples;
         out_frame.data_size = data_size;
-        out_frame.pts = getFrameTimestampSeconds(frame, audio_time_base_);
+        const auto timestamp = decodedTimestamp(*frame, audio_time_base_);
+        out_frame.has_valid_pts = timestamp.has_value();
+        out_frame.pts = timestamp.value_or(current_time_.load());
         current_time_ = out_frame.pts;
 
         av_channel_layout_uninit(&resampled_frame->ch_layout);
@@ -1084,21 +1114,6 @@ void MediaDecoder::flushAfterDiscontinuity(double seconds)
     has_last_video_pts_ = true;
 
     current_time_ = seconds;
-}
-
-// 用调用方的时间基换算已解码帧，缺少有效时间戳时沿用当前媒体时间。
-double MediaDecoder::getFrameTimestampSeconds(const AVFrame* frame, AVRational time_base) const
-{
-    if (!frame || !hasValidTimeBase(time_base)) {
-        return current_time_.load();
-    }
-
-    int64_t ts = frame->best_effort_timestamp;
-    if (ts == AV_NOPTS_VALUE) ts = frame->pts;
-    if (ts == AV_NOPTS_VALUE) ts = frame->pkt_dts;
-    if (ts == AV_NOPTS_VALUE) return current_time_.load();
-
-    return ts * av_q2d(time_base);
 }
 
 // ============================================================

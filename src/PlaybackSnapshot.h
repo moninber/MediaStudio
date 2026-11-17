@@ -39,6 +39,12 @@ struct NetworkPlaybackStats {
     std::optional<double> application_bitrate_bps;
     std::optional<double> last_packet_age_seconds;
     std::uint64_t reconnect_attempts = 0;
+    // 各阶段仅记首次，时间从本次播放请求提交起算。
+    std::optional<double> first_packet_seconds;
+    std::optional<double> first_pcm_seconds;
+    std::optional<double> first_video_submit_seconds;
+    std::optional<double> first_video_draw_seconds;
+    std::uint64_t corrupt_frames_skipped = 0;  // 与音画同步丢帧分开统计。
 };
 
 // 保留打开阶段或读包结果的错误分类与原始 FFmpeg 错误码，不包含连接地址。

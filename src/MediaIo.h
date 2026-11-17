@@ -15,10 +15,12 @@ struct MediaOpenResult {
 };
 
 enum class MediaReadStatus { Packet, Again, EndOfStream, Timeout, Cancelled, Error };
+enum class MediaReadStage { ReadPacket, InitialOutput };
 
 struct MediaReadResult {
     MediaReadStatus status;
     int ffmpegError; // 分类与 FFmpeg 原始返回值分别保存。
+    MediaReadStage stage = MediaReadStage::ReadPacket;
 };
 
 // 用中断原因区分 FFmpeg 通用退出码，保留暂时无包、EOF 和其他错误。
@@ -34,6 +36,11 @@ public:
     void cancel() noexcept;
     // 查询是否由调用方主动取消，不把超时当作取消。
     bool isCancelled() const noexcept;
+    // 首次输出期限独立于每次读包，连续有包也不能延后它。
+    void beginInitialOutputDeadline(std::chrono::steady_clock::time_point deadline) noexcept;
+    // 最后一个活动轨道按时输出后撤销启动限制，不影响在途读包的原期限。
+    bool finishInitialOutput() noexcept;
+    bool isInitialOutputTimedOut() const noexcept;
 
 private:
     friend class MediaDecoder;
@@ -56,4 +63,5 @@ private:
 
     std::atomic<bool> cancelled_{false};
     std::atomic<Clock::duration::rep> deadline_{NoDeadline};
+    std::atomic<Clock::duration::rep> initial_output_deadline_{NoDeadline};
 };

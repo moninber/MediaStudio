@@ -65,6 +65,8 @@ struct DecodedFrame {
     int height = 0;
     int samples = 0;
     double pts = 0.0;
+    bool has_valid_pts = false; // pts 来自解码器时间戳，而非缺失时的回退值。
+    bool corrupt = false;      // FFmpeg 明确标记损坏；直播只传回标记，不复制数据。
 };
 
 class MediaDecoder {
@@ -133,7 +135,6 @@ private:
     bool initAudioFilterGraph();
     void destroyAudioFilterGraph();
     std::string buildAtempoFilterChain(float speed) const;
-    double getFrameTimestampSeconds(const AVFrame* frame, AVRational time_base) const;
 
     AVFormatContext* format_ctx_;     // 由 supervisor 独占，解码线程不访问 AVStream。
     std::shared_ptr<MediaIoControl> io_; // FFmpeg 回调使用的对象，在关闭封装后释放。

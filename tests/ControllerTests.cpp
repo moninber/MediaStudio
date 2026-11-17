@@ -20,6 +20,8 @@
 #include <QTextEdit>
 #include <QTimer>
 
+#include <mmdeviceapi.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -429,7 +431,8 @@ void testControllerBlockedRead()
     PlaybackSnapshot queued;
     waitUntil([&] {
         queued = player.getPlaybackSnapshot();
-        return queued.request_id == request && queued.state == PlaybackState::Playing &&
+        return queued.request_id == request &&
+               (queued.state == PlaybackState::Buffering || queued.state == PlaybackState::Playing) &&
                queued.media_info.has_video && !queued.media_info.has_audio && queued.stats.video_queue_packets >= 30;
     }, 1s, "RTSP probe did not complete and queue the video burst");
     require(server.isHoldingConnection(), "RTSP closed after probing");
@@ -500,6 +503,162 @@ void waitInQt(Predicate ready, Clock::duration timeout, const char* detail)
 std::string testRtspAddress()
 {
     return qEnvironmentVariable("MEDIASTUDIO_TEST_RTSP_ADDRESS", "127.0.0.1").toStdString();
+}
+
+// 只判断 Windows 测试机是否有默认播放端点；设备存在时任何 PCM 提交失败都应使测试失败。
+bool hasDefaultRenderEndpoint()
+{
+    HRESULT result = E_FAIL;
+    std::thread worker([&] {
+        result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(result)) return;
+        IMMDeviceEnumerator* enumerator = nullptr;
+        result = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
+        if (SUCCEEDED(result)) {
+            IMMDevice* endpoint = nullptr;
+            result = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &endpoint);
+            if (endpoint) endpoint->Release();
+            enumerator->Release();
+        }
+        CoUninitialize();
+    });
+    worker.join();
+    if (result == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) return false;
+    require(SUCCEEDED(result), "could not enumerate the default Windows playback endpoint");
+    return true;
+}
+
+// 用真实播放器从首包走到输出；只收到非关键包时不能离开 Buffering。
+int testLiveStartup(std::string_view mode)
+{
+    using Fixture = RtspBlackhole;
+    const bool native = mode == "live-start-native";
+    const bool no_key = mode == "live-start-no-key";
+    const bool offset_start = mode == "live-start-av-offset-tcp";
+    const auto media = mode.find("-av-") != std::string_view::npos ? Fixture::StartupMedia::AudioVideo
+        : mode.find("-audio-") != std::string_view::npos ? Fixture::StartupMedia::Audio : Fixture::StartupMedia::Video;
+    const bool audio = media != Fixture::StartupMedia::Video;
+    const bool video = media != Fixture::StartupMedia::Audio;
+    const bool udp = mode.find("-udp") != std::string_view::npos;
+    if (audio && !hasDefaultRenderEndpoint()) {
+        std::cout << "Skipped: no default Windows audio endpoint for real WASAPI PCM submission\n";
+        return 77;
+    }
+
+    VideoWidget widget;
+    widget.setShowSpectrum(audio || native);
+    if (native) {
+        require(QApplication::platformName() == "windows", "native startup test requires the Windows Qt platform");
+        widget.resize(360, 260);
+        widget.show();
+    }
+    const auto expected_transport = udp ? Fixture::SetupTransport::Udp : Fixture::SetupTransport::Tcp;
+    const auto key_video = no_key ? Fixture::KeyVideo::NeverSend
+        : video && !offset_start ? Fixture::KeyVideo::AwaitRelease : Fixture::KeyVideo::Immediate;
+    Fixture server(media, testRtspAddress(), expected_transport, key_video, offset_start ? 8 : 0);
+    PlayerController player;
+    player.setVideoWidget(&widget);
+    const auto source = createStableRtspSource(server.url(), udp ? RtspTransport::Udp : RtspTransport::Tcp);
+    require(source.source.has_value(), "fixture playback source failed validation");
+    const auto started = Clock::now();
+    const auto request = player.requestOpen(*source.source);
+    require(request > 0, "live supervisor rejected the fixture request");
+
+    if (video && !offset_start) {
+        PlaybackSnapshot waiting;
+        waitInQt([&] {
+            waiting = player.getPlaybackSnapshot();
+            return waiting.request_id == request && waiting.network_stats && waiting.network_stats->first_packet_seconds &&
+                   (!audio || waiting.network_stats->first_pcm_seconds) &&
+                   (waiting.state == PlaybackState::Buffering || waiting.state == PlaybackState::Playing);
+        }, 3s, "RTSP did not deliver packet/PCM milestones while waiting for a key packet");
+        require(server.isHoldingConnection() && waiting.state == PlaybackState::Buffering &&
+                waiting.media_info.has_video && waiting.media_info.has_audio == audio &&
+                !waiting.has_current_video_output && !waiting.network_stats->first_video_submit_seconds &&
+                !waiting.network_stats->first_video_draw_seconds,
+                "packet receipt or audio-only output prematurely marked all live tracks ready");
+        std::cout << "buffering_before_idr=1 pcm_ready_before_idr=" << audio << '\n';
+        if (no_key) {
+            // 服务器持续供包，只是没有关键帧；首输出期限独立于读取超时。
+            const auto buffered_at = Clock::now();
+            PlaybackSnapshot terminal;
+            waitInQt([&] {
+                terminal = player.getPlaybackSnapshot();
+                return terminal.request_id == request && terminal.state == PlaybackState::Failed;
+            }, 12s, "nonkey packets kept an unusable live session alive without bound");
+            const auto elapsed = Clock::now() - buffered_at;
+            const auto* error = terminal.last_error ? std::get_if<MediaReadResult>(&*terminal.last_error) : nullptr;
+            require(error && error->status == MediaReadStatus::Timeout && error->stage == MediaReadStage::InitialOutput &&
+                    elapsed >= 9s && !terminal.has_current_video_output && terminal.network_stats &&
+                    terminal.network_stats->first_packet_seconds && !terminal.network_stats->first_video_submit_seconds,
+                    "nonkey stream failed outside the independent initial output deadline");
+            std::cout << "startup_no_key_initial_output_timeout_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() << '\n';
+            player.shutdown();
+            return 0;
+        }
+        server.releaseKeyVideo();
+    }
+
+    PlaybackSnapshot playing;
+    waitInQt([&] {
+        playing = player.getPlaybackSnapshot();
+        return playing.request_id == request && (playing.state == PlaybackState::Failed ||
+            (playing.state == PlaybackState::Playing && playing.current_seconds >= 2699.0 && playing.live_elapsed_seconds));
+    }, audio && video ? 8s : 4s, "RTSP did not deliver output promptly at the large source PTS");
+    if (playing.state == PlaybackState::Failed) {
+        const auto* error = playing.last_error ? std::get_if<MediaReadResult>(&*playing.last_error) : nullptr;
+        std::cerr << "startup_failure_elapsed_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count()
+                  << " media_pts=" << playing.current_seconds << " ffmpeg=" << (error ? error->ffmpegError : 0) << '\n';
+    }
+    require(server.setupTransport() == expected_transport && playing.media_info.has_audio == audio &&
+            playing.state == PlaybackState::Playing && playing.media_info.has_video == video &&
+            playing.has_current_video_output == video &&
+            playing.network_stats.has_value() && !playing.last_error, "opened live tracks, transport, or output did not match");
+    const auto& milestones = *playing.network_stats;
+    require(milestones.first_packet_seconds.has_value() && *milestones.first_packet_seconds >= 0.0 &&
+            milestones.first_pcm_seconds.has_value() == audio && milestones.first_video_submit_seconds.has_value() == video &&
+            (!audio || *milestones.first_pcm_seconds >= *milestones.first_packet_seconds) &&
+            (!video || *milestones.first_video_submit_seconds >= *milestones.first_packet_seconds) &&
+            (!(audio && video) || *milestones.first_pcm_seconds <= *milestones.first_video_submit_seconds) &&
+            !milestones.first_video_draw_seconds && *playing.live_elapsed_seconds < 5.0,
+            "output milestones did not distinguish actual PCM/frame submission, draw, and playback time");
+
+    const PlaybackEpoch epoch{playing.request_id, playing.connection_attempt_id, playing.generation};
+    require(!widget.firstDrawnAt(epoch), "hidden/spectrum view falsely reported a video draw");
+    if (offset_start) {
+        // 无有效 PTS 的首帧可先提交；统计窗口必须证明后续有效 PTS 帧也继续提交。
+        PlaybackSnapshot advanced;
+        waitInQt([&] {
+            advanced = player.getPlaybackSnapshot();
+            return advanced.request_id == request && advanced.state == PlaybackState::Playing &&
+                advanced.current_seconds >= playing.current_seconds + 0.5 && advanced.stats.render_fps >= 8.0;
+        }, 1800ms, "first video frame was submitted, but later frames stalled on the eight-second RTP offset");
+        std::cout << "startup_video_rtp_offset_s=8 audio_advanced_s=" << advanced.current_seconds - playing.current_seconds
+                  << " video_submit_fps=" << advanced.stats.render_fps << '\n';
+    }
+    if (native) {
+        // 真实窗口可画频谱，但只有切回视频并执行 GL 绘制后才能出现首帧绘制里程碑。
+        widget.setShowSpectrum(false);
+        waitInQt([&] {
+            const auto snapshot = player.getPlaybackSnapshot();
+            return widget.firstDrawnAt(epoch) && snapshot.network_stats && snapshot.network_stats->first_video_draw_seconds &&
+                   *snapshot.network_stats->first_video_draw_seconds >= *milestones.first_video_submit_seconds;
+        }, 2s, "native GL video draw did not follow the video submission milestone");
+        std::cout << "native_gl_video_draw_after_submission=1 spectrum_not_a_video_draw=1\n";
+    }
+
+    std::cout << "startup_mode=" << mode << " source_pts=" << playing.current_seconds
+              << " first_packet_s=" << *milestones.first_packet_seconds
+              << " first_pcm_s=" << milestones.first_pcm_seconds.value_or(-1.0)
+              << " first_submit_s=" << milestones.first_video_submit_seconds.value_or(-1.0)
+              << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count()
+              << " drawing_not_needed_for_playing=1\n";
+    player.shutdown();
+    waitInQt([&] { return !server.isHoldingConnection(); }, 1s, "live fixture peer did not observe disconnect");
+    return 0;
 }
 
 // 检查已接到关窗命令的快照中不再有旧源标记或可显示内容。
@@ -904,6 +1063,7 @@ int main(int argc, char* argv[])
         else if (mode == "window-close-transcode") testWindowCloseTranscode();
         else if (mode == "window-close-modal") testWindowCloseModal();
         else if (mode == "window-mixed-rtsp") testWindowMixedRtsp();
+        else if (mode.substr(0, 11) == "live-start-") return testLiveStartup(mode);
         else if (mode == "widget-epochs") testWidgetEpochs();
         else throw std::runtime_error("unknown session test");
         return 0;

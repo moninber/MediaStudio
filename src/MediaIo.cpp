@@ -36,6 +36,24 @@ bool MediaIoControl::isCancelled() const noexcept
     return cancelled_.load(std::memory_order_acquire);
 }
 
+void MediaIoControl::beginInitialOutputDeadline(Clock::time_point deadline) noexcept
+{
+    initial_output_deadline_.store(deadline.time_since_epoch().count(), std::memory_order_release);
+}
+
+bool MediaIoControl::finishInitialOutput() noexcept
+{
+    if (isInitialOutputTimedOut()) return false;
+    initial_output_deadline_.store(NoDeadline, std::memory_order_release);
+    return true;
+}
+
+bool MediaIoControl::isInitialOutputTimedOut() const noexcept
+{
+    const auto deadline = initial_output_deadline_.load(std::memory_order_acquire);
+    return deadline != NoDeadline && Clock::now().time_since_epoch().count() >= deadline;
+}
+
 // 期限从实际开始操作时计时，不受系统时间调整影响。
 void MediaIoControl::armDeadline(std::chrono::milliseconds timeout) noexcept
 {
@@ -71,7 +89,8 @@ MediaIoStopReason MediaIoControl::stopReason() const noexcept
         return MediaIoStopReason::Cancelled;
     }
     const auto deadline = deadline_.load(std::memory_order_acquire);
-    if (deadline != NoDeadline && Clock::now().time_since_epoch().count() >= deadline) {
+    if (isInitialOutputTimedOut() ||
+        (deadline != NoDeadline && Clock::now().time_since_epoch().count() >= deadline)) {
         return MediaIoStopReason::Timeout;
     }
     return MediaIoStopReason::None;

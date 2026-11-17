@@ -223,7 +223,9 @@ if(BUILD_TESTING)
 
     foreach(test_case IN ITEMS controller-local controller-supersede controller-blocked-read packet-epochs widget-epochs
                           window-close-open window-close-probe window-close-read window-stop-reopen window-close-transcode
-                          window-close-modal window-mixed-rtsp)
+                          window-close-modal window-mixed-rtsp live-start-av-tcp live-start-av-udp
+                          live-start-video-tcp live-start-video-udp live-start-audio-tcp live-start-audio-udp
+                          live-start-no-key live-start-av-offset-tcp)
         set(test_name MediaStudio.Session.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES
@@ -231,6 +233,10 @@ if(BUILD_TESTING)
             WORKING_DIRECTORY "$<TARGET_FILE_DIR:MediaStudioSessionTests>"
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
         )
+        # 无默认音频端点的机器不能真实提交 PCM；其他错误保持测试失败。
+        if(test_case MATCHES "^live-start-(av|audio)-")
+            set_property(TEST ${test_name} PROPERTY SKIP_RETURN_CODE 77)
+        endif()
         if(TARGET Qt6::QOffscreenIntegrationPlugin)
             set_property(TEST ${test_name} APPEND PROPERTY ENVIRONMENT
                 "QT_QPA_PLATFORM_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::QOffscreenIntegrationPlugin>")

@@ -32,6 +32,7 @@
 #include <QOpenGLWidget>
 #include <QOpenGLFunctions>
 #include <QTimer>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -50,6 +51,9 @@ public:
 
     // 同步更新输出归属，旧帧和旧频谱从这一刻起不能作为本代输出提交。
     void setPlaybackEpoch(PlaybackEpoch epoch, bool retain_frame);
+
+    // 仅返回当前代首帧的 GL 绘制时刻；线程安全，不调用 Qt 事件或 OpenGL。
+    std::optional<std::chrono::steady_clock::time_point> firstDrawnAt(PlaybackEpoch epoch) const;
 
     /**
      * @brief 设置视频帧数据（由PlayerController调用，线程安全）
@@ -94,8 +98,9 @@ private:
     bool gl_initialized_;
 
     // 生产线程只访问锁保护的待绘制数据，OpenGL 绘制不持有此锁。
-    std::mutex output_mutex_;
+    mutable std::mutex output_mutex_;
     PlaybackEpoch active_epoch_{};
+    std::optional<std::chrono::steady_clock::time_point> first_drawn_at_;
     // 每次要求清除画面都推进此序号，使旧静态帧在后续保留操作中也无法恢复。
     std::uint64_t display_reset_ = 0;
     VideoFrameBuffer pending_video_;

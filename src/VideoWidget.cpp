@@ -68,7 +68,7 @@ void VideoWidget::initializeGL()
     visualizer_ = std::make_unique<AudioVisualizer>();
 
     // 初始大小设为默认值，加载文件后会重新初始化
-    renderer_->init(1920, 1080);
+    if (!renderer_->init(1920, 1080)) renderer_.reset();
     visualizer_->init(64);
     displayed_spectrum_epoch_.reset();
 
@@ -85,6 +85,7 @@ void VideoWidget::paintGL()
     std::uint64_t reset;
     std::vector<float> spectrum;
     bool draw_pending_video = false;
+    bool check_first_video_draw = false;
     {
         std::lock_guard lock(output_mutex_);
         epoch = active_epoch_;
@@ -97,6 +98,7 @@ void VideoWidget::paintGL()
             std::swap(drawing_video_, pending_video_);
             has_pending_video_ = false;
             draw_pending_video = true;
+            check_first_video_draw = epoch.request_id != 0 && !first_drawn_at_;
         }
     }
 
@@ -104,6 +106,7 @@ void VideoWidget::paintGL()
     const int viewport_width = static_cast<int>(width() * dpr);
     const int viewport_height = static_cast<int>(height() * dpr);
 
+    std::optional<std::chrono::steady_clock::time_point> drawn_at;
     if (spectrum_mode) {
         glClearColor(0.05f, 0.05f, 0.08f, 1.0f);
     } else {
@@ -120,13 +123,30 @@ void VideoWidget::paintGL()
         visualizer_->render(viewport_width, viewport_height);
     } else {
         const auto& frame = draw_pending_video ? drawing_video_ : displayed_video_;
-        if (!renderer_ || frame.width == 0 || frame.display_reset != reset) return;
+        if (!renderer_ || viewport_width <= 0 || viewport_height <= 0 ||
+            frame.width == 0 || frame.display_reset != reset) return;
+
+        // 先分离 Qt 或清屏的既有 GL 错误。只在首帧候选时检查，避免每帧增加驱动查询。
+        if (check_first_video_draw) {
+            constexpr int max_gl_errors = 16;
+            int cleared = 0;
+            while (cleared < max_gl_errors && glGetError() != GL_NO_ERROR) ++cleared;
+            if (cleared == max_gl_errors) return;
+        }
         renderer_->setViewport(0, 0, viewport_width, viewport_height);
         if (frame.format == VideoFrameFormat::YUV420P) {
             renderer_->renderYUV420P(frame.planes[0].data(), frame.planes[1].data(), frame.planes[2].data(),
                                     frame.full_range, frame.bt709, frame.width, frame.height);
         } else {
             renderer_->renderRGBA(frame.planes[0].data(), frame.width, frame.height);
+        }
+        if (check_first_video_draw) {
+            if (glGetError() != GL_NO_ERROR) {
+                glClear(GL_COLOR_BUFFER_BIT);
+                return;
+            }
+            // 记录当前 Qt GL 帧缓冲的绘制，不表示窗口合成或显示器已经呈现。
+            drawn_at = std::chrono::steady_clock::now();
         }
     }
 
@@ -142,6 +162,7 @@ void VideoWidget::paintGL()
                 displayed_spectrum_reset_ = reset;
             } else if (draw_pending_video) {
                 std::swap(displayed_video_, drawing_video_);
+                if (drawn_at && !first_drawn_at_) first_drawn_at_ = drawn_at;
             }
         }
     }
@@ -161,10 +182,19 @@ void VideoWidget::setPlaybackEpoch(PlaybackEpoch epoch, bool retain_frame)
     std::lock_guard lock(output_mutex_);
     if (active_epoch_ == epoch && retain_frame) return;
     active_epoch_ = epoch;
+    first_drawn_at_.reset();
     if (!retain_frame) ++display_reset_;
     has_pending_video_ = false;
     pending_spectrum_.clear();
     needs_update_ = true;
+}
+
+// 锁内仅拷贝时间点。绘制线程不访问控制器，因此控制器读取快照时可以安全调用。
+std::optional<std::chrono::steady_clock::time_point> VideoWidget::firstDrawnAt(PlaybackEpoch epoch) const
+{
+    std::lock_guard lock(output_mutex_);
+    if (active_epoch_ != epoch) return std::nullopt;
+    return first_drawn_at_;
 }
 
 // 接受时按完整标签检查，像素仍归调用方所有，控件只保存自己的副本。
