@@ -76,6 +76,14 @@ void MediaIoControl::limitDeadline(std::chrono::milliseconds timeout) noexcept
     }
 }
 
+// URLContext 复制了回调，但 opaque 仍指向本对象；无需替换 FFmpeg 内部回调。
+void MediaIoControl::beginCloseDeadline(std::chrono::milliseconds timeout) noexcept
+{
+    auto unset = NoDeadline;
+    const auto deadline = (Clock::now() + timeout).time_since_epoch().count();
+    close_deadline_.compare_exchange_strong(unset, deadline, std::memory_order_release);
+}
+
 // 撤销当前操作的计时，不清除取消标志。
 void MediaIoControl::clearDeadline() noexcept
 {
@@ -100,5 +108,11 @@ MediaIoStopReason MediaIoControl::stopReason() const noexcept
 int MediaIoControl::interruptCallback(void* opaque) noexcept
 {
     const auto* control = static_cast<const MediaIoControl*>(opaque);
+    // 原请求仍然已取消，stopReason/isCancelled 的结果不变。只在关闭期间允许
+    // FFmpeg 尝试发送 TEARDOWN；不恢复读包，不等待回应，过期后继续中断。
+    const auto closing = control->close_deadline_.load(std::memory_order_acquire);
+    if (closing != NoDeadline) {
+        return Clock::now().time_since_epoch().count() >= closing ? 1 : 0;
+    }
     return control->stopReason() != MediaIoStopReason::None ? 1 : 0;
 }

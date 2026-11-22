@@ -81,6 +81,7 @@ private slots:
     void openFile();
     void openNetworkMedia();
     void togglePlayPause();
+    void returnToLive();
     void stopPlayback();
     void seekPosition(int position);
     void changeVolume(int volume);
@@ -142,6 +143,8 @@ private:
     QPushButton* btn_stop_;
     QPushButton* btn_prev_;
     QPushButton* btn_next_;
+    QPushButton* btn_live_;
+    QAction* action_live_;
     QPushButton* btn_mute_;
     QSlider* slider_progress_;
     QSlider* slider_volume_;
@@ -174,6 +177,7 @@ private:
     std::uint64_t library_request_id_ = 0;
     std::uint64_t displayed_request_id_ = 0;
     PlaybackState displayed_state_ = PlaybackState::Idle;
+    bool displayed_session_active_ = false;
     std::uint64_t transcode_request_id_ = 0;
     std::atomic<bool> transcoding_{ false };
     std::thread transcoding_thread_;

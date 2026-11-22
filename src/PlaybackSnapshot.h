@@ -63,6 +63,7 @@ struct PlaybackSnapshot {
     PlaybackCapabilities capabilities;
     bool is_playing = false;
     bool is_paused = false;
+    bool is_session_active = false; // 仍在打开或占用会话资源，含旧线程及解码器收尾，不等同于有网络连接。
     bool has_current_video_output = false;  // 当前标签已有控件接收的帧，静态留帧不计入。
     double current_seconds = 0.0;
     double duration_seconds = 0.0;

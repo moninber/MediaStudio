@@ -386,8 +386,12 @@ void MediaDecoder::close()
     }
 
     if (format_ctx_) {
-        // 部分协议在关闭时会发送控制消息，不清除取消或延长已有期限。
-        io_->limitDeadline(read_timeout_);
+        // 播放 worker 已回收，RTSP 关闭才允许一次有界的 TEARDOWN 写入。
+        // 取消保持粘性；FFmpeg 的 async TEARDOWN 发送后即关闭，不等待服务器回应。
+        const bool rtsp = network_input_ && format_ctx_->iformat &&
+            std::strcmp(format_ctx_->iformat->name, "rtsp") == 0;
+        if (rtsp) io_->beginCloseDeadline(std::chrono::milliseconds{250});
+        else io_->limitDeadline(read_timeout_);
         avformat_close_input(&format_ctx_);
     }
     // 打开时 io_ 与日志计数同时建立，封装和解码器销毁后才能恢复默认日志。

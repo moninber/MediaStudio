@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 // 默认在回环地址提供一次 RTSP 会话；也可显式绑定私有 IPv4。
 class RtspBlackhole {
@@ -17,7 +18,10 @@ public:
                            SetupTransport transport = SetupTransport::Tcp);
     // 启播用例可发送大时间戳、双轨 RTP，并在非关键视频包后等待测试放行 IDR。
     RtspBlackhole(StartupMedia media, const std::string& bind_address, SetupTransport transport,
-                  KeyVideo key_video = KeyVideo::Immediate, std::uint32_t video_offset_seconds = 0);
+                  KeyVideo key_video = KeyVideo::Immediate, std::uint32_t video_offset_seconds = 0,
+                  unsigned int max_sessions = 1);
+    // 在同一地址逐次提供预定阻塞阶段，验证暂停/继续确实重建连接。
+    RtspBlackhole(std::vector<StallAt> stages, const std::string& bind_address, SetupTransport transport);
     ~RtspBlackhole();
     RtspBlackhole(const RtspBlackhole&) = delete;
     RtspBlackhole& operator=(const RtspBlackhole&) = delete;
@@ -30,6 +34,13 @@ public:
     SetupTransport setupTransport() const noexcept;
     // 放行被测试暂时扣留的关键视频包。
     void releaseKeyVideo() noexcept;
+    // 计数由真实 accept 和连接析构更新，不用客户端状态冒充服务端断开。
+    unsigned int acceptedConnections() const noexcept;
+    unsigned int closedConnections() const noexcept;
+    unsigned int playRequests() const noexcept;
+    // UDP 媒体会话只有收到 TEARDOWN 才释放；控制连接 EOF 不能冒充远端会话删除。
+    unsigned int teardownRequests() const noexcept;
+    unsigned int activeRemoteSessions() const noexcept;
 
 private:
     class Impl;

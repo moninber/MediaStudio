@@ -29,9 +29,12 @@ public:
     // 由对象所有者调用，确保 supervisor 已 join 后再销毁控制器。
     void shutdown();
 
-    void play();
-    void pause();
-    void togglePlayPause();
+    // 文件暂停保留位置；直播暂停断开，继续时建立新的用户请求。
+    std::uint64_t play();
+    std::uint64_t pause();
+    std::uint64_t togglePlayPause();
+    // 同源重新接入最新直播，保留用户的输出与传输设置。
+    std::uint64_t returnToLive();
     void seek(double seconds);
     void setVolume(float volume);
     void setSpeed(float speed);
@@ -66,9 +69,10 @@ private:
     void supervisorLoop();
     std::optional<PlaybackError> runRequest(const OpenRequest& request, VideoWidget* video);
     std::optional<MediaReadResult> demuxAndPlay(const OpenRequest& request, VideoWidget* video);
+    std::uint64_t requestOpenLocked(PlaybackSource source, bool retain_frame);
     void cancelCurrentLocked();
     void resetSnapshotLocked(std::uint64_t request_id, PlaybackState state);
-    void setPausedLocked(bool paused);
+    std::uint64_t setPausedLocked(bool paused);
     PlaybackEpoch currentEpochLocked() const;
 
     MediaDecoder decoder_;
@@ -89,6 +93,7 @@ private:
     mutable std::mutex snapshot_mutex_;
     std::condition_variable command_changed_;
     std::optional<OpenRequest> pending_open_;
+    std::optional<PlaybackSource> current_source_; // 当前源只存内存；快照不暴露原始网络地址。
     std::optional<double> pending_seek_;
     PlaybackSnapshot snapshot_;
     std::chrono::steady_clock::time_point request_submitted_at_{};

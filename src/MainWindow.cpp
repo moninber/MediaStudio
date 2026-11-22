@@ -57,9 +57,12 @@ bool canSeek(const PlaybackSnapshot& snapshot)
            std::isfinite(snapshot.duration_seconds) && snapshot.duration_seconds > 0.0;
 }
 
-// 2.1 直播不支持暂停，失败或停止后可重新选择或打开当前列表项。
+// 直播在打开、等待输出或播放时都可断开暂停；继续创建新的直播请求。
 bool canTogglePlayback(const PlaybackSnapshot& snapshot)
 {
+    if (snapshot.source_kind == PlaybackSourceKind::NetworkLive) {
+        return snapshot.state != PlaybackState::Idle && snapshot.state != PlaybackState::Stopping;
+    }
     return canOpenSelectedSource(snapshot.state) ||
            (snapshot.source_kind == PlaybackSourceKind::LocalFile &&
             (snapshot.is_playing || snapshot.is_paused));
@@ -179,7 +182,7 @@ void MainWindow::setupMenuBar()
         if (isClosing()) return;
         QScopedValueRollback modal_scope(modal_depth_, modal_depth_ + 1);
         QMessageBox::information(this, "快捷键说明",
-            "SPACE - 播放/暂停（本地文件支持暂停）\n"
+            "SPACE - 播放/暂停（直播暂停断开，继续接入最新直播）\n"
             "LEFT/RIGHT - 本地文件后退/前进5秒\n"
             "UP/DOWN - 音量增大/减小\n"
             "PAGEUP/PAGEDOWN - 上一曲/下一曲\n"
@@ -247,6 +250,14 @@ void MainWindow::setupToolBar()
     btn_next_->setMinimumHeight(32);
     btn_next_->setMaximumWidth(40);
     toolbar->addWidget(btn_next_);
+
+    // 只在当前请求为直播时显示，不改变播放列表所选源的传输或预设。
+    btn_live_ = new QPushButton("回到直播");
+    btn_live_->setObjectName("btn_return_to_live");
+    btn_live_->setMinimumHeight(32);
+    btn_live_->setToolTip("重新连接当前直播，接入最新内容；连接中可再次点击或暂停。");
+    action_live_ = toolbar->addWidget(btn_live_);
+    action_live_->setVisible(false);
 
     toolbar->addSeparator();
 
@@ -551,6 +562,7 @@ void MainWindow::connectSignals()
     QObject::connect(btn_stop_, &QPushButton::clicked, this, &MainWindow::stopPlayback);
     QObject::connect(btn_prev_, &QPushButton::clicked, this, &MainWindow::prevFile);
     QObject::connect(btn_next_, &QPushButton::clicked, this, &MainWindow::nextFile);
+    QObject::connect(btn_live_, &QPushButton::clicked, this, &MainWindow::returnToLive);
     QObject::connect(btn_mute_, &QPushButton::clicked, this, &MainWindow::toggleMute);
 
     // 进度条
@@ -758,8 +770,18 @@ void MainWindow::togglePlayPause()
     if (isClosing()) return;
     const auto snapshot = player_->getPlaybackSnapshot();
     if (snapshot.request_id != playback_request_id_ || !canTogglePlayback(snapshot)) return;
-    if (snapshot.is_playing || snapshot.is_paused) {
-        player_->togglePlayPause();
+    if (snapshot.source_kind == PlaybackSourceKind::NetworkLive && canOpenSelectedSource(snapshot.state)) {
+        returnToLive();
+        return;
+    }
+    if (snapshot.source_kind == PlaybackSourceKind::NetworkLive || snapshot.is_playing || snapshot.is_paused) {
+        // 控制器保存当前源；不根据用户单击选中的另一行决定继续目标。
+        const auto request = player_->togglePlayPause();
+        if (request == 0) return;
+        playback_request_id_ = request;
+        if (snapshot.source_kind == PlaybackSourceKind::NetworkLive) library_request_id_ = 0;
+        if (current_playlist_index_ >= 0) list_playlist_->setCurrentRow(current_playlist_index_);
+        updatePlaybackInfo();
     } else if (canOpenSelectedSource(snapshot.state)) {
         if (playlist_.empty()) {
             openFile();
@@ -767,6 +789,22 @@ void MainWindow::togglePlayPause()
             openPlaylistEntry(std::max(0, current_playlist_index_));
         }
     }
+}
+
+// 用户主动恢复保留当前直播设置。重复点击由控制器撤销前一次连接，最新命令优先。
+void MainWindow::returnToLive()
+{
+    if (isClosing()) return;
+    const auto snapshot = player_->getPlaybackSnapshot();
+    if (snapshot.request_id != playback_request_id_ || snapshot.source_kind != PlaybackSourceKind::NetworkLive ||
+        !snapshot.capabilities.can_return_to_live || snapshot.state == PlaybackState::Idle ||
+        snapshot.state == PlaybackState::Stopping) return;
+    const auto request = player_->returnToLive();
+    if (request == 0) return;
+    playback_request_id_ = request;
+    library_request_id_ = 0;
+    if (current_playlist_index_ >= 0) list_playlist_->setCurrentRow(current_playlist_index_);
+    updatePlaybackInfo();
 }
 
 // 取消尚未登记的库记录，画面与会话收尾由控制器管理。
@@ -992,8 +1030,9 @@ void MainWindow::removeFromPlaylist()
     playlist_.erase(playlist_.begin() + row);
     if (row < current_playlist_index_) {
         --current_playlist_index_;
-    } else if (row == current_playlist_index_ && row >= static_cast<int>(playlist_.size())) {
-        current_playlist_index_ = playlist_.empty() ? -1 : 0;
+    } else if (row == current_playlist_index_) {
+        // 已移除的活动项仍可由控制器暂停/继续，不把下一行误当成它。
+        current_playlist_index_ = -1;
     }
 }
 
@@ -1022,11 +1061,20 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
     QString info_text;
     if (live) {
         info_text += QString("<h3>%1</h3><p>类型: 直播</p>").arg(playbackDisplayLabel(snapshot).toHtmlEscaped());
+        if (snapshot.state == PlaybackState::Paused) {
+            info_text += snapshot.is_session_active ? "<p>正在暂停，停止输出并断开连接中。</p>"
+                : "<p>已断开直播。继续时重新接入最新内容。</p>";
+        }
         const auto stats = snapshot.network_stats.value_or(NetworkPlaybackStats{});
         // 视频就绪以有效帧提交为准；频谱可隐藏画面，因此绘制有独立时刻。
         if (info.has_audio || info.has_video) {
-            const auto audio_status = !info.has_audio ? "无轨道" : stats.first_pcm_seconds ? "已提交 PCM" : "待输出";
-            const auto video_status = !info.has_video ? "无轨道" : stats.first_video_submit_seconds ? "已提交视频帧" : "待输出";
+            // 暂停时首次事件仅是历史，轨道状态以会话是否已收尾为准。
+            const char* paused_output = snapshot.state == PlaybackState::Paused
+                ? (snapshot.is_session_active ? "停止输出中" : "已停止输出") : nullptr;
+            const auto audio_status = !info.has_audio ? "无轨道" : paused_output ? paused_output
+                : stats.first_pcm_seconds ? "已提交 PCM" : "待输出";
+            const auto video_status = !info.has_video ? "无轨道" : paused_output ? paused_output
+                : stats.first_video_submit_seconds ? "已提交视频帧" : "待输出";
             info_text += QString("<p>音频: %1<br>视频: %2</p>").arg(audio_status, video_status);
         }
         info_text += QString("<p><b>首次事件（从打开请求计时）</b><br>收包: %1 · PCM: %2<br>视频提交: %3 · 绘制: %4"
@@ -1067,9 +1115,15 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
 void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
 {
     const bool live = snapshot.source_kind == PlaybackSourceKind::NetworkLive;
-    btn_play_->setText(snapshot.is_playing && !snapshot.is_paused ? "⏸" : "▶");
+    const bool live_can_pause = live && snapshot.state != PlaybackState::Paused &&
+        !canOpenSelectedSource(snapshot.state) && snapshot.state != PlaybackState::Stopping;
+    btn_play_->setText(live_can_pause || (snapshot.is_playing && !snapshot.is_paused) ? "⏸" : "▶");
     btn_play_->setEnabled(canTogglePlayback(snapshot));
-    btn_play_->setToolTip(live && !canTogglePlayback(snapshot) ? "直播暂不支持暂停，请使用停止。" : "播放/暂停 (Space)");
+    btn_play_->setToolTip(!live ? "播放/暂停 (Space)" : live_can_pause ? "暂停直播并断开连接 (Space)"
+        : snapshot.state == PlaybackState::Paused ? "继续直播，重新接入最新内容 (Space)" : "重新连接当前直播 (Space)");
+    action_live_->setVisible(live);
+    action_live_->setEnabled(live && snapshot.capabilities.can_return_to_live &&
+        snapshot.state != PlaybackState::Idle && snapshot.state != PlaybackState::Stopping);
     const bool seekable = canSeek(snapshot);
     slider_progress_->setEnabled(seekable);
     slider_progress_->setToolTip(live ? "直播不可定位" : "点击或拖动跳转播放位置");
@@ -1083,7 +1137,8 @@ void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
     }
 
     // 状态变化时才写状态栏，保留音量、倍速或特效操作出现时的提示。
-    if (snapshot.request_id != displayed_request_id_ || snapshot.state != displayed_state_) {
+    if (snapshot.request_id != displayed_request_id_ || snapshot.state != displayed_state_ ||
+        (live && snapshot.state == PlaybackState::Paused && snapshot.is_session_active != displayed_session_active_)) {
         const QString name = playbackDisplayLabel(snapshot);
         QString status;
         switch (snapshot.state) {
@@ -1092,7 +1147,10 @@ void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
             case PlaybackState::Buffering: status = (live ? "正在缓冲，等待轨道输出: " : "正在缓冲: ") + name; break;
             case PlaybackState::Playing: status = "正在播放: " + name; break;
             case PlaybackState::Draining: status = "正在播放: " + name; break;
-            case PlaybackState::Paused: status = "已暂停"; break;
+            case PlaybackState::Paused:
+                status = !live ? "已暂停" : snapshot.is_session_active
+                    ? "正在暂停，断开连接中: " + name : "已暂停（已断开直播）: " + name;
+                break;
             case PlaybackState::Reconnecting: status = "正在重新连接: " + name; break;
             case PlaybackState::Stopping: status = "正在停止"; break;
             case PlaybackState::Failed: {
@@ -1111,6 +1169,7 @@ void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
         statusBar()->showMessage(status);
         displayed_request_id_ = snapshot.request_id;
         displayed_state_ = snapshot.state;
+        displayed_session_active_ = snapshot.is_session_active;
     }
 
     const auto formatTime = [](double seconds) {
@@ -1240,6 +1299,8 @@ std::uint64_t MainWindow::requestPlayback(const PlaybackSource& source)
     if (request == 0) return 0;
     playback_request_id_ = request;
     library_request_id_ = source.kind() == PlaybackSourceKind::LocalFile ? request : 0;
+    // 直接请求与列表打开共用入口，列表调用方在成功后再绑定活动行。
+    current_playlist_index_ = -1;
     // 立即刷新请求对应的控件，媒体库同步仍由定时器处理。
     const auto snapshot = player_->getPlaybackSnapshot();
     updatePlaybackControls(snapshot);

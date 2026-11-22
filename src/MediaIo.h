@@ -54,6 +54,8 @@ private:
     void armDeadline(std::chrono::milliseconds timeout) noexcept;
     // 收尾时为网络 I/O 设置期限，但不延长已有的期限。
     void limitDeadline(std::chrono::milliseconds timeout) noexcept;
+    // 仅在打开/读取及 worker 已退出后进入，给协议关闭写入一次独立、不可延长的短期限。
+    void beginCloseDeadline(std::chrono::milliseconds timeout) noexcept;
     // 成功后撤销操作期限，避免消费队列中的空闲时间算入下一次读取。
     void clearDeadline() noexcept;
     // 只读取原子标志和时钟；同一操作取消优先于期限。
@@ -64,4 +66,5 @@ private:
     std::atomic<bool> cancelled_{false};
     std::atomic<Clock::duration::rep> deadline_{NoDeadline};
     std::atomic<Clock::duration::rep> initial_output_deadline_{NoDeadline};
+    std::atomic<Clock::duration::rep> close_deadline_{NoDeadline};
 };

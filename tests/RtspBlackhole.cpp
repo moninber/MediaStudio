@@ -172,9 +172,11 @@ public:
     // 先绑定再启动线程；若初始化失败，由成员析构关闭监听 socket。
     Impl(StallAt stall, const std::string& bind_address, SetupTransport transport,
          std::optional<StartupMedia> startup = {}, KeyVideo key_video = KeyVideo::Immediate,
-         std::uint32_t video_offset_seconds = 0)
+         std::uint32_t video_offset_seconds = 0, unsigned int max_sessions = 1,
+         std::vector<StallAt> stages = {})
         : listener_(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)), stall_(stall), bind_address_(bind_address),
-          expected_transport_(transport), startup_(startup), key_video_(key_video), video_offset_seconds_(video_offset_seconds)
+          expected_transport_(transport), startup_(startup), key_video_(key_video), video_offset_seconds_(video_offset_seconds),
+          stages_(std::move(stages)), max_sessions_(stages_.empty() ? max_sessions : stages_.size())
     {
         if (listener_.handle == INVALID_SOCKET) socketError("socket");
         sockaddr_in address{};
@@ -197,12 +199,20 @@ public:
         url_ = "rtsp://" + bind_address_ + ":" + std::to_string(ntohs(address.sin_port)) + "/blackhole";
         listener_address_ = address;
         worker_ = std::thread([this] {
-            try {
-                serve();
-            } catch (const std::exception& error) {
-                std::cerr << "RTSP fixture: " << error.what() << '\n';
+            for (unsigned int session = 0; session < max_sessions_ && !stopping_; ++session) {
+                if (!stages_.empty()) stall_ = stages_[session];
+                tracks_ = {};
+                key_released_.store(false);
+                hard_deadline_ = Clock::now() + 14s;
+                const auto before = accepted_.load();
+                try {
+                    serve();
+                } catch (const std::exception& error) {
+                    std::cerr << "RTSP fixture: " << error.what() << '\n';
+                }
+                holding_.store(false);
+                if (accepted_ > before) ++closed_;
             }
-            holding_.store(false);
         });
     }
 
@@ -217,6 +227,11 @@ public:
     bool isHoldingConnection() const noexcept { return holding_.load(); }
     SetupTransport setupTransport() const noexcept { return setup_transport_.load(); }
     void releaseKeyVideo() noexcept { key_released_.store(true); }
+    unsigned int acceptedConnections() const noexcept { return accepted_.load(); }
+    unsigned int closedConnections() const noexcept { return closed_.load(); }
+    unsigned int playRequests() const noexcept { return play_requests_.load(); }
+    unsigned int teardownRequests() const noexcept { return teardown_requests_.load(); }
+    unsigned int activeRemoteSessions() const noexcept { return remote_sessions_.load(); }
 
 private:
     // 夹具自身的期限是故障保护；正常测试在此之前由 FFmpeg 返回。
@@ -354,6 +369,7 @@ private:
         int peer_length = sizeof(peer_address);
         const Socket peer(accept(listener_.handle, reinterpret_cast<sockaddr*>(&peer_address), &peer_length));
         if (peer.handle == INVALID_SOCKET) socketError("accept");
+        ++accepted_;
         setNonBlocking(peer.handle);
         const bool probing = stall_ == StallAt::ProbeStreams;
         const bool video = probing || stall_ == StallAt::VideoReadPacket ||
@@ -423,11 +439,17 @@ private:
                 }
                 reply += "Session: 1234abcd;timeout=60\r\n\r\n";
             } else if (method == "PLAY") {
+                ++play_requests_;
+                ++remote_sessions_;
                 reply += "Session: 1234abcd\r\nRTP-Info: url=" + url_ +
                          "/trackID=0;seq=1;rtptime=" + (video ? "3600" : "160");
                 if (video && audio) reply += ",url=" + url_ + "/trackID=1;seq=1;rtptime=160";
                 reply += "\r\n\r\n";
             } else if (method == "TEARDOWN" || method == "GET_PARAMETER") {
+                if (method == "TEARDOWN") {
+                    ++teardown_requests_;
+                    if (remote_sessions_ > 0) --remote_sessions_;
+                }
                 reply += "Session: 1234abcd\r\n\r\n";
             } else {
                 throw std::runtime_error("unexpected RTSP method: " + method);
@@ -456,12 +478,14 @@ private:
 
     Winsock winsock_;
     Socket listener_;
-    const StallAt stall_;
+    StallAt stall_;
     const std::string bind_address_;
     const SetupTransport expected_transport_;
     const std::optional<StartupMedia> startup_;
     const KeyVideo key_video_;
     const std::uint32_t video_offset_seconds_;
+    const std::vector<StallAt> stages_;
+    const unsigned int max_sessions_;
     std::atomic<bool> key_released_{false};
     sockaddr_in listener_address_{};
     std::array<Track, 2> tracks_;
@@ -469,7 +493,12 @@ private:
     std::atomic<bool> stopping_{false};
     std::atomic<bool> holding_{false};
     std::atomic<SetupTransport> setup_transport_{SetupTransport::None};
-    const Clock::time_point hard_deadline_ = Clock::now() + 14s;
+    std::atomic<unsigned int> accepted_{0};
+    std::atomic<unsigned int> closed_{0};
+    std::atomic<unsigned int> play_requests_{0};
+    std::atomic<unsigned int> teardown_requests_{0};
+    std::atomic<unsigned int> remote_sessions_{0};
+    Clock::time_point hard_deadline_ = Clock::now() + 14s;
     std::thread worker_;
 };
 
@@ -477,10 +506,18 @@ private:
 RtspBlackhole::RtspBlackhole(StallAt stall, const std::string& bind_address, SetupTransport transport)
     : impl_(std::make_unique<Impl>(stall, bind_address, transport)) {}
 RtspBlackhole::RtspBlackhole(StartupMedia media, const std::string& bind_address, SetupTransport transport,
-                           KeyVideo key_video, std::uint32_t video_offset_seconds)
-    : impl_(std::make_unique<Impl>(StallAt::ReadPacket, bind_address, transport, media, key_video, video_offset_seconds)) {}
+                           KeyVideo key_video, std::uint32_t video_offset_seconds, unsigned int max_sessions)
+    : impl_(std::make_unique<Impl>(StallAt::ReadPacket, bind_address, transport, media, key_video, video_offset_seconds, max_sessions)) {}
+RtspBlackhole::RtspBlackhole(std::vector<StallAt> stages, const std::string& bind_address, SetupTransport transport)
+    : impl_(std::make_unique<Impl>(StallAt::ReadPacket, bind_address, transport, std::nullopt,
+                                 KeyVideo::Immediate, 0, 1, std::move(stages))) {}
 RtspBlackhole::~RtspBlackhole() = default;
 std::string RtspBlackhole::url() const { return impl_->url(); }
 bool RtspBlackhole::isHoldingConnection() const noexcept { return impl_->isHoldingConnection(); }
 RtspBlackhole::SetupTransport RtspBlackhole::setupTransport() const noexcept { return impl_->setupTransport(); }
 void RtspBlackhole::releaseKeyVideo() noexcept { impl_->releaseKeyVideo(); }
+unsigned int RtspBlackhole::acceptedConnections() const noexcept { return impl_->acceptedConnections(); }
+unsigned int RtspBlackhole::closedConnections() const noexcept { return impl_->closedConnections(); }
+unsigned int RtspBlackhole::playRequests() const noexcept { return impl_->playRequests(); }
+unsigned int RtspBlackhole::teardownRequests() const noexcept { return impl_->teardownRequests(); }
+unsigned int RtspBlackhole::activeRemoteSessions() const noexcept { return impl_->activeRemoteSessions(); }

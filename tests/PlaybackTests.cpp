@@ -392,6 +392,9 @@ void testRtspBlackhole(bool cancel)
                     "blocked read did not report a deadline");
             require(elapsed >= timeout - 100ms && elapsed <= timeout + 2s, "blocked read missed its deadline");
         }
+        // 有界 TEARDOWN 只允许关闭写入，不能清除上层共享的粘性取消状态。
+        decoder.close();
+        require(control->isCancelled() == cancel, "decoder close reset or invented the caller's cancellation state");
         return;
     }
     throw std::runtime_error("no blocked RTSP read after draining fixture packets");

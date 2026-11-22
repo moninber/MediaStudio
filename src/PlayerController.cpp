@@ -65,6 +65,12 @@ void PlayerController::cancelCurrentLocked()
 std::uint64_t PlayerController::requestOpen(const PlaybackSource& source)
 {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    return requestOpenLocked(source, false);
+}
+
+// 调用者已经持有命令锁。按值接收源，避免继续操作时引用被自身的状态替换失效。
+std::uint64_t PlayerController::requestOpenLocked(PlaybackSource source, bool retain_frame)
+{
     if (shutting_down_) return 0;
     auto io = std::make_shared<MediaIoControl>();
 
@@ -86,11 +92,12 @@ std::uint64_t PlayerController::requestOpen(const PlaybackSource& source)
     snapshot_.capabilities = initialPlaybackCapabilities(source.kind(), false);
     if (source.kind() == PlaybackSourceKind::NetworkLive) snapshot_.network_stats.emplace();
     resume_state_ = PlaybackState::Playing;
-    if (video_widget_) video_widget_->setPlaybackEpoch(epoch, false);
+    if (video_widget_) video_widget_->setPlaybackEpoch(epoch, retain_frame);
 
     // 先发布可取消对象，再唤醒 supervisor。打开尚未开始时也能取消这条命令。
     active_io_ = io;
-    pending_open_ = OpenRequest{source, epoch, std::move(io)};
+    current_source_ = source;
+    pending_open_ = OpenRequest{std::move(source), epoch, std::move(io)};
     command_changed_.notify_one();
     return epoch.request_id;
 }
@@ -101,6 +108,7 @@ std::uint64_t PlayerController::stopAsync()
     if (shutting_down_) return 0;
     const auto request_id = snapshot_.request_id;
     cancelCurrentLocked();
+    current_source_.reset();
     audio_packets_.abort();
     video_packets_.abort();
     resetSnapshotLocked(request_id, supervisor_busy_ ? PlaybackState::Stopping : PlaybackState::Idle);
@@ -114,6 +122,7 @@ void PlayerController::requestShutdown()
     if (shutting_down_) return;
     shutting_down_ = true;
     cancelCurrentLocked();
+    current_source_.reset();
     resetSnapshotLocked(snapshot_.request_id, supervisor_busy_ ? PlaybackState::Stopping : PlaybackState::Idle);
     if (video_widget_) video_widget_->setPlaybackEpoch({}, false);
     // FFmpeg 回调轮询取消标志，退出后由 supervisor 中止队列、释放包并回收 worker。
@@ -131,9 +140,43 @@ void PlayerController::shutdown()
     if (supervisor_.joinable()) supervisor_.join();
 }
 
-void PlayerController::setPausedLocked(bool paused)
+std::uint64_t PlayerController::setPausedLocked(bool paused)
 {
-    if (shutting_down_ || !playing_ || paused_ == paused || snapshot_.source_kind != PlaybackSourceKind::LocalFile) return;
+    if (shutting_down_) return 0;
+    if (current_source_ && current_source_->kind() == PlaybackSourceKind::NetworkLive) {
+        if (!paused) {
+            // 不回调公开 requestOpen，避免重复取得 snapshot_mutex_。
+            if (snapshot_.state == PlaybackState::Paused) return requestOpenLocked(*current_source_, true);
+            return snapshot_.state == PlaybackState::Opening || snapshot_.state == PlaybackState::Buffering ||
+                snapshot_.state == PlaybackState::Playing || snapshot_.state == PlaybackState::Reconnecting
+                ? snapshot_.request_id : 0;
+        }
+        if (snapshot_.state == PlaybackState::Paused) return snapshot_.request_id;
+        if (snapshot_.state != PlaybackState::Opening && snapshot_.state != PlaybackState::Buffering &&
+            snapshot_.state != PlaybackState::Playing && snapshot_.state != PlaybackState::Reconnecting) return 0;
+
+        // 先冻结可展示进度，再取消旧输入与输出。旧 worker 的发布检查也会立即失效。
+        if (live_output_started_at_) {
+            snapshot_.live_elapsed_seconds =
+                std::chrono::duration<double>(Clock::now() - *live_output_started_at_).count();
+            live_output_started_at_.reset();
+        }
+        cancelCurrentLocked();
+        active_io_.reset();
+        audio_packets_.abort();
+        video_packets_.abort();
+        snapshot_.state = PlaybackState::Paused;
+        snapshot_.connection_attempt_id = 0;
+        snapshot_.generation = 0;
+        snapshot_.has_current_video_output = false;
+        snapshot_.stats = {};
+        snapshot_.last_error.reset();
+        paused_ = true;
+        if (video_widget_) video_widget_->setPlaybackEpoch({}, true);
+        return snapshot_.request_id;
+    }
+    if (!playing_ || snapshot_.source_kind != PlaybackSourceKind::LocalFile) return 0;
+    if (paused_ == paused) return snapshot_.request_id;
     if (paused) {
         resume_state_ = snapshot_.state;
         snapshot_.state = PlaybackState::Paused;
@@ -142,24 +185,32 @@ void PlayerController::setPausedLocked(bool paused)
         snapshot_.state = resume_state_;
     }
     paused_ = paused;
+    return snapshot_.request_id;
 }
 
-void PlayerController::play()
+std::uint64_t PlayerController::play()
 {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
-    setPausedLocked(false);
+    return setPausedLocked(false);
 }
 
-void PlayerController::pause()
+std::uint64_t PlayerController::pause()
 {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
-    setPausedLocked(true);
+    return setPausedLocked(true);
 }
 
-void PlayerController::togglePlayPause()
+std::uint64_t PlayerController::togglePlayPause()
 {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
-    setPausedLocked(!paused_.load());
+    return setPausedLocked(!paused_.load());
+}
+
+std::uint64_t PlayerController::returnToLive()
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (shutting_down_ || !current_source_ || current_source_->kind() != PlaybackSourceKind::NetworkLive) return 0;
+    return requestOpenLocked(*current_source_, true);
 }
 
 void PlayerController::seek(double seconds)
@@ -204,6 +255,7 @@ PlaybackSnapshot PlayerController::getPlaybackSnapshot() const
     PlaybackSnapshot snapshot = snapshot_;
     snapshot.is_playing = playing_.load();
     snapshot.is_paused = paused_.load();
+    snapshot.is_session_active = supervisor_busy_;
     snapshot.current_seconds = current_time_.load();
     snapshot.duration_seconds = duration_.load();
     if (live_output_started_at_) {
