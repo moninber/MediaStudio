@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "PlayerController.h"
+#include "LiveRecovery.h"
 #include "RtspBlackhole.h"
 #include "VideoWidget.h"
 
@@ -843,6 +844,8 @@ void testLiveFailures(bool udp)
             !refused.is_playing && !refused.has_current_video_output &&
             open_error->ffmpegError == AVERROR_HTTP_FORBIDDEN && refusing.acceptedConnections() == 1,
             "RTSP 403 rejection was reported as playback or lost its raw open error");
+    require(classifyLiveFailure(refused.source_kind, *refused.last_error).disposition == LiveFailureDisposition::Fatal,
+            "recovery policy would retry actual server access denial");
 
     // 空闲回环端口在不同系统可立刻拒绝或等 SYN 超时；两者都应发布有界的打开失败。
     Fixture absent(Fixture::StallAt::UnavailableEndpoint, testRtspAddress());
@@ -858,6 +861,8 @@ void testLiveFailures(bool udp)
             (absent_error->status == MediaOpenStatus::Error || absent_error->status == MediaOpenStatus::Timeout) &&
             !unavailable.is_playing && !unavailable.has_current_video_output && absent.acceptedConnections() == 0,
             "unreachable endpoint lost its open error or was confused with usable playback");
+    require(classifyLiveFailure(unavailable.source_kind, *unavailable.last_error).disposition == LiveFailureDisposition::Retryable,
+            "recovery policy rejected actual transient connection failure");
 
     Fixture silent({Fixture::StallAt::VideoReadPacket, Fixture::StallAt::VideoReadPacket}, testRtspAddress(),
         udp ? Fixture::SetupTransport::Udp : Fixture::SetupTransport::Tcp);
@@ -890,6 +895,8 @@ void testLiveFailures(bool udp)
             failed.connection_attempt_id == 0 && failed.generation == 0 &&
             failed.stats.audio_buffer_seconds == 0.0 && silent.closedConnections() == 1 && silent.activeRemoteSessions() == 0,
             "read timeout did not retire live output and release its remote session");
+    require(classifyLiveFailure(failed.source_kind, *failed.last_error).disposition == LiveFailureDisposition::Retryable,
+            "recovery policy discarded actual typed read timeout at the raw error boundary");
     requireStaleOutputRejected(widget, previous, snapshotEpoch(failed));
     remainsInQt([&] {
         const auto now = player.getPlaybackSnapshot();

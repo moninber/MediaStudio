@@ -31,6 +31,7 @@ find_package(OpenGL REQUIRED)
 set(MEDIASTUDIO_PLAYBACK_SOURCES
     src/PlaybackSource.cpp
     src/MediaIo.cpp
+    src/LiveRecovery.cpp
     src/MediaDecoder.cpp
 )
 
@@ -55,6 +56,7 @@ set(MEDIASTUDIO_HEADERS
     src/PlaybackSource.h
     src/PlaybackSnapshot.h
     src/MediaIo.h
+    src/LiveRecovery.h
     src/MediaInfo.h
     src/MediaDecoder.h
     src/AudioOutput.h
@@ -190,6 +192,27 @@ if(BUILD_TESTING)
     endforeach()
     # CTest 也检查进程输出，覆盖 FFmpeg 的 C 级 stderr 与 Qt 调试日志。
     set_property(TEST MediaStudio.Playback.rtsp-stable PROPERTY FAIL_REGULAR_EXPRESSION "MediaStudioSecret[0-9A-Za-z]+")
+
+    # 恢复策略只依赖单调时间值；不启动窗口、声卡或真实网络，也不等待真实的 45 秒。
+    add_executable(MediaStudioRecoveryTests tests/RecoveryTests.cpp src/LiveRecovery.cpp)
+    set_target_properties(MediaStudioRecoveryTests PROPERTIES
+        AUTOMOC OFF
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests"
+    )
+    target_include_directories(MediaStudioRecoveryTests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${MEDIASTUDIO_FFMPEG_ROOT}/include"
+    )
+    target_link_libraries(MediaStudioRecoveryTests PRIVATE Threads::Threads)
+    foreach(test_case IN ITEMS classification schedule deadline health cancellation)
+        set(test_name MediaStudio.Recovery.${test_case})
+        add_test(NAME ${test_name} COMMAND MediaStudioRecoveryTests ${test_case})
+        set_tests_properties(${test_name} PROPERTIES TIMEOUT 10)
+        if(WIN32)
+            set_property(TEST ${test_name} PROPERTY ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:${mediastudio_compiler_bin}")
+        endif()
+    endforeach()
 
     # 会话和关窗用例链接实际主窗口、控制器及显示控件，离屏执行，无需数据库或音频设备。
     add_executable(MediaStudioSessionTests
