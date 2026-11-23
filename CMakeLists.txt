@@ -179,7 +179,7 @@ if(BUILD_TESTING)
 
     # 测试可直接从构建目录运行，不依赖播放器部署步骤或已配置的全局 PATH。
     get_filename_component(mediastudio_compiler_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
-    foreach(test_case IN ITEMS contracts local-file rtsp-cancel rtsp-timeout rtsp-stable)
+    foreach(test_case IN ITEMS contracts local-file rtsp-cancel rtsp-timeout rtsp-stable rtsp-recovery-deadline)
         add_test(NAME MediaStudio.Playback.${test_case} COMMAND MediaStudioPlaybackTests ${test_case})
         set_tests_properties(MediaStudio.Playback.${test_case} PROPERTIES TIMEOUT 18)
         if(WIN32)
@@ -194,7 +194,7 @@ if(BUILD_TESTING)
     set_property(TEST MediaStudio.Playback.rtsp-stable PROPERTY FAIL_REGULAR_EXPRESSION "MediaStudioSecret[0-9A-Za-z]+")
 
     # 恢复策略只依赖单调时间值；不启动窗口、声卡或真实网络，也不等待真实的 45 秒。
-    add_executable(MediaStudioRecoveryTests tests/RecoveryTests.cpp src/LiveRecovery.cpp)
+    add_executable(MediaStudioRecoveryTests tests/RecoveryTests.cpp src/LiveRecovery.cpp src/MediaIo.cpp)
     set_target_properties(MediaStudioRecoveryTests PROPERTIES
         AUTOMOC OFF
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests"
@@ -204,7 +204,7 @@ if(BUILD_TESTING)
         "${MEDIASTUDIO_FFMPEG_ROOT}/include"
     )
     target_link_libraries(MediaStudioRecoveryTests PRIVATE Threads::Threads)
-    foreach(test_case IN ITEMS classification schedule deadline health cancellation)
+    foreach(test_case IN ITEMS classification schedule deadline health cancellation watchdogs)
         set(test_name MediaStudio.Recovery.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioRecoveryTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES TIMEOUT 10)
@@ -251,7 +251,10 @@ if(BUILD_TESTING)
                           live-start-no-key live-start-av-offset-tcp live-pause-open live-pause-probe live-pause-read
                           live-pause-av-tcp live-pause-av-udp live-command-races window-live-controls
                           live-cycle-video-tcp live-cycle-video-udp live-cycle-audio-tcp live-cycle-audio-udp
-                          mixed-switch-tcp mixed-switch-udp live-failures-tcp live-failures-udp)
+                          mixed-switch-tcp mixed-switch-udp live-failures-tcp live-failures-udp
+                          live-recover-av-tcp live-recover-av-udp live-recover-video-tcp live-recover-video-udp
+                          live-recover-audio-tcp live-recover-audio-udp live-recovery-budget live-recovery-cancel
+                          live-stall-audio live-stall-video live-recovery-metadata window-auto-recovery)
         set(test_name MediaStudio.Session.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES
@@ -261,12 +264,17 @@ if(BUILD_TESTING)
         )
         # 无默认音频端点的机器不能真实提交 PCM；其他错误保持测试失败。
         if(test_case MATCHES "^live-start-(av|audio)-" OR test_case MATCHES "^live-pause-av-" OR
-           test_case MATCHES "^live-cycle-audio-" OR test_case MATCHES "^mixed-switch-")
+           test_case MATCHES "^live-cycle-audio-" OR test_case MATCHES "^mixed-switch-" OR
+           test_case MATCHES "^live-recover-(av|audio)-" OR test_case MATCHES "^live-stall-" OR
+           test_case STREQUAL "live-recovery-metadata")
             set_property(TEST ${test_name} PROPERTY SKIP_RETURN_CODE 77)
         endif()
         # 连续切换须逐个等待真实 PCM/视频输出，慢速测试机仍有有界的失败期限。
         if(test_case MATCHES "^mixed-switch-")
             set_property(TEST ${test_name} PROPERTY TIMEOUT 45)
+        endif()
+        if(test_case MATCHES "^live-recover" OR test_case MATCHES "^live-stall-")
+            set_property(TEST ${test_name} PROPERTY TIMEOUT 35)
         endif()
         if(TARGET Qt6::QOffscreenIntegrationPlugin)
             set_property(TEST ${test_name} APPEND PROPERTY ENVIRONMENT

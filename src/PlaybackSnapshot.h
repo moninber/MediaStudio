@@ -7,6 +7,7 @@
 
 #include "MediaInfo.h"
 #include "MediaIo.h"
+#include "LiveRecovery.h"
 #include "PlaybackSource.h"
 
 // 界面可观察到的播放状态；后续接入网络时继续使用同一组状态。
@@ -39,16 +40,22 @@ struct NetworkPlaybackStats {
     std::optional<double> application_bitrate_bps;
     std::optional<double> last_packet_age_seconds;
     std::uint64_t reconnect_attempts = 0;
-    // 各阶段仅记首次，时间从本次播放请求提交起算。
+    unsigned int recovery_retries_used = 0;
+    bool auto_reconnect_enabled = false;
+    std::optional<LiveFailureReason> last_failure_reason;
+    std::optional<RecoveryStopReason> recovery_stop_reason;
+    std::optional<double> retry_in_seconds;
+    double attempt_started_seconds = 0.0; // 当前连接相对用户请求的起点。
+    std::optional<double> input_ready_seconds;
+    std::optional<double> last_audio_output_age_seconds;
+    std::optional<double> last_video_output_age_seconds;
+    // 各阶段仅记首次，从当前连接尝试开始计时，自动重建时重置。
     std::optional<double> first_packet_seconds;
     std::optional<double> first_pcm_seconds;
     std::optional<double> first_video_submit_seconds;
     std::optional<double> first_video_draw_seconds;
     std::uint64_t corrupt_frames_skipped = 0;  // 与音画同步丢帧分开统计。
 };
-
-// 保留打开阶段或读包结果的错误分类与原始 FFmpeg 错误码，不包含连接地址。
-using PlaybackError = std::variant<MediaOpenResult, MediaReadResult>;
 
 // 供界面按值获取的播放快照：仅包含可显示信息，不持有解码器、队列或原始网络地址。
 struct PlaybackSnapshot {

@@ -7,7 +7,8 @@
 #include <mutex>
 #include <optional>
 
-#include "PlaybackSnapshot.h"
+#include "MediaIo.h"
+#include "PlaybackSource.h"
 
 // 业务层判定是否值得重试，原始 FFmpeg 错误码仍单独保存，不解析可能含地址的错误文本。
 enum class LiveFailureDisposition { None, Cancelled, Fatal, Retryable };

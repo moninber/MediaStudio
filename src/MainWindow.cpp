@@ -27,6 +27,7 @@
 #include <QToolBar>
 #include <QStatusBar>
 #include <QAction>
+#include <QCheckBox>
 #include <QShortcut>
 #include <QScrollBar>
 #include <QScopedValueRollback>
@@ -85,11 +86,43 @@ QString playbackDisplayLabel(const PlaybackSnapshot& snapshot)
     return QString::fromStdString(snapshot.display_name);
 }
 
-// 这些时刻相对打开请求；未采到的事件保留空值，不用 0 冒充已发生。
+// 这些时刻相对当前连接；未采到的事件保留空值，不用 0 冒充已发生。
 QString formatMilestone(const std::optional<double>& seconds)
 {
     return seconds && std::isfinite(*seconds) && *seconds >= 0.0
         ? QString("%1 ms").arg(*seconds * 1000.0, 0, 'f', 0) : QString("—");
+}
+
+// 提示只使用固定错误分类，不拼接远端文本或原始网络地址。
+QString recoveryFailureLabel(const PlaybackSnapshot& snapshot)
+{
+    if (snapshot.last_error) {
+        if (const auto* read = std::get_if<MediaReadResult>(&*snapshot.last_error)) {
+            if (read->stage == MediaReadStage::AudioOutput) return "音频输出超时";
+            if (read->stage == MediaReadStage::VideoOutput) return "视频输出超时";
+            if (read->stage == MediaReadStage::InitialOutput) return "等待首次输出失败";
+            if (read->stage == MediaReadStage::RecoveryBudget) return "恢复总时间已用尽";
+            if (read->status == MediaReadStatus::Timeout) return "读取超时";
+            if (read->status == MediaReadStatus::EndOfStream) return "直播结束或连接中断";
+        }
+        if (const auto* open = std::get_if<MediaOpenResult>(&*snapshot.last_error)) {
+            if (open->status == MediaOpenStatus::Timeout) {
+                return open->stage == MediaOpenStage::ProbeStreams ? "媒体探测超时" : "连接超时";
+            }
+        }
+    }
+    if (!snapshot.network_stats || !snapshot.network_stats->last_failure_reason) return "—";
+    switch (*snapshot.network_stats->last_failure_reason) {
+        case LiveFailureReason::AccessDenied: return "访问被拒绝";
+        case LiveFailureReason::InvalidSource: return "地址或参数错误";
+        case LiveFailureReason::UnsupportedInput: return "协议或模式不支持";
+        case LiveFailureReason::DecoderUnavailable: return "解码器不可用";
+        case LiveFailureReason::ResourceExhausted: return "资源不足";
+        case LiveFailureReason::SetupFailed: return "媒体初始化失败";
+        case LiveFailureReason::OutputTimeout: return "媒体输出失活";
+        case LiveFailureReason::LiveEof: return "直播结束或连接中断";
+        default: return "连接失败或中断";
+    }
 }
 
 } // namespace
@@ -728,6 +761,11 @@ void MainWindow::openNetworkMedia()
     transport->addItem("UDP", static_cast<int>(RtspTransport::Udp));
     form->addRow("传输方式：", transport);
     form->addRow("播放模式：", new QLabel("稳定", &dialog));
+    auto* automatic = new QCheckBox("自动重连", &dialog);
+    automatic->setObjectName("autoReconnectOption");
+    automatic->setChecked(true);
+    automatic->setToolTip("断流后最多重试 3 次；暂停、停止和切源会取消恢复。");
+    form->addRow(automatic);
 
     auto* error_label = new QLabel(&dialog);
     error_label->setObjectName("networkUrlError");
@@ -744,7 +782,7 @@ void MainWindow::openNetworkMedia()
     connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
         if (isClosing()) { dialog.reject(); return; }
         const auto selected_transport = static_cast<RtspTransport>(transport->currentData().toInt());
-        auto result = createStableRtspSource(url_input->text().toStdString(), selected_transport);
+        auto result = createStableRtspSource(url_input->text().toStdString(), selected_transport, automatic->isChecked());
         if (!result.source) {
             error_label->setText(result.error == RtspSourceError::UnsupportedProtocol
                 ? "当前版本仅支持 RTSP 直播地址。" : "请输入有效的 RTSP 地址。");
@@ -1066,10 +1104,16 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
                 : "<p>已断开直播。继续时重新接入最新内容。</p>";
         }
         const auto stats = snapshot.network_stats.value_or(NetworkPlaybackStats{});
+        info_text += QString("<p>连接尝试: %1 · 自动重试累计: %2<br>本轮已用: %3/3 · 自动重连: %4</p>")
+            .arg(stats.reconnect_attempts + 1).arg(stats.reconnect_attempts).arg(stats.recovery_retries_used)
+            .arg(stats.auto_reconnect_enabled ? "开" : "关");
+        if (stats.last_failure_reason) info_text += QString("<p>最近故障: %1</p>").arg(recoveryFailureLabel(snapshot));
+        if (snapshot.state == PlaybackState::Reconnecting) info_text += "<p>旧连接及声音已释放，正在等待重试。</p>";
         // 视频就绪以有效帧提交为准；频谱可隐藏画面，因此绘制有独立时刻。
         if (info.has_audio || info.has_video) {
             // 暂停或失败时首次事件仅是历史，轨道状态以会话是否已收尾为准。
-            const char* stopped_output = snapshot.state == PlaybackState::Paused || snapshot.state == PlaybackState::Failed
+            const char* stopped_output = snapshot.state == PlaybackState::Reconnecting ? "已停止输出" :
+                snapshot.state == PlaybackState::Paused || snapshot.state == PlaybackState::Failed
                 ? (snapshot.is_session_active ? "停止输出中" : "已停止输出") : nullptr;
             const auto audio_status = !info.has_audio ? "无轨道" : stopped_output ? stopped_output
                 : stats.first_pcm_seconds ? "已提交 PCM" : "待输出";
@@ -1077,11 +1121,14 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
                 : stats.first_video_submit_seconds ? "已提交视频帧" : "待输出";
             info_text += QString("<p>音频: %1<br>视频: %2</p>").arg(audio_status, video_status);
         }
-        info_text += QString("<p><b>首次事件（从打开请求计时）</b><br>收包: %1 · PCM: %2<br>视频提交: %3 · 绘制: %4"
+        info_text += QString("<p><b>首次事件（从本次连接计时）</b><br>收包: %1 · PCM: %2<br>视频提交: %3 · 绘制: %4"
                              "<br>损坏帧跳过: %5</p>")
             .arg(formatMilestone(stats.first_packet_seconds), formatMilestone(stats.first_pcm_seconds),
                  formatMilestone(stats.first_video_submit_seconds), formatMilestone(stats.first_video_draw_seconds))
             .arg(stats.corrupt_frames_skipped);
+        info_text += QString("<p>探测完成: %1<br>距上次音频输出: %2<br>距上次视频提交: %3</p>")
+            .arg(formatMilestone(stats.input_ready_seconds), formatMilestone(stats.last_audio_output_age_seconds),
+                 formatMilestone(stats.last_video_output_age_seconds));
     } else if (!info.file_name.empty()) {
         info_text += QString("<h3>%1</h3>").arg(QString::fromStdString(info.file_name).toHtmlEscaped());
         info_text += QString("<p>格式: %1</p>").arg(QString::fromStdString(info.format_name).toHtmlEscaped());
@@ -1138,7 +1185,8 @@ void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
 
     // 状态变化时才写状态栏，保留音量、倍速或特效操作出现时的提示。
     if (snapshot.request_id != displayed_request_id_ || snapshot.state != displayed_state_ ||
-        (live && snapshot.state == PlaybackState::Paused && snapshot.is_session_active != displayed_session_active_)) {
+        (live && snapshot.state == PlaybackState::Paused && snapshot.is_session_active != displayed_session_active_) ||
+        (live && snapshot.state == PlaybackState::Reconnecting)) {
         const QString name = playbackDisplayLabel(snapshot);
         QString status;
         switch (snapshot.state) {
@@ -1151,7 +1199,10 @@ void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
                 status = !live ? "已暂停" : snapshot.is_session_active
                     ? "正在暂停，断开连接中: " + name : "已暂停（已断开直播）: " + name;
                 break;
-            case PlaybackState::Reconnecting: status = "正在重新连接: " + name; break;
+            case PlaybackState::Reconnecting:
+                status = QString("正在重新连接: %1（约 %2 秒后重试）").arg(name)
+                    .arg(snapshot.network_stats ? snapshot.network_stats->retry_in_seconds.value_or(0.0) : 0.0, 0, 'f', 1);
+                break;
             case PlaybackState::Stopping: status = "正在停止"; break;
             case PlaybackState::Failed: {
                 status = "播放失败: " + name;
@@ -1161,6 +1212,13 @@ void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
                         status = (read->status == MediaReadStatus::Timeout
                             ? "播放失败，等待轨道输出超时: " : "播放失败，无法启动轨道输出: ") + name;
                     }
+                    if (read && (read->stage == MediaReadStage::AudioOutput || read->stage == MediaReadStage::VideoOutput)) {
+                        status = QString("播放失败，%1输出超时: ")
+                            .arg(read->stage == MediaReadStage::AudioOutput ? "音频" : "视频") + name;
+                    }
+                    const auto stopped = snapshot.network_stats ? snapshot.network_stats->recovery_stop_reason : std::nullopt;
+                    if (stopped == RecoveryStopReason::AttemptsExhausted) status = "播放失败，重试次数已用尽: " + name;
+                    if (stopped == RecoveryStopReason::DeadlineExceeded) status = "播放失败，恢复总时间已用尽: " + name;
                 }
                 break;
             }

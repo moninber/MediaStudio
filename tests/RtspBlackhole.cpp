@@ -173,10 +173,10 @@ public:
     Impl(StallAt stall, const std::string& bind_address, SetupTransport transport,
          std::optional<StartupMedia> startup = {}, KeyVideo key_video = KeyVideo::Immediate,
          std::uint32_t video_offset_seconds = 0, unsigned int max_sessions = 1,
-         std::vector<StallAt> stages = {})
+         std::vector<StallAt> stages = {}, bool continuous = false)
         : listener_(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)), stall_(stall), bind_address_(bind_address),
           expected_transport_(transport), startup_(startup), key_video_(key_video), video_offset_seconds_(video_offset_seconds),
-          stages_(std::move(stages)), max_sessions_(stages_.empty() ? max_sessions : stages_.size())
+          stages_(std::move(stages)), max_sessions_(stages_.empty() ? max_sessions : stages_.size()), continuous_(continuous)
     {
         if (listener_.handle == INVALID_SOCKET) socketError("socket");
         sockaddr_in address{};
@@ -209,6 +209,7 @@ public:
             for (unsigned int session = 0; session < max_sessions_ && !stopping_; ++session) {
                 if (!stages_.empty()) stall_ = stages_[session];
                 tracks_ = {};
+                disconnect_.store(false);
                 key_released_.store(false);
                 hard_deadline_ = Clock::now() + 14s;
                 const auto before = accepted_.load();
@@ -218,6 +219,9 @@ public:
                     std::cerr << "RTSP fixture: " << error.what() << '\n';
                 }
                 holding_.store(false);
+                // TCP 媒体绑定控制连接，客户端关闭即释放；UDP 则仍要求显式 TEARDOWN。
+                // 连续发送可能先看到 send 失败，再读到关闭前的 TEARDOWN，不能伪造残留 TCP 会话。
+                if ((disconnect_.load() || expected_transport_ == SetupTransport::Tcp) && remote_sessions_ > 0) --remote_sessions_;
                 if (accepted_ > before) ++closed_;
             }
         });
@@ -239,12 +243,16 @@ public:
     unsigned int playRequests() const noexcept { return play_requests_.load(); }
     unsigned int teardownRequests() const noexcept { return teardown_requests_.load(); }
     unsigned int activeRemoteSessions() const noexcept { return remote_sessions_.load(); }
+    void disconnectCurrent() noexcept { disconnect_.store(true); }
+    void setTrackStalled(bool audio, bool stalled) noexcept { (audio ? stall_audio_ : stall_video_).store(stalled); }
+    unsigned int sentAudioPackets() const noexcept { return sent_audio_.load(); }
+    unsigned int sentVideoPackets() const noexcept { return sent_video_.load(); }
 
 private:
     // 夹具自身的期限是故障保护；正常测试在此之前由 FFmpeg 返回。
     bool waitSocket(SOCKET socket, bool read)
     {
-        while (!stopping_.load() && Clock::now() < hard_deadline_) {
+        while (!stopping_.load() && !disconnect_.load() && Clock::now() < hard_deadline_) {
             fd_set sockets;
             FD_ZERO(&sockets);
             FD_SET(socket, &sockets);
@@ -327,6 +335,7 @@ private:
     // RTP-Info 保持零基准，而 RTP 样本远离零：FFmpeg 解复用后的实际媒体时间约 45 分钟。
     bool sendStartup(SOCKET socket, const sockaddr_in& peer, bool video, bool audio)
     {
+        if (continuous_) return sendContinuous(socket, peer, video, audio);
         constexpr std::uint32_t origin_seconds = 2700;
         // 缺少首个 IDR 时探测仍可能读满分析时长；供应超过 5 秒的非关键视频时间线。
         constexpr std::uint16_t gate_at_frame = 150;
@@ -338,7 +347,7 @@ private:
         const auto total = video ? gate_at_frame + 24 : 72;
         for (std::uint16_t seq = 1; seq <= total; ++seq) {
             if (video && seq > gate_at_frame && key_video_ == KeyVideo::NeverSend) {
-                while (!stopping_.load() && Clock::now() < hard_deadline_) {
+                while (!stopping_.load() && !disconnect_.load() && Clock::now() < hard_deadline_) {
                     if (!sendRtp(socket, peer, 0, h264NonIdr(seq++, video_origin))) return false;
                     std::this_thread::sleep_for(40ms);
                 }
@@ -366,6 +375,64 @@ private:
             }
         }
         return true;
+    }
+
+    // 非阻塞收取控制消息，避免 UDP 连续发送时永远不处理 TEARDOWN 或对端关闭。
+    bool pollControl(SOCKET socket, std::string& pending)
+    {
+        char buffer[2048];
+        const int received = recv(socket, buffer, sizeof(buffer), 0);
+        if (received == 0) return false;
+        if (received < 0 && WSAGetLastError() != WSAEWOULDBLOCK) return false;
+        if (received > 0) pending.append(buffer, received);
+        for (;;) {
+            if (!pending.empty() && pending.front() == '$') {
+                if (pending.size() < 4) return true;
+                const auto size = 4u + 256u * static_cast<unsigned char>(pending[2]) + static_cast<unsigned char>(pending[3]);
+                if (pending.size() < size) return true;
+                pending.erase(0, size);
+                continue;
+            }
+            const auto end = pending.find("\r\n\r\n");
+            if (end == std::string::npos) return pending.size() <= 8192;
+            const auto request = pending.substr(0, end + 4);
+            pending.erase(0, end + 4);
+            const auto cseq = request.find("\r\nCSeq:");
+            if (cseq == std::string::npos) return false;
+            const auto cseq_end = request.find("\r\n", cseq + 2);
+            const auto reply = "RTSP/1.0 200 OK" + request.substr(cseq, cseq_end - cseq) + "\r\nSession: 1234abcd\r\n\r\n";
+            if (request.rfind("TEARDOWN ", 0) == 0) {
+                ++teardown_requests_;
+                if (remote_sessions_ > 0) --remote_sessions_;
+                writeAll(socket, reply);
+                return false;
+            }
+            if (!writeAll(socket, reply)) return false;
+        }
+    }
+
+    // 以真实 25fps/8kHz 节奏持续供包，各轨有独立开关，不用全连接静默冒充单轨停滞。
+    bool sendContinuous(SOCKET socket, const sockaddr_in& peer, bool video, bool audio)
+    {
+        std::string pending;
+        auto next = Clock::now();
+        const auto audio_track = video ? 1u : 0u;
+        for (std::uint16_t seq = 1; !stopping_.load() && !disconnect_.load() && Clock::now() < hard_deadline_; ++seq) {
+            if (!pollControl(socket, pending)) return false;
+            if (audio && !stall_audio_.load()) {
+                const auto channel = static_cast<unsigned char>(audio_track * 2);
+                if (!sendRtp(socket, peer, audio_track, pcmuRtp(seq * 2 - 1, 2700 * 8000, channel)) ||
+                    !sendRtp(socket, peer, audio_track, pcmuRtp(seq * 2, 2700 * 8000, channel))) return false;
+                sent_audio_ += 2;
+            }
+            if (video && !stall_video_.load()) {
+                if (!sendRtp(socket, peer, 0, h264Rtp(seq, 2700 * 90000))) return false;
+                ++sent_video_;
+            }
+            next += 40ms;
+            std::this_thread::sleep_until(next);
+        }
+        return false;
     }
 
     // 完成最小 RTSP 握手并提供所选媒体，或收到首条请求后保持 TCP 连接但不回应。
@@ -400,10 +467,11 @@ private:
             if (method == "OPTIONS") {
                 reply += "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n";
             } else if (method == "DESCRIBE") {
-                if (stall_ == StallAt::RejectOpen) {
+                if (stall_ == StallAt::RejectOpen || stall_ == StallAt::NotPublished) {
                     // 模拟错误诊断带回请求目标，验证播放器不会输出其中的查询参数。
                     const auto target = request.substr(9, request.find(' ', 9) - 9);
-                    reply = "RTSP/1.0 403 " + target + request.substr(cseq, cseq_end - cseq) + "\r\n\r\n";
+                    reply = std::string(stall_ == StallAt::RejectOpen ? "RTSP/1.0 403 " : "RTSP/1.0 404 ") +
+                        target + request.substr(cseq, cseq_end - cseq) + "\r\n\r\n";
                     writeAll(peer.handle, reply);
                     return;
                 }
@@ -465,7 +533,12 @@ private:
             if (method == "PLAY") {
                 if (startup_) {
                     holding_.store(true);
-                    if (!sendStartup(peer.handle, peer_address, video, audio)) return;
+                    if (!sendStartup(peer.handle, peer_address, video, audio)) {
+                        // 客户端可在发出 TEARDOWN 后立刻关闭，持续/突发发送会先看到写失败。
+                        // 收取已到达的控制消息再结束连接，否则实际结束消息会漏计。
+                        if (!disconnect_.load() && !stopping_.load()) pollControl(peer.handle, pending);
+                        return;
+                    }
                 } else if (probing) {
                     // PLAY 成功，但探测一直等缺失的解码参数。对端关闭前保留 TCP。
                     holding_.store(true);
@@ -505,6 +578,12 @@ private:
     std::atomic<unsigned int> play_requests_{0};
     std::atomic<unsigned int> teardown_requests_{0};
     std::atomic<unsigned int> remote_sessions_{0};
+    const bool continuous_;
+    std::atomic<bool> disconnect_{false};
+    std::atomic<bool> stall_audio_{false};
+    std::atomic<bool> stall_video_{false};
+    std::atomic<unsigned int> sent_audio_{0};
+    std::atomic<unsigned int> sent_video_{0};
     Clock::time_point hard_deadline_ = Clock::now() + 14s;
     std::thread worker_;
 };
@@ -513,8 +592,9 @@ private:
 RtspBlackhole::RtspBlackhole(StallAt stall, const std::string& bind_address, SetupTransport transport)
     : impl_(std::make_unique<Impl>(stall, bind_address, transport)) {}
 RtspBlackhole::RtspBlackhole(StartupMedia media, const std::string& bind_address, SetupTransport transport,
-                           KeyVideo key_video, std::uint32_t video_offset_seconds, unsigned int max_sessions)
-    : impl_(std::make_unique<Impl>(StallAt::ReadPacket, bind_address, transport, media, key_video, video_offset_seconds, max_sessions)) {}
+                           KeyVideo key_video, std::uint32_t video_offset_seconds, unsigned int max_sessions, bool continuous)
+    : impl_(std::make_unique<Impl>(StallAt::ReadPacket, bind_address, transport, media, key_video, video_offset_seconds,
+                                 max_sessions, std::vector<StallAt>{}, continuous)) {}
 RtspBlackhole::RtspBlackhole(std::vector<StallAt> stages, const std::string& bind_address, SetupTransport transport)
     : impl_(std::make_unique<Impl>(StallAt::ReadPacket, bind_address, transport, std::nullopt,
                                  KeyVideo::Immediate, 0, 1, std::move(stages))) {}
@@ -528,3 +608,7 @@ unsigned int RtspBlackhole::closedConnections() const noexcept { return impl_->c
 unsigned int RtspBlackhole::playRequests() const noexcept { return impl_->playRequests(); }
 unsigned int RtspBlackhole::teardownRequests() const noexcept { return impl_->teardownRequests(); }
 unsigned int RtspBlackhole::activeRemoteSessions() const noexcept { return impl_->activeRemoteSessions(); }
+void RtspBlackhole::disconnectCurrent() noexcept { impl_->disconnectCurrent(); }
+void RtspBlackhole::setTrackStalled(bool audio, bool stalled) noexcept { impl_->setTrackStalled(audio, stalled); }
+unsigned int RtspBlackhole::sentAudioPackets() const noexcept { return impl_->sentAudioPackets(); }
+unsigned int RtspBlackhole::sentVideoPackets() const noexcept { return impl_->sentVideoPackets(); }

@@ -16,6 +16,7 @@ using namespace std::chrono_literals;
 namespace {
 using Clock = std::chrono::steady_clock;
 constexpr auto LiveInitialOutputLimit = 10s;
+constexpr auto LiveOutputLimit = 10s;
 constexpr double LiveInitialAvSkewSeconds = 1.0;
 constexpr double LiveClockJumpSeconds = 10.0;
 }
@@ -47,7 +48,11 @@ void PlayerController::resetSnapshotLocked(std::uint64_t request_id, PlaybackSta
     snapshot_.request_id = request_id;
     snapshot_.state = state;
     request_submitted_at_ = {};
+    connection_started_at_ = {};
     live_output_started_at_.reset();
+    last_audio_output_at_.reset();
+    last_video_output_at_.reset();
+    outputs_ready_at_.reset();
     current_time_ = 0.0;
     duration_ = 0.0;
 }
@@ -55,6 +60,7 @@ void PlayerController::resetSnapshotLocked(std::uint64_t request_id, PlaybackSta
 void PlayerController::cancelCurrentLocked()
 {
     if (active_io_) active_io_->cancel();
+    if (active_recovery_) active_recovery_->cancel();
     pending_open_.reset();
     pending_seek_.reset();
     seek_requested_ = false;
@@ -73,6 +79,7 @@ std::uint64_t PlayerController::requestOpenLocked(PlaybackSource source, bool re
 {
     if (shutting_down_) return 0;
     auto io = std::make_shared<MediaIoControl>();
+    auto recovery_wait = std::make_shared<RecoveryWait>();
 
     const PlaybackEpoch epoch{snapshot_.request_id + 1, 1, 1};
     const auto submitted_at = Clock::now();
@@ -81,6 +88,7 @@ std::uint64_t PlayerController::requestOpenLocked(PlaybackSource source, bool re
     video_packets_.abort();
     resetSnapshotLocked(epoch.request_id, PlaybackState::Opening);
     request_submitted_at_ = submitted_at;
+    connection_started_at_ = submitted_at;
     snapshot_.connection_attempt_id = epoch.connection_attempt_id;
     snapshot_.generation = epoch.generation;
     snapshot_.source_kind = source.kind();
@@ -90,14 +98,18 @@ std::uint64_t PlayerController::requestOpenLocked(PlaybackSource source, bool re
     }
     snapshot_.display_name = source.displayName();
     snapshot_.capabilities = initialPlaybackCapabilities(source.kind(), false);
-    if (source.kind() == PlaybackSourceKind::NetworkLive) snapshot_.network_stats.emplace();
+    if (source.kind() == PlaybackSourceKind::NetworkLive) {
+        snapshot_.network_stats.emplace();
+        snapshot_.network_stats->auto_reconnect_enabled = source.liveOptions()->auto_reconnect;
+    }
     resume_state_ = PlaybackState::Playing;
     if (video_widget_) video_widget_->setPlaybackEpoch(epoch, retain_frame);
 
     // 先发布可取消对象，再唤醒 supervisor。打开尚未开始时也能取消这条命令。
     active_io_ = io;
+    active_recovery_ = recovery_wait;
     current_source_ = source;
-    pending_open_ = OpenRequest{std::move(source), epoch, std::move(io)};
+    pending_open_ = OpenRequest{std::move(source), epoch, std::move(io), std::move(recovery_wait)};
     command_changed_.notify_one();
     return epoch.request_id;
 }
@@ -155,24 +167,20 @@ std::uint64_t PlayerController::setPausedLocked(bool paused)
         if (snapshot_.state != PlaybackState::Opening && snapshot_.state != PlaybackState::Buffering &&
             snapshot_.state != PlaybackState::Playing && snapshot_.state != PlaybackState::Reconnecting) return 0;
 
-        // 先冻结可展示进度，再取消旧输入与输出。旧 worker 的发布检查也会立即失效。
-        if (live_output_started_at_) {
-            snapshot_.live_elapsed_seconds =
-                std::chrono::duration<double>(Clock::now() - *live_output_started_at_).count();
-            live_output_started_at_.reset();
-        }
+        // 请求取消贯穿退避及下一次连接的创建，不只取消此刻可见的 I/O。
         cancelCurrentLocked();
         active_io_.reset();
         audio_packets_.abort();
         video_packets_.abort();
         snapshot_.state = PlaybackState::Paused;
-        snapshot_.connection_attempt_id = 0;
-        snapshot_.generation = 0;
-        snapshot_.has_current_video_output = false;
+        retireLiveOutputLocked(video_widget_);
         snapshot_.stats = {};
         snapshot_.last_error.reset();
+        if (snapshot_.network_stats) {
+            snapshot_.network_stats->retry_in_seconds.reset();
+            snapshot_.network_stats->recovery_stop_reason = RecoveryStopReason::Cancelled;
+        }
         paused_ = true;
-        if (video_widget_) video_widget_->setPlaybackEpoch({}, true);
         return snapshot_.request_id;
     }
     if (!playing_ || snapshot_.source_kind != PlaybackSourceKind::LocalFile) return 0;
@@ -263,11 +271,18 @@ PlaybackSnapshot PlayerController::getPlaybackSnapshot() const
             std::chrono::duration<double>(std::chrono::steady_clock::now() - *live_output_started_at_).count();
     }
     if (snapshot.network_stats && snapshot.network_stats->first_video_submit_seconds && video_widget_) {
-        // 绘制不回调控制器。读取只匹配当前标签，并按相同的请求时钟计时。
+        // 绘制不回调控制器。读取只匹配当前标签，并按当前连接时钟计时。
         if (const auto drawn = video_widget_->firstDrawnAt(currentEpochLocked())) {
             snapshot.network_stats->first_video_draw_seconds =
-                std::chrono::duration<double>(*drawn - request_submitted_at_).count();
+                std::chrono::duration<double>(*drawn - connection_started_at_).count();
         }
+    }
+    if (snapshot.network_stats) {
+        const auto now = Clock::now();
+        if (last_audio_output_at_) snapshot.network_stats->last_audio_output_age_seconds =
+            std::chrono::duration<double>(now - *last_audio_output_at_).count();
+        if (last_video_output_at_) snapshot.network_stats->last_video_output_age_seconds =
+            std::chrono::duration<double>(now - *last_video_output_at_).count();
     }
     snapshot.stats.audio_queue_packets = audio_packets_.size();
     snapshot.stats.video_queue_packets = video_packets_.size();
@@ -294,7 +309,37 @@ bool PlayerController::updateLocalLibraryInfo(std::uint64_t expected_request_id,
     return true;
 }
 
-// 一个受管理线程拥有解复用资源。取消旧连接后，必须先回收它的 worker 才能复用队列。
+// 在命令锁内撤销活动输出。静帧、错误和里程碑可保留，待绘制帧不能跨连接升级。
+void PlayerController::retireLiveOutputLocked(VideoWidget* video)
+{
+    const auto now = Clock::now();
+    if (live_output_started_at_) {
+        snapshot_.live_elapsed_seconds = std::chrono::duration<double>(now - *live_output_started_at_).count();
+        live_output_started_at_.reset();
+    }
+    if (snapshot_.network_stats) {
+        auto& stats = *snapshot_.network_stats;
+        if (last_audio_output_at_) stats.last_audio_output_age_seconds =
+            std::chrono::duration<double>(now - *last_audio_output_at_).count();
+        if (last_video_output_at_) stats.last_video_output_age_seconds =
+            std::chrono::duration<double>(now - *last_video_output_at_).count();
+        if (video && !stats.first_video_draw_seconds) {
+            if (const auto drawn = video->firstDrawnAt(currentEpochLocked())) {
+                stats.first_video_draw_seconds = std::chrono::duration<double>(*drawn - connection_started_at_).count();
+            }
+        }
+    }
+    if (video) video->setPlaybackEpoch({}, true);
+    snapshot_.connection_attempt_id = 0;
+    snapshot_.generation = 0;
+    snapshot_.has_current_video_output = false;
+    last_audio_output_at_.reset();
+    last_video_output_at_.reset();
+    outputs_ready_at_.reset();
+    playing_ = false;
+}
+
+// 一次用户请求内串行执行所有自动连接；旧 worker 与输入完全回收后才能开始下一次。
 void PlayerController::supervisorLoop()
 {
     for (;;) {
@@ -302,6 +347,7 @@ void PlayerController::supervisorLoop()
         command_changed_.wait(lock, [&] { return shutting_down_ || pending_open_.has_value(); });
         if (shutting_down_) {
             active_io_.reset();
+            active_recovery_.reset();
             video_widget_ = nullptr;
             snapshot_.state = PlaybackState::Idle;
             break;
@@ -309,55 +355,130 @@ void PlayerController::supervisorLoop()
         auto request = std::move(*pending_open_);
         pending_open_.reset();
         auto* video = video_widget_;
+        const bool live = request.source.kind() == PlaybackSourceKind::NetworkLive;
+        LiveRecoveryBudget recovery(live && request.source.liveOptions()->auto_reconnect);
         supervisor_busy_ = true;
+        const auto current_request = [&] {
+            // 退避时没有活动 I/O，仍需由整个请求的取消对象覆盖下一次连接创建。
+            return !shutting_down_ && !request.recovery_wait->isCancelled() &&
+                snapshot_.request_id == request.epoch.request_id;
+        };
         lock.unlock();
 
-        const auto error = runRequest(request, video);
-        decoder_.close();
-
-        lock.lock();
-        supervisor_busy_ = false;
-        if (shutting_down_) continue;
-        if (snapshot_.state == PlaybackState::Stopping) {
-            snapshot_.state = PlaybackState::Idle;
-        }
-        // 切源/停止已经发布新的快照，旧请求的错误和收尾不能再修改它。
-        if (request.io->isCancelled() || snapshot_.request_id != request.epoch.request_id ||
-            snapshot_.connection_attempt_id != request.epoch.connection_attempt_id) continue;
-        active_io_.reset();
-        playing_ = false;
-        paused_ = false;
-        pending_seek_.reset();
-        seek_requested_ = false;
-        snapshot_.stats.audio_buffer_seconds = 0.0;
-        if (live_output_started_at_) {
-            snapshot_.live_elapsed_seconds =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - *live_output_started_at_).count();
-            live_output_started_at_.reset();
-        }
-        if (error && request.source.kind() == PlaybackSourceKind::NetworkLive) {
-            // 失败后只保留已绘制静帧。先保存真实绘制历史，再撤销待绘制数据和旧输出标签。
-            if (video) {
-                if (snapshot_.network_stats && !snapshot_.network_stats->first_video_draw_seconds) {
-                    if (const auto drawn = video->firstDrawnAt(currentEpochLocked())) {
-                        snapshot_.network_stats->first_video_draw_seconds =
-                            std::chrono::duration<double>(*drawn - request_submitted_at_).count();
-                    }
-                }
-                video->setPlaybackEpoch({}, true);
+        for (;;) {
+            auto error = runRequest(request, video, live ? &recovery : nullptr);
+            // 在关闭旧输入前启动/检查预算，把收尾耗时也计入恢复过程。
+            if (live && !request.recovery_wait->isCancelled()) {
+                if (!error) error = MediaReadResult{MediaReadStatus::EndOfStream, AVERROR_EOF};
+                const auto decision = recovery.onFailure(classifyLiveFailure(request.source.kind(), *error), Clock::now());
+                if (decision.deadline) request.io->setRecoveryDeadline(*decision.deadline);
             }
-            snapshot_.connection_attempt_id = 0;
-            snapshot_.generation = 0;
-            snapshot_.has_current_video_output = false;
+            decoder_.close();
+            lock.lock();
+            if (!current_request()) break;
+
+            playing_ = false;
+            paused_ = false;
+            pending_seek_.reset();
+            seek_requested_ = false;
+            snapshot_.stats.audio_buffer_seconds = 0.0;
+            if (!live) {
+                active_io_.reset();
+                active_recovery_.reset();
+                snapshot_.state = error ? PlaybackState::Failed : PlaybackState::Ended;
+                snapshot_.last_error = error;
+                break;
+            }
+            if (!error) error = MediaReadResult{MediaReadStatus::EndOfStream, AVERROR_EOF};
+            retireLiveOutputLocked(video);
+            snapshot_.last_error = error;
+            const auto failure = classifyLiveFailure(request.source.kind(), *error);
+            auto decision = recovery.next(Clock::now());
+            auto& stats = *snapshot_.network_stats;
+            stats.last_failure_reason = failure.reason;
+            stats.reconnect_attempts = recovery.totalRetriesStarted();
+            stats.recovery_retries_used = recovery.retriesUsed();
+            request.io->cancel();
+            active_io_.reset();
+            std::cout << "[Recovery] request=" << request.epoch.request_id
+                      << " attempt=" << request.epoch.connection_attempt_id
+                      << " generation=" << request.epoch.generation
+                      << " monotonic_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                          Clock::now().time_since_epoch()).count()
+                      << " event=failure reason=" << static_cast<int>(failure.reason) << std::endl;
+
+            while (current_request() && decision.action == RecoveryAction::Wait) {
+                snapshot_.state = PlaybackState::Reconnecting;
+                snapshot_.network_stats->retry_in_seconds =
+                    std::max(0.0, std::chrono::duration<double>(*decision.wake_at - Clock::now()).count());
+                // 短分段只是刷新倒计时；真正取消由条件变量立即唤醒，无忙循环或额外线程。
+                const auto wake = std::min(*decision.wake_at, Clock::now() + 200ms);
+                lock.unlock();
+                const auto waited = request.recovery_wait->waitUntil(wake);
+                lock.lock();
+                if (waited == RecoveryWaitResult::Cancelled || !current_request()) break;
+                decision = recovery.next(Clock::now());
+            }
+            if (!current_request()) break;
+            if (decision.action == RecoveryAction::StartAttempt) {
+                auto io = std::make_shared<MediaIoControl>();
+                const auto started = Clock::now();
+                // 与用户命令同锁核对、计数和发布取消对象，停止不能漏掉刚创建的连接。
+                if (recovery.startAttempt(started)) {
+                    io->setRecoveryDeadline(*recovery.operationDeadline(started, 0ms));
+                    const auto previous = *snapshot_.network_stats;
+                    request.epoch = {request.epoch.request_id, request.epoch.connection_attempt_id + 1, 1};
+                    request.io = io;
+                    active_io_ = io;
+                    connection_started_at_ = started;
+                    live_output_started_at_.reset();
+                    last_audio_output_at_.reset();
+                    last_video_output_at_.reset();
+                    outputs_ready_at_.reset();
+                    current_time_ = 0.0;
+                    duration_ = 0.0;
+                    snapshot_.connection_attempt_id = request.epoch.connection_attempt_id;
+                    snapshot_.generation = request.epoch.generation;
+                    snapshot_.media_info = {};
+                    snapshot_.stats = {};
+                    snapshot_.state = PlaybackState::Opening;
+                    snapshot_.has_current_video_output = false;
+                    snapshot_.live_elapsed_seconds.reset();
+                    snapshot_.network_stats.emplace();
+                    auto& next_stats = *snapshot_.network_stats;
+                    next_stats.auto_reconnect_enabled = request.source.liveOptions()->auto_reconnect;
+                    next_stats.reconnect_attempts = recovery.totalRetriesStarted();
+                    next_stats.recovery_retries_used = recovery.retriesUsed();
+                    next_stats.last_failure_reason = previous.last_failure_reason;
+                    next_stats.attempt_started_seconds =
+                        std::chrono::duration<double>(started - request_submitted_at_).count();
+                    if (video) video->setPlaybackEpoch(request.epoch, true);
+                    std::cout << "[Recovery] request=" << request.epoch.request_id
+                              << " attempt=" << request.epoch.connection_attempt_id
+                              << " generation=" << request.epoch.generation
+                              << " monotonic_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  started.time_since_epoch()).count()
+                              << " event=attempt-start retries=" << next_stats.reconnect_attempts << std::endl;
+                    lock.unlock();
+                    continue;
+                }
+                decision = recovery.next(Clock::now());
+            }
+            snapshot_.state = PlaybackState::Failed;
+            snapshot_.network_stats->recovery_stop_reason = decision.stop_reason;
+            snapshot_.network_stats->retry_in_seconds.reset();
+            active_io_.reset();
+            active_recovery_.reset();
+            break;
         }
-        snapshot_.state = error ? PlaybackState::Failed : PlaybackState::Ended;
-        snapshot_.last_error = error;
+        supervisor_busy_ = false;
+        if (snapshot_.state == PlaybackState::Stopping) snapshot_.state = PlaybackState::Idle;
+        // 暂停/停止/切源已发布自己的状态，旧请求的结束不能覆盖它。
     }
-    // 上一请求已回收 worker 并关闭输入，最后一次访问控件和快照结束后才发布完成。
     shutdown_complete_.store(true, std::memory_order_release);
 }
 
-std::optional<PlaybackError> PlayerController::runRequest(const OpenRequest& request, VideoWidget* video)
+std::optional<PlaybackError> PlayerController::runRequest(const OpenRequest& request, VideoWidget* video, LiveRecoveryBudget* recovery)
 {
     const auto result = decoder_.open(request.source, request.io);
     if (result.status != MediaOpenStatus::Opened) return result;
@@ -373,15 +494,21 @@ std::optional<PlaybackError> PlayerController::runRequest(const OpenRequest& req
         audio_packets_.reset();
         video_packets_.reset();
         playing_ = !live;
-        if (live) request.io->beginInitialOutputDeadline(Clock::now() + LiveInitialOutputLimit);
+        if (live) {
+            const auto now = Clock::now();
+            snapshot_.network_stats->input_ready_seconds =
+                std::chrono::duration<double>(now - connection_started_at_).count();
+            request.io->beginInitialOutputDeadline(now + LiveInitialOutputLimit);
+            request.io->beginOutputWatchdogs(snapshot_.media_info.has_audio, snapshot_.media_info.has_video, now + LiveOutputLimit);
+        }
     }
 
-    const auto read_error = demuxAndPlay(request, video);
+    const auto read_error = demuxAndPlay(request, video, recovery);
     if (read_error) return *read_error;
     return {};
 }
 
-std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest& request, VideoWidget* video)
+std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest& request, VideoWidget* video, LiveRecoveryBudget* recovery)
 {
     if (request.io->isCancelled()) return {};
     const bool local_file = request.source.kind() == PlaybackSourceKind::LocalFile;
@@ -400,6 +527,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
     std::atomic<bool> workers_done(false);
     std::atomic<bool> worker_allocation_failed(false);
     std::atomic<int> audio_error(0);
+    std::atomic<bool> video_timing_known(false);
 
     auto epoch_now = [&] {
         return PlaybackEpoch{request.epoch.request_id, request.epoch.connection_attempt_id, stream_generation.load()};
@@ -407,7 +535,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
     auto running = [&] { return !request.io->isCancelled() && !workers_done; };
     auto is_current = [&](PlaybackEpoch epoch) {
         return running() && !seek_requested_ && !reconfiguring && epoch == epoch_now() &&
-            (!live || !request.io->isInitialOutputTimedOut());
+            (!live || !request.io->liveDeadlineStage());
     };
     auto publish = [&](PlaybackEpoch epoch, const auto& update) {
         std::lock_guard<std::mutex> lock(snapshot_mutex_);
@@ -416,12 +544,14 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
 
     // 在匹配标签的快照锁内调用；一轨可以先输出，全部轨就绪后才进入 Playing。
     auto record_live_output = [&](std::optional<double>& first, Clock::time_point at) {
-        if (!first) first = std::chrono::duration<double>(at - request_submitted_at_).count();
+        if (!first) first = std::chrono::duration<double>(at - connection_started_at_).count();
         if (!live_output_started_at_ || at < *live_output_started_at_) live_output_started_at_ = at;
         const auto& progress = *snapshot_.network_stats;
         if (snapshot_.state == PlaybackState::Buffering &&
             (!use_audio || progress.first_pcm_seconds) && (!use_video || progress.first_video_submit_seconds) &&
-            request.io->finishInitialOutput()) {
+            request.io->finishInitialOutput() && request.io->finishRecoveryDeadline()) {
+            outputs_ready_at_ = at;
+            snapshot_.last_error.reset();
             snapshot_.state = PlaybackState::Playing;
             playing_ = true;
         }
@@ -439,6 +569,53 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
     auto read_audio_clock = [&](PlaybackEpoch epoch) {
         std::lock_guard<std::mutex> lock(snapshot_mutex_);
         return audio_clock.epoch == epoch ? audio_clock : AudioClockSample{};
+    };
+
+    bool recovery_output_observed = false;
+    auto health_sample_at = Clock::now() - 1s;
+    std::optional<double> previous_media_position;
+    // 只在 supervisor 调策略；worker 仅发布实际输出时间，不能并发修改恢复预算。
+    auto update_recovery = [&] {
+        if (!live || !recovery) return;
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        if (!is_current(epoch_now()) || currentEpochLocked() != epoch_now()) return;
+        if (!recovery_output_observed && outputs_ready_at_) {
+            recovery->outputsReady(*outputs_ready_at_);
+            recovery_output_observed = true;
+            std::cout << "[Recovery] request=" << request.epoch.request_id
+                      << " attempt=" << request.epoch.connection_attempt_id
+                      << " generation=" << request.epoch.generation
+                      << " monotonic_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                          outputs_ready_at_->time_since_epoch()).count()
+                      << " event=required-output-ready" << std::endl;
+        }
+        const auto now = Clock::now();
+        if (now - health_sample_at < 1s) return;
+        LiveOutputHealth health;
+        health.required_tracks_outputting = (!use_audio || (last_audio_output_at_ && now - *last_audio_output_at_ <= 2s)) &&
+            (!use_video || (last_video_output_at_ && now - *last_video_output_at_ <= 2s));
+        // 此处仅观察包数是否在计划限界内；3.3 再强制执行包数/字节/跨度上限。
+        const int observed_packet_limit = request.source.liveOptions()->preset == LivePreset::Stable ? 512 : 256;
+        health.buffers_within_limits = audio_packets_.size() <= observed_packet_limit && video_packets_.size() <= observed_packet_limit &&
+            snapshot_.stats.audio_buffer_seconds <= 1.0;
+        const double media = current_time_.load();
+        const double elapsed = std::chrono::duration<double>(now - health_sample_at).count();
+        const bool timing_known = use_audio ? audio_clock.uses_source_pts : video_timing_known.load();
+        if (timing_known && previous_media_position) {
+            const double advanced = media - *previous_media_position;
+            // 时间域跳变撤销这次测量；可信的慢速推进不能恢复预算。
+            if (advanced >= 0.0 && advanced <= elapsed * 2.0) health.media_progress_healthy = advanced >= elapsed * 0.8;
+        }
+        previous_media_position = media;
+        health_sample_at = now;
+        if (recovery->observeOutputs(now, health)) {
+            std::cout << "[Recovery] request=" << request.epoch.request_id
+                      << " attempt=" << request.epoch.connection_attempt_id
+                      << " generation=" << request.epoch.generation
+                      << " monotonic_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now.time_since_epoch()).count() << " event=budget-restored" << std::endl;
+        }
+        snapshot_.network_stats->recovery_retries_used = recovery->retriesUsed();
     };
 
     // 成功出队后的帧沿用该包的完整标签。EOF 刷新则使用调用 flush 之前捕获的标签。
@@ -613,16 +790,19 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                     const auto result = device.write(pcm, offset, can_write);
                     if (offset > previous_offset && result != AudioWriteResult::Error) {
                         last_write = Clock::now();
+                        const bool first_write = !clock_base;
                         if (!clock_base) {
                             // 只由实际提交的 PCM 建立声卡主时钟，不用跨轨合成时间戳。
                             clock_has_source_pts = frame.has_valid_pts && std::isfinite(effective_pts);
                             clock_base = live ? (clock_has_source_pts ? effective_pts : 0.0)
                                               : std::max(effective_pts, target);
-                            if (live) publish(epoch, [&] {
-                                record_live_output(snapshot_.network_stats->first_pcm_seconds, last_write);
-                            });
-                            sample_device(epoch, true);
                         }
+                        if (live) publish(epoch, [&] {
+                            last_audio_output_at_ = last_write;
+                            request.io->noteAudioOutput(last_write + LiveOutputLimit);
+                            record_live_output(snapshot_.network_stats->first_pcm_seconds, last_write);
+                        });
+                        if (first_write) sample_device(epoch, true);
                     }
                     if (result == AudioWriteResult::Written) break;
                     if (result == AudioWriteResult::Error) {
@@ -700,6 +880,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                     if (!is_current(epoch) || audio_error) return;
 
                     const bool valid_pts = frame.has_valid_pts && std::isfinite(frame.pts);
+                    video_timing_known = valid_pts;
                     const bool clock_jump = valid_pts && last_live_video_pts &&
                         std::abs(frame.pts - *last_live_video_pts) > LiveClockJumpSeconds;
                     const bool first_valid_pts = valid_pts && !last_live_video_pts;
@@ -772,7 +953,11 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                     }
                     if (accepted) {
                         snapshot_.has_current_video_output = true;
-                        if (live) record_live_output(snapshot_.network_stats->first_video_submit_seconds, submitted_at);
+                        if (live) {
+                            last_video_output_at_ = submitted_at;
+                            request.io->noteVideoOutput(submitted_at + LiveOutputLimit);
+                            record_live_output(snapshot_.network_stats->first_video_submit_seconds, submitted_at);
+                        }
                     }
                     if (sync_to_audio) snapshot_.stats.av_diff_ms = diff * 1000.0;
                     if (dropped) ++snapshot_.stats.dropped_frames_total;
@@ -845,13 +1030,13 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
     bool draining = false;
     bool can_reposition_for_speed = duration_ > 0.0;
     bool awaiting_video_key = live && use_video;
-    const auto initial_output_timeout = MediaReadResult{
-        MediaReadStatus::Timeout, AVERROR(ETIMEDOUT), MediaReadStage::InitialOutput};
-
     while (packet && running()) {
-        if (live && request.io->isInitialOutputTimedOut()) {
-            error = initial_output_timeout;
-            break;
+        update_recovery();
+        if (live) {
+            if (const auto stage = request.io->liveDeadlineStage()) {
+                error = MediaReadResult{MediaReadStatus::Timeout, AVERROR(ETIMEDOUT), *stage};
+                break;
+            }
         }
         if (worker_allocation_failed) {
             error = MediaReadResult{MediaReadStatus::Error, AVERROR(ENOMEM)};
@@ -921,10 +1106,12 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
 
         // 格式上下文仅 supervisor 使用。网络等包期间，worker 仍可用缓存的 time_base 解码。
         const MediaReadResult result = decoder_.readPacketResult(packet);
-        if (live && request.io->isInitialOutputTimedOut()) {
-            error = initial_output_timeout;
-            if (result.ffmpegError < 0) error->ffmpegError = result.ffmpegError;
-            break;
+        update_recovery();
+        if (live) {
+            if (const auto stage = request.io->liveDeadlineStage()) {
+                error = MediaReadResult{MediaReadStatus::Timeout, result.ffmpegError, *stage};
+                break;
+            }
         }
         if (result.status == MediaReadStatus::Again) {
             std::this_thread::sleep_for(2ms);
@@ -936,7 +1123,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
         if (result.status == MediaReadStatus::Packet) {
             if (live && !snapshot_.network_stats->first_packet_seconds) {
                 snapshot_.network_stats->first_packet_seconds =
-                    std::chrono::duration<double>(Clock::now() - request_submitted_at_).count();
+                    std::chrono::duration<double>(Clock::now() - connection_started_at_).count();
             }
             // 读包前捕获标签，入队时保存。暂停可保留队列，seek 则丢弃这次旧读取。
             if (!seek_requested_) {
@@ -964,6 +1151,12 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
         }
     }
 
+    // 首次故障当场启动预算，worker 停止/设备释放及后续输入关闭都计入本轮时间。
+    // supervisor 收尾后的重复通知由策略去重，不能重新排退避或增加次数。
+    if (live && recovery && error && !request.recovery_wait->isCancelled()) {
+        const auto decision = recovery->onFailure(classifyLiveFailure(request.source.kind(), *error), Clock::now());
+        if (decision.deadline) request.io->setRecoveryDeadline(*decision.deadline);
+    }
     workers_done = true;
     audio_packets_.abort();
     video_packets_.abort();

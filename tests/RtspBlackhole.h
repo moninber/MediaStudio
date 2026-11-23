@@ -8,7 +8,7 @@
 // 默认在回环地址提供一次 RTSP 会话；也可显式绑定私有 IPv4。
 class RtspBlackhole {
 public:
-    enum class StallAt { ReadPacket, OpenInput, ProbeStreams, VideoReadPacket, RejectOpen, UnavailableEndpoint };
+    enum class StallAt { ReadPacket, OpenInput, ProbeStreams, VideoReadPacket, RejectOpen, UnavailableEndpoint, NotPublished };
     enum class SetupTransport { None, Tcp, Udp };
     enum class StartupMedia { Audio, Video, AudioVideo };
     enum class KeyVideo { Immediate, AwaitRelease, NeverSend };
@@ -19,7 +19,7 @@ public:
     // 启播用例可发送大时间戳、双轨 RTP，并在非关键视频包后等待测试放行 IDR。
     RtspBlackhole(StartupMedia media, const std::string& bind_address, SetupTransport transport,
                   KeyVideo key_video = KeyVideo::Immediate, std::uint32_t video_offset_seconds = 0,
-                  unsigned int max_sessions = 1);
+                  unsigned int max_sessions = 1, bool continuous = false);
     // 在同一地址逐次提供预定阻塞阶段，验证暂停/继续确实重建连接。
     RtspBlackhole(std::vector<StallAt> stages, const std::string& bind_address, SetupTransport transport);
     ~RtspBlackhole();
@@ -41,6 +41,11 @@ public:
     // UDP 媒体会话只有收到 TEARDOWN 才释放；控制连接 EOF 不能冒充远端会话删除。
     unsigned int teardownRequests() const noexcept;
     unsigned int activeRemoteSessions() const noexcept;
+    // 服务端主动断开当前连接；连续流模式可单独停一轨，另一轨继续发包。
+    void disconnectCurrent() noexcept;
+    void setTrackStalled(bool audio, bool stalled) noexcept;
+    unsigned int sentAudioPackets() const noexcept;
+    unsigned int sentVideoPackets() const noexcept;
 
 private:
     class Impl;

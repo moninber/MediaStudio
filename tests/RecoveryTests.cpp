@@ -310,6 +310,44 @@ void testCancellation()
     for (const auto result : results) require(result == RecoveryWaitResult::Cancelled, "cancel failed to notify all waiters");
     std::cout << "cancel_wait_entry_races=64 waiters_woken=8 no_real_backoff_sleeps=1 cancelled_candidate_not_counted=1\n";
 }
+
+// 在同一套原子截止状态上推进观察时间，验证活动轨道独立、首输出和总预算的优先级。
+void testOutputWatchdogs()
+{
+    const auto now = RecoveryClock::now();
+    MediaIoControl video_stalled;
+    video_stalled.beginOutputWatchdogs(true, true, now + 10s);
+    video_stalled.noteAudioOutput(now + 20s);
+    require(!video_stalled.liveDeadlineStage(now + 9s) &&
+        video_stalled.liveDeadlineStage(now + 10s) == MediaReadStage::VideoOutput,
+        "audio writes hid a stalled selected video track");
+    MediaIoControl audio_stalled;
+    audio_stalled.beginOutputWatchdogs(true, true, now + 10s);
+    audio_stalled.noteVideoOutput(now + 20s);
+    require(audio_stalled.liveDeadlineStage(now + 10s) == MediaReadStage::AudioOutput,
+        "video submissions hid a stalled selected audio track");
+    MediaIoControl inactive;
+    inactive.beginOutputWatchdogs(false, false, now - 1s);
+    require(!inactive.liveDeadlineStage(now + 1h), "absent tracks acquired an output deadline");
+    MediaIoControl late_frame;
+    late_frame.beginOutputWatchdogs(false, true, now - 1s);
+    late_frame.noteVideoOutput(now + 10s);
+    require(late_frame.liveDeadlineStage() == MediaReadStage::VideoOutput, "late output revived an expired connection");
+    MediaIoControl budget;
+    budget.beginOutputWatchdogs(true, true, now + 10s);
+    budget.beginInitialOutputDeadline(now + 5s);
+    budget.setRecoveryDeadline(now + 3s);
+    require(budget.liveDeadlineStage(now + 3s) == MediaReadStage::RecoveryBudget,
+        "ongoing startup outlived the total recovery budget");
+    require(budget.finishRecoveryDeadline() && budget.liveDeadlineStage(now + 5s) == MediaReadStage::InitialOutput &&
+        budget.finishInitialOutput() && budget.liveDeadlineStage(now + 10s) == MediaReadStage::AudioOutput,
+        "successful startup removed steady output protection or left the old recovery deadline armed");
+    MediaIoControl expired;
+    expired.setRecoveryDeadline(now - 1s);
+    require(!expired.finishRecoveryDeadline() && expired.liveDeadlineStage() == MediaReadStage::RecoveryBudget,
+        "already-expired recovery deadline was cleared by a late first output");
+    std::cout << "independent_output_watchdogs=audio,video inactive_tracks_ignored=1 total_budget_caps_startup=1 late_output_cannot_revive=1\n";
+}
 }
 
 int main(int argc, char** argv)
@@ -321,7 +359,8 @@ int main(int argc, char** argv)
         else if (mode == "deadline") testDeadline();
         else if (mode == "health") testHealth();
         else if (mode == "cancellation") testCancellation();
-        else throw std::runtime_error("expected classification, schedule, deadline, health or cancellation");
+        else if (mode == "watchdogs") testOutputWatchdogs();
+        else throw std::runtime_error("expected classification, schedule, deadline, health, cancellation or watchdogs");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "Recovery test failed: " << error.what() << '\n';

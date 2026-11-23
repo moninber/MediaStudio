@@ -1,5 +1,6 @@
 #include "MediaIo.h"
 
+#include <algorithm>
 #include <cerrno>
 
 extern "C" {
@@ -54,6 +55,55 @@ bool MediaIoControl::isInitialOutputTimedOut() const noexcept
     return deadline != NoDeadline && Clock::now().time_since_epoch().count() >= deadline;
 }
 
+void MediaIoControl::setRecoveryDeadline(Clock::time_point deadline) noexcept
+{
+    recovery_deadline_.store(deadline.time_since_epoch().count(), std::memory_order_release);
+}
+
+bool MediaIoControl::finishRecoveryDeadline() noexcept
+{
+    const auto deadline = recovery_deadline_.load(std::memory_order_acquire);
+    if (isCancelled() || (deadline != NoDeadline && Clock::now().time_since_epoch().count() >= deadline)) return false;
+    recovery_deadline_.store(NoDeadline, std::memory_order_release);
+    return true;
+}
+
+void MediaIoControl::beginOutputWatchdogs(bool audio, bool video, Clock::time_point deadline) noexcept
+{
+    const auto ticks = deadline.time_since_epoch().count();
+    audio_output_deadline_.store(audio ? ticks : NoDeadline, std::memory_order_release);
+    video_output_deadline_.store(video ? ticks : NoDeadline, std::memory_order_release);
+}
+
+void MediaIoControl::noteAudioOutput(Clock::time_point deadline) noexcept
+{
+    const auto previous = audio_output_deadline_.load(std::memory_order_acquire);
+    if (previous != NoDeadline && Clock::now().time_since_epoch().count() < previous) {
+        audio_output_deadline_.store(deadline.time_since_epoch().count(), std::memory_order_release);
+    }
+}
+
+void MediaIoControl::noteVideoOutput(Clock::time_point deadline) noexcept
+{
+    const auto previous = video_output_deadline_.load(std::memory_order_acquire);
+    if (previous != NoDeadline && Clock::now().time_since_epoch().count() < previous) {
+        video_output_deadline_.store(deadline.time_since_epoch().count(), std::memory_order_release);
+    }
+}
+
+std::optional<MediaReadStage> MediaIoControl::liveDeadlineStage(Clock::time_point now) const noexcept
+{
+    const auto expired = [ticks = now.time_since_epoch().count()](const auto& value) {
+        const auto at = value.load(std::memory_order_acquire);
+        return at != NoDeadline && ticks >= at;
+    };
+    if (expired(recovery_deadline_)) return MediaReadStage::RecoveryBudget;
+    if (expired(initial_output_deadline_)) return MediaReadStage::InitialOutput;
+    if (expired(audio_output_deadline_)) return MediaReadStage::AudioOutput;
+    if (expired(video_output_deadline_)) return MediaReadStage::VideoOutput;
+    return {};
+}
+
 // 期限从实际开始操作时计时，不受系统时间调整影响。
 void MediaIoControl::armDeadline(std::chrono::milliseconds timeout) noexcept
 {
@@ -80,7 +130,8 @@ void MediaIoControl::limitDeadline(std::chrono::milliseconds timeout) noexcept
 void MediaIoControl::beginCloseDeadline(std::chrono::milliseconds timeout) noexcept
 {
     auto unset = NoDeadline;
-    const auto deadline = (Clock::now() + timeout).time_since_epoch().count();
+    const auto deadline = std::min((Clock::now() + timeout).time_since_epoch().count(),
+        recovery_deadline_.load(std::memory_order_acquire));
     close_deadline_.compare_exchange_strong(unset, deadline, std::memory_order_release);
 }
 
@@ -97,7 +148,7 @@ MediaIoStopReason MediaIoControl::stopReason() const noexcept
         return MediaIoStopReason::Cancelled;
     }
     const auto deadline = deadline_.load(std::memory_order_acquire);
-    if (isInitialOutputTimedOut() ||
+    if (liveDeadlineStage() ||
         (deadline != NoDeadline && Clock::now().time_since_epoch().count() >= deadline)) {
         return MediaIoStopReason::Timeout;
     }

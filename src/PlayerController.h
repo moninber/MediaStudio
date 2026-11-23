@@ -63,12 +63,14 @@ private:
         PlaybackSource source;
         PlaybackEpoch epoch;
         std::shared_ptr<MediaIoControl> io;
+        std::shared_ptr<RecoveryWait> recovery_wait; // 整个用户请求共用，跨自动连接保持取消意图。
     };
 
     // supervisor 独占打开、读取、seek 与关闭，旧连接收尾后才执行新命令。
     void supervisorLoop();
-    std::optional<PlaybackError> runRequest(const OpenRequest& request, VideoWidget* video);
-    std::optional<MediaReadResult> demuxAndPlay(const OpenRequest& request, VideoWidget* video);
+    std::optional<PlaybackError> runRequest(const OpenRequest& request, VideoWidget* video, LiveRecoveryBudget* recovery);
+    std::optional<MediaReadResult> demuxAndPlay(const OpenRequest& request, VideoWidget* video, LiveRecoveryBudget* recovery);
+    void retireLiveOutputLocked(VideoWidget* video);
     std::uint64_t requestOpenLocked(PlaybackSource source, bool retain_frame);
     void cancelCurrentLocked();
     void resetSnapshotLocked(std::uint64_t request_id, PlaybackState state);
@@ -97,8 +99,13 @@ private:
     std::optional<double> pending_seek_;
     PlaybackSnapshot snapshot_;
     std::chrono::steady_clock::time_point request_submitted_at_{};
+    std::chrono::steady_clock::time_point connection_started_at_{};
     std::optional<std::chrono::steady_clock::time_point> live_output_started_at_;
+    std::optional<std::chrono::steady_clock::time_point> last_audio_output_at_;
+    std::optional<std::chrono::steady_clock::time_point> last_video_output_at_;
+    std::optional<std::chrono::steady_clock::time_point> outputs_ready_at_;
     std::shared_ptr<MediaIoControl> active_io_;
+    std::shared_ptr<RecoveryWait> active_recovery_;
     VideoWidget* video_widget_ = nullptr;
     bool supervisor_busy_ = false;
     bool shutting_down_ = false;

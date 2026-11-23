@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <optional>
+#include <variant>
 
 enum class MediaIoStopReason { None, Cancelled, Timeout };
 
@@ -15,13 +17,16 @@ struct MediaOpenResult {
 };
 
 enum class MediaReadStatus { Packet, Again, EndOfStream, Timeout, Cancelled, Error };
-enum class MediaReadStage { ReadPacket, InitialOutput };
+enum class MediaReadStage { ReadPacket, InitialOutput, AudioOutput, VideoOutput, RecoveryBudget };
 
 struct MediaReadResult {
     MediaReadStatus status;
     int ffmpegError; // 分类与 FFmpeg 原始返回值分别保存。
     MediaReadStage stage = MediaReadStage::ReadPacket;
 };
+
+// 保留操作阶段和原始错误码，恢复策略与快照共用，不依赖界面数据结构。
+using PlaybackError = std::variant<MediaOpenResult, MediaReadResult>;
 
 // 用中断原因区分 FFmpeg 通用退出码，保留暂时无包、EOF 和其他错误。
 MediaReadResult classifyMediaReadResult(
@@ -41,6 +46,15 @@ public:
     // 最后一个活动轨道按时输出后撤销启动限制，不影响在途读包的原期限。
     bool finishInitialOutput() noexcept;
     bool isInitialOutputTimedOut() const noexcept;
+    // 一次自动尝试的总期限独立于打开/探测/读取；首轮用户打开不设置它。
+    void setRecoveryDeadline(std::chrono::steady_clock::time_point deadline) noexcept;
+    bool finishRecoveryDeadline() noexcept;
+    // 只有实际 PCM 写入或有效视频提交才刷新各自期限，收包不能代替输出。
+    void beginOutputWatchdogs(bool audio, bool video, std::chrono::steady_clock::time_point deadline) noexcept;
+    void noteAudioOutput(std::chrono::steady_clock::time_point deadline) noexcept;
+    void noteVideoOutput(std::chrono::steady_clock::time_point deadline) noexcept;
+    std::optional<MediaReadStage> liveDeadlineStage(
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const noexcept;
 
 private:
     friend class MediaDecoder;
@@ -67,4 +81,7 @@ private:
     std::atomic<Clock::duration::rep> deadline_{NoDeadline};
     std::atomic<Clock::duration::rep> initial_output_deadline_{NoDeadline};
     std::atomic<Clock::duration::rep> close_deadline_{NoDeadline};
+    std::atomic<Clock::duration::rep> recovery_deadline_{NoDeadline};
+    std::atomic<Clock::duration::rep> audio_output_deadline_{NoDeadline};
+    std::atomic<Clock::duration::rep> video_output_deadline_{NoDeadline};
 };

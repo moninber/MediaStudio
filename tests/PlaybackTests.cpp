@@ -400,21 +400,57 @@ void testRtspBlackhole(bool cancel)
     throw std::runtime_error("no blocked RTSP read after draining fixture packets");
 }
 
+// 实际阻塞的打开、探测和读包都受同一恢复总期限裁剪，不能各自重新获得 5 秒。
+void testRecoveryIoDeadline()
+{
+    using Fixture = RtspBlackhole;
+    for (const auto stage : {Fixture::StallAt::OpenInput, Fixture::StallAt::ProbeStreams, Fixture::StallAt::VideoReadPacket}) {
+        Fixture server(stage);
+        MediaDecoder decoder;
+        auto control = std::make_shared<MediaIoControl>();
+        const auto started = Clock::now();
+        control->setRecoveryDeadline(started + 400ms);
+        const auto source = createStableRtspSource(server.url(), RtspTransport::Tcp);
+        const auto opened = decoder.open(*source.source, control);
+        if (stage != Fixture::StallAt::VideoReadPacket) {
+            require(opened.status == MediaOpenStatus::Timeout &&
+                opened.stage == (stage == Fixture::StallAt::OpenInput ? MediaOpenStage::OpenInput : MediaOpenStage::ProbeStreams),
+                "opening/probing exceeded the shared recovery deadline");
+        } else {
+            require(opened.status == MediaOpenStatus::Opened, "read fixture failed before global IO deadline verification");
+            auto packet = makePacket();
+            MediaReadResult result{MediaReadStatus::Packet, 0};
+            while (result.status == MediaReadStatus::Packet || result.status == MediaReadStatus::Again) {
+                result = decoder.readPacketResult(packet.get());
+            }
+            require(result.status == MediaReadStatus::Timeout, "read deadline was renewed by buffered RTP packets");
+        }
+        decoder.close();
+        require(!control->isCancelled() && control->liveDeadlineStage() == MediaReadStage::RecoveryBudget &&
+            Clock::now() - started >= 350ms && Clock::now() - started < 2s,
+            "recovery budget was misreported as cancellation or cleanup ignored its bound");
+    }
+    std::cout << "actual_recovery_deadline_ms=400 open_probe_read_capped=1 sticky_cancel_unchanged=1\n";
+}
+
 // 用同一个稳定模式入口校验原始地址，并观察 TCP/UDP SETUP 和相应的 RTP 数据。
 void testStableRtsp()
 {
+    const auto automatic = createStableRtspSource("rtsp://example.test/live", RtspTransport::Tcp);
+    require(automatic.source && automatic.source->liveOptions()->auto_reconnect,
+            "stable RTSP must enable bounded automatic recovery by default");
     const std::string address = "RTSP://MediaStudioSecretUser:p%40ss@example.test:554/stream?token=MediaStudioSecretQuery";
-    const auto accepted = createStableRtspSource(address, RtspTransport::Tcp);
+    const auto accepted = createStableRtspSource(address, RtspTransport::Tcp, false);
     require(accepted.source && accepted.error == RtspSourceError::None &&
             accepted.source->address() == address && accepted.source->displayName() == "RTSP" &&
             accepted.source->kind() == PlaybackSourceKind::NetworkLive &&
             accepted.source->protocol() == PlaybackProtocol::Rtsp, "stable validation changed or exposed the RTSP address");
     auto unsupported = createStableRtspSource("https://example.test/watch?token=MediaStudioSecretUnsupported",
-                                              RtspTransport::Udp);
+                                              RtspTransport::Udp, false);
     require(!unsupported.source && unsupported.error == RtspSourceError::UnsupportedProtocol,
             "stable entry accepted an unsupported protocol");
     for (const std::string_view invalid : {"rtsp:///no-host", "rtsp://example.test:65536/live", "rtsp://example.test/with space"}) {
-        const auto rejected = createStableRtspSource(std::string(invalid), RtspTransport::Tcp);
+        const auto rejected = createStableRtspSource(std::string(invalid), RtspTransport::Tcp, false);
         require(!rejected.source && rejected.error == RtspSourceError::InvalidAddress,
                 "stable entry accepted a malformed RTSP address");
     }
@@ -427,7 +463,7 @@ void testStableRtsp()
         RtspBlackhole server(RtspBlackhole::StallAt::ReadPacket, local, expected);
         auto raw = server.url() + "?token=MediaStudioSecretQuery";
         raw.insert(7, "MediaStudioSecretUser:MediaStudioSecretPassword@");
-        const auto validated = createStableRtspSource(raw, transport);
+        const auto validated = createStableRtspSource(raw, transport, false);
         require(validated.source && validated.source->address() == raw, "fixture credentials or query changed during validation");
         const auto* options = validated.source->liveOptions();
         require(options && options->rtsp_transport == transport && options->preset == LivePreset::Stable &&
@@ -449,7 +485,7 @@ void testStableRtsp()
     // RTSP 403 诊断可携带原始请求目标。CTest 另外检查 stderr 中没有测试凭据与查询参数。
     RtspBlackhole rejecting(RtspBlackhole::StallAt::RejectOpen, local);
     const auto private_url = rejecting.url() + "?token=MediaStudioSecretRejected";
-    const auto private_source = createStableRtspSource(private_url, RtspTransport::Tcp);
+    const auto private_source = createStableRtspSource(private_url, RtspTransport::Tcp, false);
     require(private_source.source.has_value(), "could not construct rejected private RTSP request");
     MediaDecoder decoder;
     const auto result = decoder.open(*private_source.source);
@@ -478,6 +514,8 @@ int main(int argc, char* argv[])
             testRtspBlackhole(true);
         } else if (mode == "rtsp-timeout" && argc == 2) {
             testRtspBlackhole(false);
+        } else if (mode == "rtsp-recovery-deadline" && argc == 2) {
+            testRecoveryIoDeadline();
         } else if (mode == "rtsp-stable" && argc == 2) {
             testStableRtsp();
         } else {

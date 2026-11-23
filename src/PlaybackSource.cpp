@@ -181,14 +181,14 @@ const LiveSourceOptions* PlaybackSource::liveOptions() const noexcept
     return kind_ == PlaybackSourceKind::NetworkLive ? &live_options_ : nullptr;
 }
 
-// 应用的网络入口只提供 RTSP TCP/UDP 与稳定预设，恢复流程留给后续阶段。
-RtspSourceValidation createStableRtspSource(std::string url, RtspTransport transport)
+// 稳定模式默认启用有限重连；参数按播放项保存，继续和手动重接沿用同一配置。
+RtspSourceValidation createStableRtspSource(std::string url, RtspTransport transport, bool auto_reconnect)
 {
     if (protocolOf(url) != PlaybackProtocol::Rtsp) {
         return {{}, url.find("://") == std::string::npos
             ? RtspSourceError::InvalidAddress : RtspSourceError::UnsupportedProtocol};
     }
-    auto source = PlaybackSource::networkLive(std::move(url), {transport, LivePreset::Stable, false});
+    auto source = PlaybackSource::networkLive(std::move(url), {transport, LivePreset::Stable, auto_reconnect});
     if (!source.isValid()) return {{}, RtspSourceError::InvalidAddress};
     return {std::move(source), RtspSourceError::None};
 }

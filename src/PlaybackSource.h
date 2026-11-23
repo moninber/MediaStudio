@@ -57,7 +57,7 @@ struct RtspSourceValidation {
     RtspSourceError error;
 };
 
-RtspSourceValidation createStableRtspSource(std::string url, RtspTransport transport);
+RtspSourceValidation createStableRtspSource(std::string url, RtspTransport transport, bool auto_reconnect = true);
 
 enum class PauseBehavior { KeepPosition, DisconnectLive, FreezeVod };
 enum class EndOfStreamBehavior { Drain, RecoverLive };

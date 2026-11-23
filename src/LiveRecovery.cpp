@@ -57,7 +57,8 @@ LiveFailure classifyLiveFailure(PlaybackSourceKind kind, const PlaybackError& er
         if (timeout) {
             const auto reason = [&] {
                 if constexpr (std::is_same_v<Result, MediaReadResult>) {
-                    if (result.stage == MediaReadStage::InitialOutput) return LiveFailureReason::OutputTimeout;
+                    if (result.stage == MediaReadStage::InitialOutput || result.stage == MediaReadStage::AudioOutput ||
+                        result.stage == MediaReadStage::VideoOutput) return LiveFailureReason::OutputTimeout;
                 }
                 return LiveFailureReason::IoTimeout;
             }();
