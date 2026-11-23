@@ -8,7 +8,7 @@
 // 默认在回环地址提供一次 RTSP 会话；也可显式绑定私有 IPv4。
 class RtspBlackhole {
 public:
-    enum class StallAt { ReadPacket, OpenInput, ProbeStreams, VideoReadPacket, RejectOpen };
+    enum class StallAt { ReadPacket, OpenInput, ProbeStreams, VideoReadPacket, RejectOpen, UnavailableEndpoint };
     enum class SetupTransport { None, Tcp, Udp };
     enum class StartupMedia { Audio, Video, AudioVideo };
     enum class KeyVideo { Immediate, AwaitRelease, NeverSend };

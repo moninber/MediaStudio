@@ -1068,12 +1068,12 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
         const auto stats = snapshot.network_stats.value_or(NetworkPlaybackStats{});
         // 视频就绪以有效帧提交为准；频谱可隐藏画面，因此绘制有独立时刻。
         if (info.has_audio || info.has_video) {
-            // 暂停时首次事件仅是历史，轨道状态以会话是否已收尾为准。
-            const char* paused_output = snapshot.state == PlaybackState::Paused
+            // 暂停或失败时首次事件仅是历史，轨道状态以会话是否已收尾为准。
+            const char* stopped_output = snapshot.state == PlaybackState::Paused || snapshot.state == PlaybackState::Failed
                 ? (snapshot.is_session_active ? "停止输出中" : "已停止输出") : nullptr;
-            const auto audio_status = !info.has_audio ? "无轨道" : paused_output ? paused_output
+            const auto audio_status = !info.has_audio ? "无轨道" : stopped_output ? stopped_output
                 : stats.first_pcm_seconds ? "已提交 PCM" : "待输出";
-            const auto video_status = !info.has_video ? "无轨道" : paused_output ? paused_output
+            const auto video_status = !info.has_video ? "无轨道" : stopped_output ? stopped_output
                 : stats.first_video_submit_seconds ? "已提交视频帧" : "待输出";
             info_text += QString("<p>音频: %1<br>视频: %2</p>").arg(audio_status, video_status);
         }

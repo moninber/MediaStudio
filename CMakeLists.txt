@@ -226,7 +226,9 @@ if(BUILD_TESTING)
                           window-close-modal window-mixed-rtsp live-start-av-tcp live-start-av-udp
                           live-start-video-tcp live-start-video-udp live-start-audio-tcp live-start-audio-udp
                           live-start-no-key live-start-av-offset-tcp live-pause-open live-pause-probe live-pause-read
-                          live-pause-av-tcp live-pause-av-udp live-command-races window-live-controls)
+                          live-pause-av-tcp live-pause-av-udp live-command-races window-live-controls
+                          live-cycle-video-tcp live-cycle-video-udp live-cycle-audio-tcp live-cycle-audio-udp
+                          mixed-switch-tcp mixed-switch-udp live-failures-tcp live-failures-udp)
         set(test_name MediaStudio.Session.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES
@@ -235,8 +237,13 @@ if(BUILD_TESTING)
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
         )
         # 无默认音频端点的机器不能真实提交 PCM；其他错误保持测试失败。
-        if(test_case MATCHES "^live-start-(av|audio)-" OR test_case MATCHES "^live-pause-av-")
+        if(test_case MATCHES "^live-start-(av|audio)-" OR test_case MATCHES "^live-pause-av-" OR
+           test_case MATCHES "^live-cycle-audio-" OR test_case MATCHES "^mixed-switch-")
             set_property(TEST ${test_name} PROPERTY SKIP_RETURN_CODE 77)
+        endif()
+        # 连续切换须逐个等待真实 PCM/视频输出，慢速测试机仍有有界的失败期限。
+        if(test_case MATCHES "^mixed-switch-")
+            set_property(TEST ${test_name} PROPERTY TIMEOUT 45)
         endif()
         if(TARGET Qt6::QOffscreenIntegrationPlugin)
             set_property(TEST ${test_name} APPEND PROPERTY ENVIRONMENT

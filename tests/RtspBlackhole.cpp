@@ -191,14 +191,21 @@ public:
         }
         int size = sizeof(address);
         if (bind(listener_.handle, reinterpret_cast<sockaddr*>(&address), size) == SOCKET_ERROR ||
-            listen(listener_.handle, 1) == SOCKET_ERROR ||
+            (stall_ != StallAt::UnavailableEndpoint && listen(listener_.handle, 1) == SOCKET_ERROR) ||
             getsockname(listener_.handle, reinterpret_cast<sockaddr*>(&address), &size) == SOCKET_ERROR) {
             socketError("bind/listen/getsockname");
         }
         setNonBlocking(listener_.handle);
         url_ = "rtsp://" + bind_address_ + ":" + std::to_string(ntohs(address.sin_port)) + "/blackhole";
         listener_address_ = address;
+        if (stall_ == StallAt::UnavailableEndpoint) {
+            // 使用系统选出的临时空闲端口；Windows 的 SYN 拒绝或丢弃策略由实际网络栈决定。
+            closesocket(listener_.handle);
+            listener_.handle = INVALID_SOCKET;
+        }
         worker_ = std::thread([this] {
+            // 地址来自系统分配的临时端口，客户端验证原始打开错误而非将超时冒充拒绝。
+            if (stall_ == StallAt::UnavailableEndpoint) return;
             for (unsigned int session = 0; session < max_sessions_ && !stopping_; ++session) {
                 if (!stages_.empty()) stall_ = stages_[session];
                 tracks_ = {};

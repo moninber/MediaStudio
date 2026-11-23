@@ -335,6 +335,21 @@ void PlayerController::supervisorLoop()
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - *live_output_started_at_).count();
             live_output_started_at_.reset();
         }
+        if (error && request.source.kind() == PlaybackSourceKind::NetworkLive) {
+            // 失败后只保留已绘制静帧。先保存真实绘制历史，再撤销待绘制数据和旧输出标签。
+            if (video) {
+                if (snapshot_.network_stats && !snapshot_.network_stats->first_video_draw_seconds) {
+                    if (const auto drawn = video->firstDrawnAt(currentEpochLocked())) {
+                        snapshot_.network_stats->first_video_draw_seconds =
+                            std::chrono::duration<double>(*drawn - request_submitted_at_).count();
+                    }
+                }
+                video->setPlaybackEpoch({}, true);
+            }
+            snapshot_.connection_attempt_id = 0;
+            snapshot_.generation = 0;
+            snapshot_.has_current_video_output = false;
+        }
         snapshot_.state = error ? PlaybackState::Failed : PlaybackState::Ended;
         snapshot_.last_error = error;
     }

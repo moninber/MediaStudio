@@ -680,13 +680,18 @@ void testLivePauseStage(std::string_view mode)
     std::cout << "pause_stage=" << mode << " resume_new_request=1 explicit_reconnect_reset_metrics=1\n";
 }
 
-// 真实 WASAPI 音画会话暂停/继续两轮，静态留帧、偏好和网络设置跨连接保留。
-int testLivePauseAv(bool udp)
+// 六种轨道/传输组合共用完整生命周期，避免只验证混合音画而漏掉单轨就绪条件。
+int testLiveLifecycle(std::string_view mode)
 {
-    if (!hasDefaultRenderEndpoint()) return 77;
     using Fixture = RtspBlackhole;
+    const bool udp = mode.find("-udp") != std::string_view::npos;
+    const auto media = mode.find("-video-") != std::string_view::npos ? Fixture::StartupMedia::Video
+        : mode.find("-audio-") != std::string_view::npos ? Fixture::StartupMedia::Audio : Fixture::StartupMedia::AudioVideo;
+    const bool audio = media != Fixture::StartupMedia::Video;
+    const bool video = media != Fixture::StartupMedia::Audio;
+    if (audio && !hasDefaultRenderEndpoint()) return 77;
     const auto transport = udp ? RtspTransport::Udp : RtspTransport::Tcp;
-    Fixture server(Fixture::StartupMedia::AudioVideo, testRtspAddress(),
+    Fixture server(media, testRtspAddress(),
         udp ? Fixture::SetupTransport::Udp : Fixture::SetupTransport::Tcp, Fixture::KeyVideo::Immediate, 8, 3);
     VideoWidget widget;
     PlayerController player;
@@ -700,31 +705,216 @@ int testLivePauseAv(bool udp)
         PlaybackSnapshot active;
         waitInQt([&] {
             active = player.getPlaybackSnapshot();
-            return active.request_id == request && active.state == PlaybackState::Playing && active.has_current_video_output &&
-                   active.network_stats && active.network_stats->first_pcm_seconds && active.live_elapsed_seconds;
-        }, 2s, "AV live connection did not submit real PCM and video");
+            return active.request_id == request && active.state == PlaybackState::Playing &&
+                   active.has_current_video_output == video && active.network_stats &&
+                   active.network_stats->first_pcm_seconds.has_value() == audio &&
+                   active.network_stats->first_video_submit_seconds.has_value() == video && active.live_elapsed_seconds;
+        }, 2s, "live connection did not submit the expected PCM/video tracks");
         require(active.rtsp_transport == transport && std::abs(player.getVolume() - 0.27f) < 0.001f &&
                 player.getEffect() == VideoEffect::Grayscale && player.isVisualizerShown() &&
                 *active.live_elapsed_seconds < 1.0 && !active.network_stats->first_video_draw_seconds,
                 "live reconnect lost volume/effect/visualizer/transport or reused the previous connection clock");
         const auto epoch = snapshotEpoch(active);
-        const auto paused = pauseLiveAndSettle(player, server, round);
-        if (udp) {
-            require(server.teardownRequests() == round && server.activeRemoteSessions() == 0,
-                    "UDP pause closed its control socket without TEARDOWN of the remote RTP session");
+        if (round == 1) {
+            const auto paused = pauseLiveAndSettle(player, server, round);
+            require(server.teardownRequests() == 1 && server.activeRemoteSessions() == 0,
+                    "pause closed its control socket without TEARDOWN of the remote RTP session");
+            requireStaleOutputRejected(widget, epoch, snapshotEpoch(paused));
+        } else if (round == 3) {
+            require(player.stopAsync() == request, "lifecycle stop did not target the active live session");
+            waitInQt([&] {
+                const auto stopped = player.getPlaybackSnapshot();
+                return stopped.state == PlaybackState::Idle && !stopped.is_session_active &&
+                       server.closedConnections() == 3 && server.teardownRequests() == 3 && server.activeRemoteSessions() == 0;
+            }, 2s, "lifecycle stop did not release all local and remote sessions");
+            requireStaleOutputRejected(widget, epoch, {});
+            break;
         }
-        requireStaleOutputRejected(widget, epoch, snapshotEpoch(paused));
-        if (round == 3) break;
         const auto reopened = round == 1 ? player.togglePlayPause() : player.returnToLive();
         require(reopened > request, "AV resume/return-to-live did not allocate a new request");
         request = reopened;
+        const auto opening = player.getPlaybackSnapshot();
+        require(opening.request_id == request && opening.network_stats &&
+                (!opening.live_elapsed_seconds || *opening.live_elapsed_seconds < 1.0),
+                "continued or explicit live replacement inherited the previous connection clock");
+        if (opening.state == PlaybackState::Opening) {
+            require(!opening.has_current_video_output && !opening.live_elapsed_seconds &&
+                    !opening.network_stats->first_pcm_seconds && !opening.network_stats->first_video_submit_seconds,
+                    "reopened connection counted the retained frame as fresh output before probing");
+        }
+        requireStaleOutputRejected(widget, epoch, snapshotEpoch(opening));
     }
     require(server.acceptedConnections() == 3 && server.playRequests() == 3,
             "AV pause/resume created duplicate connections or failed to issue a fresh RTSP PLAY");
-    std::cout << "av_pause_resume_transport=" << (udp ? "UDP" : "TCP")
-              << " fresh_pcm_and_frame_rounds=3 preserved_preferences=1 teardown_requests=" << server.teardownRequests()
+    std::cout << "live_lifecycle=" << mode
+              << " output_rounds=3 pause_resume_return_stop=1 preserved_preferences=1 teardown_requests=" << server.teardownRequests()
               << " active_remote_sessions=" << server.activeRemoteSessions() << '\n';
     return 0;
+}
+
+// 同一控制器完成 20 次实际文件/直播切换，每次都等新会话输出，而非只投递打开命令。
+int testMixedSwitchStress(bool udp)
+{
+    if (!hasDefaultRenderEndpoint()) return 77;
+    using Fixture = RtspBlackhole;
+    Fixture server(Fixture::StartupMedia::AudioVideo, testRtspAddress(),
+        udp ? Fixture::SetupTransport::Udp : Fixture::SetupTransport::Tcp, Fixture::KeyVideo::Immediate, 8, 10);
+    const VideoFixtures files;
+    VideoWidget widget;
+    PlayerController player;
+    player.setVideoWidget(&widget);
+    player.setVolume(0.23f);
+    player.setEffect(VideoEffect::Sepia);
+    player.setSpeed(1.5f);
+    player.toggleVisualizer();
+    const auto live = createStableRtspSource(server.url(), udp ? RtspTransport::Udp : RtspTransport::Tcp);
+    std::vector<PlaybackEpoch> retired;
+    unsigned int network_sessions = 0;
+    std::uint64_t prior_request = 0;
+    for (unsigned int step = 0; step <= 20; ++step) {
+        const bool network = step % 2 == 1;
+        const auto source = network ? *live.source : PlaybackSource::localFile(files.second().u8string());
+        const auto request = player.requestOpen(source);
+        require(request > prior_request, "mixed switch reused a retired playback request");
+        PlaybackSnapshot output;
+        waitInQt([&] {
+            output = player.getPlaybackSnapshot();
+            return output.request_id == request && output.state == PlaybackState::Playing && output.has_current_video_output &&
+                (network ? output.network_stats && output.network_stats->first_pcm_seconds
+                         : output.media_info.video_info.width == 80 && output.current_seconds >= 0.12);
+        }, 2s, "mixed switch did not deliver real output for the newest source");
+        const auto current = snapshotEpoch(output);
+        require(current.connection_attempt_id != 0 && current.generation != 0 && !output.last_error &&
+                std::abs(player.getVolume() - 0.23f) < 0.001f && player.getEffect() == VideoEffect::Sepia &&
+                player.isVisualizerShown() && std::abs(player.getSpeed() - 1.5f) < 0.001f,
+                "mixed source output lost its epoch or user preferences");
+        for (const auto old : retired) requireStaleOutputRejected(widget, old, current);
+        if (network) {
+            ++network_sessions;
+            require(output.source_kind == PlaybackSourceKind::NetworkLive && output.media_info.has_audio &&
+                    output.current_seconds >= 2699.0 && output.rtsp_transport == live.source->liveOptions()->rtsp_transport &&
+                    output.live_elapsed_seconds && *output.live_elapsed_seconds < 1.0 &&
+                    server.acceptedConnections() == network_sessions && server.activeRemoteSessions() == 1,
+                    "new live connection inherited a local clock or changed transport/session ownership");
+        } else {
+            waitInQt([&] { return server.closedConnections() == network_sessions &&
+                server.teardownRequests() == network_sessions && server.activeRemoteSessions() == 0; },
+                500ms, "switching to a file left the old RTSP session allocated");
+            // 本地文件无音轨；旧声卡的约 2700 秒媒体时钟不能回写到新文件。
+            remainsInQt([&] {
+                const auto local = player.getPlaybackSnapshot();
+                return local.request_id == request && local.source_kind == PlaybackSourceKind::LocalFile &&
+                    !local.media_info.has_audio && local.current_seconds < 1.0 && local.stats.audio_queue_packets == 0 &&
+                    local.stats.audio_buffer_seconds == 0.0 && !local.network_stats;
+            }, 80ms, "retired live audio or network metrics flowed back into the new local file");
+        }
+        retired.push_back(current);
+        prior_request = request;
+        std::cout << "mixed_output_step=" << step << " request=" << request << " source="
+                  << (network ? "RTSP" : "file") << " media_seconds=" << output.current_seconds << '\n';
+    }
+    player.stopAsync();
+    waitInQt([&] { return player.getPlaybackSnapshot().state == PlaybackState::Idle &&
+        !player.getPlaybackSnapshot().is_session_active; }, 1s, "stress controller did not stop");
+    std::cout << "mixed_switch_transport=" << (udp ? "UDP" : "TCP")
+              << " actual_outputs=21 switches=20 retired_epochs_checked=210 remote_sessions_released="
+              << server.teardownRequests() << '\n';
+    return 0;
+}
+
+// 连接失败及已输出后的真实读取超时都必须是明确终态，已退出 worker 不能再提交输出。
+void testLiveFailures(bool udp)
+{
+    using Fixture = RtspBlackhole;
+    const auto transport = udp ? RtspTransport::Udp : RtspTransport::Tcp;
+    VideoWidget widget;
+    PlayerController player;
+    player.setVideoWidget(&widget);
+    Fixture refusing(Fixture::StallAt::RejectOpen, testRtspAddress());
+    const auto rejected_source = createStableRtspSource(refusing.url(), transport);
+    const auto rejected_id = player.requestOpen(*rejected_source.source);
+    PlaybackSnapshot refused;
+    waitInQt([&] {
+        refused = player.getPlaybackSnapshot();
+        return refused.request_id == rejected_id && refused.state == PlaybackState::Failed && !refused.is_session_active;
+    }, 4s, "connection refusal did not become an explicit Failed state");
+    const auto* open_error = refused.last_error ? std::get_if<MediaOpenResult>(&*refused.last_error) : nullptr;
+    require(open_error && open_error->status == MediaOpenStatus::Error && open_error->stage == MediaOpenStage::OpenInput &&
+            !refused.is_playing && !refused.has_current_video_output &&
+            open_error->ffmpegError == AVERROR_HTTP_FORBIDDEN && refusing.acceptedConnections() == 1,
+            "RTSP 403 rejection was reported as playback or lost its raw open error");
+
+    // 空闲回环端口在不同系统可立刻拒绝或等 SYN 超时；两者都应发布有界的打开失败。
+    Fixture absent(Fixture::StallAt::UnavailableEndpoint, testRtspAddress());
+    const auto absent_source = createStableRtspSource(absent.url(), transport);
+    const auto absent_id = player.requestOpen(*absent_source.source);
+    PlaybackSnapshot unavailable;
+    waitInQt([&] {
+        unavailable = player.getPlaybackSnapshot();
+        return unavailable.request_id == absent_id && unavailable.state == PlaybackState::Failed && !unavailable.is_session_active;
+    }, 7s, "unreachable RTSP endpoint did not report failure within the configured open deadline");
+    const auto* absent_error = unavailable.last_error ? std::get_if<MediaOpenResult>(&*unavailable.last_error) : nullptr;
+    require(absent_error && absent_error->stage == MediaOpenStage::OpenInput && absent_error->ffmpegError < 0 &&
+            (absent_error->status == MediaOpenStatus::Error || absent_error->status == MediaOpenStatus::Timeout) &&
+            !unavailable.is_playing && !unavailable.has_current_video_output && absent.acceptedConnections() == 0,
+            "unreachable endpoint lost its open error or was confused with usable playback");
+
+    Fixture silent({Fixture::StallAt::VideoReadPacket, Fixture::StallAt::VideoReadPacket}, testRtspAddress(),
+        udp ? Fixture::SetupTransport::Udp : Fixture::SetupTransport::Tcp);
+    const auto source = createStableRtspSource(silent.url(), transport);
+    const auto request = player.requestOpen(*source.source);
+    PlaybackSnapshot playing;
+    waitInQt([&] {
+        playing = player.getPlaybackSnapshot();
+        return playing.request_id == request && playing.state == PlaybackState::Playing && playing.has_current_video_output;
+    }, 2s, "read-timeout fixture failed before producing actual video output");
+    const auto previous = snapshotEpoch(playing);
+    PlaybackSnapshot failed;
+    waitInQt([&] {
+        failed = player.getPlaybackSnapshot();
+        return failed.request_id == request && failed.state == PlaybackState::Failed && !failed.is_session_active;
+    }, 7s, "silent RTSP transport remained Playing past the read deadline");
+    const auto* read_error = failed.last_error ? std::get_if<MediaReadResult>(&*failed.last_error) : nullptr;
+    waitInQt([&] { return silent.closedConnections() == 1 && silent.activeRemoteSessions() == 0; },
+             500ms, "read failure did not release its remote RTSP session");
+    std::cout << "read_failure_status=" << (read_error ? static_cast<int>(read_error->status) : -1)
+              << " stage=" << (read_error ? static_cast<int>(read_error->stage) : -1)
+              << " ffmpeg_raw=" << (read_error ? read_error->ffmpegError : 0)
+              << " epoch=" << failed.connection_attempt_id << '/' << failed.generation
+              << " current_video=" << failed.has_current_video_output << " playing=" << failed.is_playing
+              << " paused=" << failed.is_paused << " audio_buffer=" << failed.stats.audio_buffer_seconds
+              << " closed=" << silent.closedConnections() << " teardown=" << silent.teardownRequests() << '\n';
+    require(read_error && read_error->status == MediaReadStatus::Timeout && read_error->stage == MediaReadStage::ReadPacket &&
+            // FFmpeg 可在期限刚过时返回最后一个缓冲包（0）；原始码与 Timeout 分类独立保存。
+            read_error->ffmpegError <= 0 && !failed.is_playing && !failed.is_paused && !failed.has_current_video_output &&
+            failed.connection_attempt_id == 0 && failed.generation == 0 &&
+            failed.stats.audio_buffer_seconds == 0.0 && silent.closedConnections() == 1 && silent.activeRemoteSessions() == 0,
+            "read timeout did not retire live output and release its remote session");
+    requireStaleOutputRejected(widget, previous, snapshotEpoch(failed));
+    remainsInQt([&] {
+        const auto now = player.getPlaybackSnapshot();
+        return now.request_id == request && now.state == PlaybackState::Failed && !now.is_session_active &&
+               now.current_seconds == failed.current_seconds && now.live_elapsed_seconds == failed.live_elapsed_seconds &&
+               silent.acceptedConnections() == 1;
+    }, 180ms, "failed live request resumed media time or automatically reconnected");
+    const auto reopened = player.returnToLive();
+    require(reopened > request, "failed request could not be explicitly replaced by a fresh live connection");
+    PlaybackSnapshot recovered;
+    waitInQt([&] {
+        recovered = player.getPlaybackSnapshot();
+        return recovered.request_id == reopened && recovered.state == PlaybackState::Playing &&
+               recovered.has_current_video_output && recovered.live_elapsed_seconds && !recovered.last_error;
+    }, 2s, "explicit return-to-live did not resume output after a read failure");
+    require(snapshotEpoch(recovered) != previous && *recovered.live_elapsed_seconds < 1.0 &&
+            silent.acceptedConnections() == 2, "manual recovery reused the failed output epoch or playback clock");
+    requireStaleOutputRejected(widget, previous, snapshotEpoch(recovered));
+    player.stopAsync();
+    waitInQt([&] { return silent.closedConnections() == 2 && silent.activeRemoteSessions() == 0 &&
+        player.getPlaybackSnapshot().state == PlaybackState::Idle; }, 1s, "stop after manual recovery left a live session");
+    std::cout << "live_failure_transport=" << (udp ? "UDP" : "TCP")
+              << " refused_open_error=" << open_error->ffmpegError
+              << " unavailable_open_status=" << static_cast<int>(absent_error->status)
+              << " after_output_read_timeout=1 retired_output=1 explicit_return_after_failed=1\n";
 }
 
 // 快速手动重接/继续被停止、切源和关机覆盖后，旧连接不得再次复活。
@@ -1356,7 +1546,10 @@ int main(int argc, char* argv[])
         else if (mode == "window-mixed-rtsp") testWindowMixedRtsp();
         else if (mode == "window-live-controls") testWindowLiveControls();
         else if (mode == "live-pause-open" || mode == "live-pause-probe" || mode == "live-pause-read") testLivePauseStage(mode);
-        else if (mode == "live-pause-av-tcp" || mode == "live-pause-av-udp") return testLivePauseAv(mode == "live-pause-av-udp");
+        else if (mode == "live-pause-av-tcp" || mode == "live-pause-av-udp" || mode.substr(0, 11) == "live-cycle-")
+            return testLiveLifecycle(mode);
+        else if (mode == "mixed-switch-tcp" || mode == "mixed-switch-udp") return testMixedSwitchStress(mode == "mixed-switch-udp");
+        else if (mode == "live-failures-tcp" || mode == "live-failures-udp") testLiveFailures(mode == "live-failures-udp");
         else if (mode == "live-command-races") testLiveCommandRaces();
         else if (mode.substr(0, 11) == "live-start-") return testLiveStartup(mode);
         else if (mode == "widget-epochs") testWidgetEpochs();
