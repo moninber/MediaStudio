@@ -273,7 +273,13 @@ if(BUILD_TESTING)
                           live-recover-audio-tcp live-recover-audio-udp live-recovery-budget live-recovery-cancel
                           live-stall-audio live-stall-video live-recovery-metadata window-auto-recovery
                           live-queue-audio-tcp live-queue-audio-udp live-queue-video-tcp live-queue-video-udp
-                          live-queue-cancel live-oversized-video-tcp window-queue-failure)
+                          live-queue-cancel live-oversized-video-tcp window-queue-failure
+                          live-jitter-hold-tcp live-jitter-hold-udp live-jitter-gap-tcp live-jitter-gap-udp
+                          live-frame-categories-tcp live-frame-categories-udp live-stall-audio-udp live-stall-video-tcp
+                          live-fault-blackhole-open-tcp live-fault-blackhole-open-udp
+                          live-fault-blackhole-probe-tcp live-fault-blackhole-probe-udp
+                          live-fault-blackhole-read-tcp live-fault-blackhole-read-udp
+                          live-fault-responses-tcp live-fault-responses-udp live-real-time-budget window-transient-buffering)
         set(test_name MediaStudio.Session.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES
@@ -286,7 +292,8 @@ if(BUILD_TESTING)
            test_case MATCHES "^live-cycle-audio-" OR test_case MATCHES "^mixed-switch-" OR
            test_case MATCHES "^live-recover-(av|audio)-" OR test_case MATCHES "^live-stall-" OR
            test_case STREQUAL "live-recovery-metadata" OR test_case MATCHES "^live-queue-" OR
-           test_case STREQUAL "window-queue-failure")
+           test_case STREQUAL "window-queue-failure" OR test_case MATCHES "^live-jitter-" OR
+           test_case MATCHES "^live-frame-categories-")
             set_property(TEST ${test_name} PROPERTY SKIP_RETURN_CODE 77)
         endif()
         # 连续切换须逐个等待真实 PCM/视频输出，慢速测试机仍有有界的失败期限。
@@ -295,6 +302,15 @@ if(BUILD_TESTING)
         endif()
         if(test_case MATCHES "^live-recover" OR test_case MATCHES "^live-stall-" OR test_case MATCHES "^live-queue-")
             set_property(TEST ${test_name} PROPERTY TIMEOUT 35)
+        endif()
+        if(test_case MATCHES "^live-fault-blackhole-")
+            set_property(TEST ${test_name} PROPERTY TIMEOUT 45)
+        endif()
+        if(test_case STREQUAL "live-real-time-budget")
+            set_property(TEST ${test_name} PROPERTY TIMEOUT 60)
+        endif()
+        if(test_case MATCHES "^live-fault-responses-")
+            set_property(TEST ${test_name} PROPERTY FAIL_REGULAR_EXPRESSION "MediaStudioSecret[0-9A-Za-z]+")
         endif()
         if(TARGET Qt6::QOffscreenIntegrationPlugin)
             set_property(TEST ${test_name} APPEND PROPERTY ENVIRONMENT

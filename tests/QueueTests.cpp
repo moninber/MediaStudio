@@ -90,6 +90,16 @@ void testTimestamps() {
     queue.reset({4,32,2s},{1,1000});input.at(0);queued(queue,input);
     input.at(1);require(queue.push(input.value,{1,1,2}).status==PacketPushStatus::Queued &&
         !queue.stats().timestamp_span_seconds,"generation changed without resetting span domain");
+    queue.reset({0,0,2s},{1,1000});
+    for(const auto timestamp:{0,40,80,2160,2200}){input.at(timestamp);queued(queue,input);}
+    require(!queue.stats().timestamp_span_seconds,"known-cadence two-second gap was treated as real queued media span");
+    for(int i=0;i<4;++i)require(queue.pop(output.value,popped,false),"could not remove gap prefix");
+    input.at(2240);queued(queue,input);
+    require(queue.stats().timestamp_span_seconds==.04,"timestamp cadence did not recover after gap");
+    queue.reset({0,0,2s},{1,1000});
+    for(const auto timestamp:{0,500,1000,1500,2000}){input.at(timestamp);queued(queue,input);}
+    input.at(2500);require(queue.push(input.value,Epoch).status==PacketPushStatus::Full,
+        "regular burst bypassed the unchanged two-second span cap");
     std::cout<<"DTS_preferred=1 missing_jump_generation_invalidates_span=1 trusted_suffix_recovers=1 extreme_timestamps_safe=1\n";
 }
 

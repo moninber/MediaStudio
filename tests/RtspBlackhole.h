@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -8,11 +9,13 @@
 // 默认在回环地址提供一次 RTSP 会话；也可显式绑定私有 IPv4。
 class RtspBlackhole {
 public:
-    enum class StallAt { ReadPacket, OpenInput, ProbeStreams, VideoReadPacket, RejectOpen, UnavailableEndpoint, NotPublished };
+    enum class StallAt { ReadPacket, OpenInput, ProbeStreams, VideoReadPacket, RejectOpen, UnavailableEndpoint,
+                         NotPublished, Unauthorized, TemporarilyBusy };
     enum class SetupTransport { None, Tcp, Udp };
     enum class StartupMedia { Audio, Video, AudioVideo };
     enum class KeyVideo { Immediate, AwaitRelease, NeverSend };
     enum class QueueBurst { Audio, Video, OversizedVideo };
+    enum class VideoSignal { Normal, Late, Corrupt };
 
     // 默认先完成握手并提供有效音频，保留读包取消测试的行为。
     explicit RtspBlackhole(StallAt stall = StallAt::ReadPacket, const std::string& bind_address = "127.0.0.1",
@@ -20,7 +23,8 @@ public:
     // 启播用例可发送大时间戳、双轨 RTP，并在非关键视频包后等待测试放行 IDR。
     RtspBlackhole(StartupMedia media, const std::string& bind_address, SetupTransport transport,
                   KeyVideo key_video = KeyVideo::Immediate, std::uint32_t video_offset_seconds = 0,
-                  unsigned int max_sessions = 1, bool continuous = false);
+                  unsigned int max_sessions = 1, bool continuous = false,
+                  std::chrono::milliseconds session_limit = std::chrono::seconds{14});
     // 在同一地址逐次提供预定阻塞阶段，验证暂停/继续确实重建连接。
     RtspBlackhole(std::vector<StallAt> stages, const std::string& bind_address, SetupTransport transport);
     ~RtspBlackhole();
@@ -45,6 +49,10 @@ public:
     // 服务端主动断开当前连接；连续流模式可单独停一轨，另一轨继续发包。
     void disconnectCurrent() noexcept;
     void setTrackStalled(bool audio, bool stalled) noexcept;
+    // 暂停 RTP 与媒体时间，控制连接仍可处理 TEARDOWN；与丢包后 PTS 前进的单轨开关分开。
+    void setMediaPaused(bool paused) noexcept;
+    // 真正发送滞后时间戳或截短的 IDR 负载，用解码结果核验丢帧/损坏跳过分类。
+    void setVideoSignal(VideoSignal signal) noexcept;
     unsigned int sentAudioPackets() const noexcept;
     unsigned int sentVideoPackets() const noexcept;
     // 连续正常供包至少一秒后按轨道瞬发；跨自动连接保留，用于验证 Full 共享有限预算。

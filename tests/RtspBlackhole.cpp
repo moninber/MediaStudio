@@ -173,10 +173,11 @@ public:
     Impl(StallAt stall, const std::string& bind_address, SetupTransport transport,
          std::optional<StartupMedia> startup = {}, KeyVideo key_video = KeyVideo::Immediate,
          std::uint32_t video_offset_seconds = 0, unsigned int max_sessions = 1,
-         std::vector<StallAt> stages = {}, bool continuous = false)
+         std::vector<StallAt> stages = {}, bool continuous = false, std::chrono::milliseconds session_limit = 14s)
         : listener_(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)), stall_(stall), bind_address_(bind_address),
           expected_transport_(transport), startup_(startup), key_video_(key_video), video_offset_seconds_(video_offset_seconds),
-          stages_(std::move(stages)), max_sessions_(stages_.empty() ? max_sessions : stages_.size()), continuous_(continuous)
+          stages_(std::move(stages)), max_sessions_(stages_.empty() ? max_sessions : stages_.size()), continuous_(continuous),
+          session_limit_(session_limit)
     {
         if (listener_.handle == INVALID_SOCKET) socketError("socket");
         sockaddr_in address{};
@@ -211,7 +212,7 @@ public:
                 tracks_ = {};
                 disconnect_.store(false);
                 key_released_.store(false);
-                hard_deadline_ = Clock::now() + 14s;
+                hard_deadline_ = Clock::now() + session_limit_;
                 const auto before = accepted_.load();
                 try {
                     serve();
@@ -245,6 +246,8 @@ public:
     unsigned int activeRemoteSessions() const noexcept { return remote_sessions_.load(); }
     void disconnectCurrent() noexcept { disconnect_.store(true); }
     void setTrackStalled(bool audio, bool stalled) noexcept { (audio ? stall_audio_ : stall_video_).store(stalled); }
+    void setMediaPaused(bool paused) noexcept { media_paused_.store(paused); }
+    void setVideoSignal(VideoSignal signal) noexcept { video_signal_.store(signal); }
     unsigned int sentAudioPackets() const noexcept { return sent_audio_.load(); }
     unsigned int sentVideoPackets() const noexcept { return sent_video_.load(); }
     void releaseQueueBurst(QueueBurst burst) noexcept { queue_burst_.store(static_cast<int>(burst) + 1); }
@@ -425,8 +428,13 @@ private:
         std::string pending;
         auto next = Clock::now();
         const auto audio_track = video ? 1u : 0u;
-        for (std::uint16_t seq = 1; !stopping_.load() && !disconnect_.load() && Clock::now() < hard_deadline_; ++seq) {
+        for (std::uint16_t seq = 1; !stopping_.load() && !disconnect_.load() && Clock::now() < hard_deadline_;) {
             if (!pollControl(socket, pending)) return false;
+            if (media_paused_.load()) {
+                next = Clock::now(); // 放行后按正常节奏送，不补发暂停期间的时间线或瞬发追赶包。
+                std::this_thread::sleep_for(5ms);
+                continue;
+            }
             if (seq > 25 && queue_burst_.load()) return sendQueueBurst(socket, peer, seq, video, pending);
             if (audio && !stall_audio_.load()) {
                 const auto channel = static_cast<unsigned char>(audio_track * 2);
@@ -435,11 +443,19 @@ private:
                 sent_audio_ += 2;
             }
             if (video && !stall_video_.load()) {
-                if (!sendRtp(socket, peer, 0, h264Rtp(seq, 2700 * 90000))) return false;
+                const auto signal = video_signal_.load();
+                const auto packet = h264Rtp(seq, 2700 * 90000 - (signal == VideoSignal::Late ? 180000 : 0));
+                if (signal == VideoSignal::Corrupt) {
+                    std::array<unsigned char, 22> truncated{};
+                    std::copy_n(packet.begin(), truncated.size(), truncated.begin());
+                    truncated[3] = static_cast<unsigned char>(truncated.size() - 4);
+                    if (!sendRtp(socket, peer, 0, truncated)) return false;
+                } else if (!sendRtp(socket, peer, 0, packet)) return false;
                 ++sent_video_;
             }
             next += 40ms;
             std::this_thread::sleep_until(next);
+            ++seq;
         }
         return false;
     }
@@ -530,10 +546,14 @@ private:
             if (method == "OPTIONS") {
                 reply += "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n";
             } else if (method == "DESCRIBE") {
-                if (stall_ == StallAt::RejectOpen || stall_ == StallAt::NotPublished) {
+                if (stall_ == StallAt::RejectOpen || stall_ == StallAt::NotPublished ||
+                    stall_ == StallAt::Unauthorized || stall_ == StallAt::TemporarilyBusy) {
                     // 模拟错误诊断带回请求目标，验证播放器不会输出其中的查询参数。
                     const auto target = request.substr(9, request.find(' ', 9) - 9);
-                    reply = std::string(stall_ == StallAt::RejectOpen ? "RTSP/1.0 403 " : "RTSP/1.0 404 ") +
+                    const char* status = stall_ == StallAt::RejectOpen ? "RTSP/1.0 403 " :
+                        stall_ == StallAt::Unauthorized ? "RTSP/1.0 401 " :
+                        stall_ == StallAt::TemporarilyBusy ? "RTSP/1.0 429 " : "RTSP/1.0 404 ";
+                    reply = std::string(status) +
                         target + request.substr(cseq, cseq_end - cseq) + "\r\n\r\n";
                     writeAll(peer.handle, reply);
                     return;
@@ -642,10 +662,13 @@ private:
     std::atomic<unsigned int> teardown_requests_{0};
     std::atomic<unsigned int> remote_sessions_{0};
     const bool continuous_;
+    const std::chrono::milliseconds session_limit_;
     std::atomic<bool> disconnect_{false};
     std::atomic<int> queue_burst_{0};
     std::atomic<bool> stall_audio_{false};
     std::atomic<bool> stall_video_{false};
+    std::atomic<bool> media_paused_{false};
+    std::atomic<VideoSignal> video_signal_{VideoSignal::Normal};
     std::atomic<unsigned int> sent_audio_{0};
     std::atomic<unsigned int> sent_video_{0};
     Clock::time_point hard_deadline_ = Clock::now() + 14s;
@@ -656,9 +679,10 @@ private:
 RtspBlackhole::RtspBlackhole(StallAt stall, const std::string& bind_address, SetupTransport transport)
     : impl_(std::make_unique<Impl>(stall, bind_address, transport)) {}
 RtspBlackhole::RtspBlackhole(StartupMedia media, const std::string& bind_address, SetupTransport transport,
-                           KeyVideo key_video, std::uint32_t video_offset_seconds, unsigned int max_sessions, bool continuous)
+                           KeyVideo key_video, std::uint32_t video_offset_seconds, unsigned int max_sessions, bool continuous,
+                           std::chrono::milliseconds session_limit)
     : impl_(std::make_unique<Impl>(StallAt::ReadPacket, bind_address, transport, media, key_video, video_offset_seconds,
-                                 max_sessions, std::vector<StallAt>{}, continuous)) {}
+                                 max_sessions, std::vector<StallAt>{}, continuous, session_limit)) {}
 RtspBlackhole::RtspBlackhole(std::vector<StallAt> stages, const std::string& bind_address, SetupTransport transport)
     : impl_(std::make_unique<Impl>(StallAt::ReadPacket, bind_address, transport, std::nullopt,
                                  KeyVideo::Immediate, 0, 1, std::move(stages))) {}
@@ -674,6 +698,8 @@ unsigned int RtspBlackhole::teardownRequests() const noexcept { return impl_->te
 unsigned int RtspBlackhole::activeRemoteSessions() const noexcept { return impl_->activeRemoteSessions(); }
 void RtspBlackhole::disconnectCurrent() noexcept { impl_->disconnectCurrent(); }
 void RtspBlackhole::setTrackStalled(bool audio, bool stalled) noexcept { impl_->setTrackStalled(audio, stalled); }
+void RtspBlackhole::setMediaPaused(bool paused) noexcept { impl_->setMediaPaused(paused); }
+void RtspBlackhole::setVideoSignal(VideoSignal signal) noexcept { impl_->setVideoSignal(signal); }
 unsigned int RtspBlackhole::sentAudioPackets() const noexcept { return impl_->sentAudioPackets(); }
 unsigned int RtspBlackhole::sentVideoPackets() const noexcept { return impl_->sentVideoPackets(); }
 void RtspBlackhole::releaseQueueBurst(QueueBurst burst) noexcept { impl_->releaseQueueBurst(burst); }

@@ -55,6 +55,7 @@ struct NetworkPlaybackStats {
     // 按显式用户请求累计，跨自动连接保留；与同步丢帧/损坏帧分别计数。
     std::uint64_t queue_full_events = 0;
     std::uint64_t oversized_packet_events = 0;
+    std::uint64_t audio_clock_reanchors = 0; // 本连接内因可信音频 PTS 跳变而重置设备时钟，不计作重连。
     std::optional<PacketQueueLimit> last_queue_limit;
     // 各阶段仅记首次，从当前连接尝试开始计时，自动重建时重置。
     std::optional<double> first_packet_seconds;

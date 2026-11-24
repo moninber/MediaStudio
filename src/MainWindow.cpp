@@ -1127,6 +1127,7 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
         if (stats.last_failure_reason) info_text += QString("<p>最近故障: %1</p>").arg(recoveryFailureLabel(snapshot));
         info_text += QString("<p>队列 Full 累计: %1 · 超大单包: %2</p>")
             .arg(stats.queue_full_events).arg(stats.oversized_packet_events);
+        info_text += QString("<p>本连接音频时间戳重建: %1</p>").arg(stats.audio_clock_reanchors);
         if (stats.last_queue_limit) info_text += QString("<p>最近触发限界: %1</p>").arg(queueLimitLabel(*stats.last_queue_limit));
         const auto queue_info = [](const QString& name, const PacketQueueStats& queue) {
             const auto span = queue.timestamp_span_seconds ? QString("%1 ms").arg(*queue.timestamp_span_seconds * 1000.0, 0, 'f', 0)
@@ -1148,8 +1149,12 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
                 snapshot.state == PlaybackState::Paused || snapshot.state == PlaybackState::Failed
                 ? (snapshot.is_session_active ? "停止输出中" : "已停止输出") : nullptr;
             const auto audio_status = !info.has_audio ? "无轨道" : stopped_output ? stopped_output
+                : snapshot.state == PlaybackState::Buffering && stats.last_audio_output_age_seconds.value_or(0.0) > 1.0
+                    ? "输出中断，等待恢复"
                 : stats.first_pcm_seconds ? "已提交 PCM" : "待输出";
             const auto video_status = !info.has_video ? "无轨道" : stopped_output ? stopped_output
+                : snapshot.state == PlaybackState::Buffering && stats.last_video_output_age_seconds.value_or(0.0) > 1.0
+                    ? "输出中断，等待恢复"
                 : stats.first_video_submit_seconds ? "已提交视频帧" : "待输出";
             info_text += QString("<p>音频: %1<br>视频: %2</p>").arg(audio_status, video_status);
         }

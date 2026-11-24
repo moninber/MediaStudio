@@ -58,6 +58,7 @@ private:
         std::optional<std::int64_t> trusted;
         bool uses_dts = false;
         std::uint64_t timeline;
+        std::optional<long double> next_step;
     };
 
     TimestampCandidate timestampCandidateLocked(const AVPacket& packet, PlaybackEpoch epoch) const;
@@ -75,6 +76,7 @@ private:
     PacketQueueStats stats_;
     AVRational time_base_{0, 1};
     std::optional<std::int64_t> previous_timestamp_;
+    std::optional<long double> timestamp_step_;
     std::optional<PlaybackEpoch> previous_epoch_;
     bool previous_uses_dts_ = false;
     std::uint64_t timeline_ = 0;

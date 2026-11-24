@@ -25,7 +25,7 @@ void PacketQueue::PacketDeleter::operator()(AVPacket* packet) const noexcept
 // 这里只计算候选；Full、取消和分配失败不能改变已入队数据的统计域。
 PacketQueue::TimestampCandidate PacketQueue::timestampCandidateLocked(const AVPacket& packet, PlaybackEpoch epoch) const
 {
-    TimestampCandidate result{{}, {}, packet.dts != AV_NOPTS_VALUE, timeline_};
+    TimestampCandidate result{{}, {}, packet.dts != AV_NOPTS_VALUE, timeline_, timestamp_step_};
     if (time_base_.num > 0 && time_base_.den > 0) {
         const auto raw = result.uses_dts ? packet.dts : packet.pts;
         if (raw != AV_NOPTS_VALUE) result.raw = result.trusted = raw;
@@ -35,12 +35,24 @@ PacketQueue::TimestampCandidate PacketQueue::timestampCandidateLocked(const AVPa
     if (result.raw && previous_timestamp_ && !changed && result.uses_dts == previous_uses_dts_) {
         // 先转长浮点再相减，避免极值 PTS 的有符号溢出；不将负 DTS/大绝对 PTS 当成坏数据。
         const long double seconds = (static_cast<long double>(*result.raw) - *previous_timestamp_) * time_base_.num / time_base_.den;
-        if (seconds < 0.0L || seconds > TimestampJumpSeconds) {
+        // 已知正常包间隔时，约 2 秒停包产生的 PTS 缺口也属于时间域跳变，不能把
+        // “一个旧包 + 一个缺口后的新包”误算成两秒压缩数据积压。正常连续突发仍逐包受跨度限额。
+        const auto jump_limit = timestamp_step_ ? std::max(1.0L, *timestamp_step_ * 8.0L) : TimestampJumpSeconds;
+        if (seconds < 0.0L || seconds > jump_limit) {
             discontinuity = true;
             result.trusted.reset(); // 跳变包本身不可用于显示跨度，后续包从新基准开始。
+        } else if (seconds > 0.0L && seconds <= 1.0L) {
+            result.next_step = seconds;
         }
     }
-    if (discontinuity) ++result.timeline;
+    if (discontinuity) {
+        ++result.timeline;
+        result.next_step.reset();
+    }
+    if (result.raw && packet.duration > 0) {
+        const auto duration = static_cast<long double>(packet.duration) * time_base_.num / time_base_.den;
+        if (duration > 0.0L && duration <= 1.0L) result.next_step = duration;
+    }
     return result;
 }
 
@@ -107,6 +119,7 @@ PacketPushResult PacketQueue::push(const AVPacket* packet, PlaybackEpoch epoch, 
     }
     timeline_ = timestamp.timeline;
     previous_timestamp_ = timestamp.raw;
+    timestamp_step_ = timestamp.next_step;
     previous_epoch_ = epoch;
     previous_uses_dts_ = timestamp.uses_dts;
     stats_.packets = packets_.size();
@@ -162,6 +175,7 @@ void PacketQueue::resetLocked()
     stats_ = {};
     stats_.limits = limits;
     previous_timestamp_.reset();
+    timestamp_step_.reset();
     previous_epoch_.reset();
     previous_uses_dts_ = false;
     timeline_ = 0;

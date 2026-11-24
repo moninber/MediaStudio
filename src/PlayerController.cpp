@@ -295,6 +295,14 @@ PlaybackSnapshot PlayerController::getPlaybackSnapshot() const
             snapshot.network_stats->audio_queue = audio_packets_.stats();
             snapshot.network_stats->video_queue = video_packets_.stats();
         }
+        // 暂时无输出先呈现缓冲，不撤销连接、不消耗重试。这里仅派生按值快照，
+        // 不改 owner 的播放意图；新 PCM/视频恢复后下一次快照自然回到 Playing。
+        if (snapshot.state == PlaybackState::Playing &&
+            ((snapshot.media_info.has_audio && snapshot.network_stats->last_audio_output_age_seconds.value_or(0.0) > 1.0) ||
+             (snapshot.media_info.has_video && snapshot.network_stats->last_video_output_age_seconds.value_or(0.0) > 1.0))) {
+            snapshot.state = PlaybackState::Buffering;
+            snapshot.is_playing = false;
+        }
     }
     snapshot.stats.audio_queue_packets = audio_packets_.size();
     snapshot.stats.video_queue_packets = video_packets_.size();
@@ -711,6 +719,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
             fft.init(64, false);
             std::uint64_t device_generation = request.epoch.generation;
             std::optional<double> clock_base;
+            std::optional<double> next_audio_pts;
             bool clock_has_source_pts = false;
             auto last_sample_at = Clock::now() - 8ms;
             bool device_paused = false;
@@ -758,6 +767,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                     }
                     device_generation = epoch.generation;
                     clock_base.reset();
+                    next_audio_pts.reset();
                     clock_has_source_pts = false;
                     tail_seconds_left.reset();
                     fft.resetSpectrum();
@@ -788,6 +798,38 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                     if (skip >= frame.samples) return;
                     trim_bytes = skip * (frame.data_size / frame.samples);
                     effective_pts = target;
+                }
+                const bool trustworthy_pts = frame.has_valid_pts && std::isfinite(effective_pts);
+                if (live && clock_base && trustworthy_pts && next_audio_pts &&
+                    std::abs(effective_pts - *next_audio_pts) > LiveInitialAvSkewSeconds) {
+                    // 停包后 PTS 可能跨过缺失内容，但设备只累计实际提交的采样；继续沿用旧映射会
+                    // 让视频一直等慢了数秒的主时钟。先播完旧 padding，再由本线程重置设备与锚点。
+                    const double jump = effective_pts - *next_audio_pts;
+                    const auto waiting_since = Clock::now();
+                    while (is_current(epoch)) {
+                        const auto progress = device.sample();
+                        if (!progress.valid) { fail_audio(EIO, "音频时间戳跳变时无法读取缓冲"); return; }
+                        if (progress.queued_seconds <= 0.0) break;
+                        if (Clock::now() - waiting_since >= 1s) {
+                            fail_audio(ETIMEDOUT, "音频时间戳跳变时旧缓冲未能排空"); return;
+                        }
+                        sample_device(epoch, false);
+                        std::this_thread::sleep_for(5ms);
+                    }
+                    if (!is_current(epoch)) return;
+                    if (!device.reset()) { fail_audio(EIO, "音频时间戳跳变时无法重置声卡"); return; }
+                    clock_base.reset();
+                    next_audio_pts.reset();
+                    clock_has_source_pts = false;
+                    fft.resetSpectrum();
+                    publish(epoch, [&] {
+                        audio_clock = AudioClockSample{epoch};
+                        ++snapshot_.network_stats->audio_clock_reanchors;
+                    });
+                    std::cout << "[Clock] request=" << epoch.request_id << " attempt=" << epoch.connection_attempt_id
+                        << " generation=" << epoch.generation << " monotonic_ms="
+                        << std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count()
+                        << " event=audio-pts-reanchor jump_seconds=" << jump << std::endl;
                 }
                 std::vector<uint8_t> pcm(frame.data + trim_bytes, frame.data + frame.data_size);
                 const float volume = volume_.load();
@@ -824,6 +866,8 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                             request.io->noteAudioOutput(last_write + LiveOutputLimit);
                             record_live_output(snapshot_.network_stats->first_pcm_seconds, last_write);
                         });
+                        if (live) next_audio_pts = trustworthy_pts
+                            ? std::optional<double>{effective_pts + static_cast<double>(frame.samples) / sample_rate} : std::nullopt;
                         if (first_write) sample_device(epoch, true);
                     }
                     if (result == AudioWriteResult::Written) break;

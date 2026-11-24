@@ -986,6 +986,86 @@ int testAutomaticRecovery(std::string_view mode)
     return 0;
 }
 
+// 约两秒停包不关闭控制连接；分别模拟媒体时间冻结和丢失两秒后时间戳继续前进。
+int testShortMediaPause(std::string_view mode)
+{
+    if (!hasDefaultRenderEndpoint()) return 77;
+    using Fixture=RtspBlackhole;
+    const bool udp=mode.find("udp")!=std::string_view::npos;
+    const bool gap=mode.find("gap")!=std::string_view::npos;
+    Fixture server(Fixture::StartupMedia::AudioVideo,testRtspAddress(),udp?Fixture::SetupTransport::Udp:Fixture::SetupTransport::Tcp,
+        Fixture::KeyVideo::Immediate,0,2,true);
+    VideoWidget widget;widget.setShowSpectrum(true);PlayerController player;player.setVideoWidget(&widget);
+    const auto request=player.requestOpen(*createStableRtspSource(server.url(),udp?RtspTransport::Udp:RtspTransport::Tcp).source);
+    waitInQt([&]{const auto s=player.getPlaybackSnapshot();return s.state==PlaybackState::Playing&&s.network_stats&&
+        s.network_stats->last_audio_output_age_seconds&&s.network_stats->last_video_output_age_seconds;},4s,"short-pause fixture never produced both tracks");
+    const auto before=player.getPlaybackSnapshot();
+    if(gap){server.setTrackStalled(true,true);server.setTrackStalled(false,true);}else server.setMediaPaused(true);
+    remainsInQt([&]{const auto s=player.getPlaybackSnapshot();return s.request_id==request&&s.connection_attempt_id==1&&
+        (s.state==PlaybackState::Playing||s.state==PlaybackState::Buffering)&&!s.last_error&&s.network_stats->reconnect_attempts==0;},2080ms,
+        "two-second media pause tore down an otherwise connected source");
+    const auto stalled=player.getPlaybackSnapshot();
+    const auto packets=server.sentAudioPackets()+server.sentVideoPackets();
+    if(gap){server.setTrackStalled(true,false);server.setTrackStalled(false,false);}else server.setMediaPaused(false);
+    waitInQt([&]{const auto s=player.getPlaybackSnapshot();
+        require(s.state!=PlaybackState::Reconnecting&&s.state!=PlaybackState::Failed&&s.connection_attempt_id==1,
+            "short media gap forced recovery instead of restoring the same connection");
+        return s.request_id==request&&s.state==PlaybackState::Playing&&s.current_seconds>stalled.current_seconds+.4&&
+            server.sentAudioPackets()+server.sentVideoPackets()>packets+20&&
+            s.network_stats->last_audio_output_age_seconds.value_or(10)<.2&&s.network_stats->last_video_output_age_seconds.value_or(10)<.2;
+    },5s,"same connection did not restore fresh PCM and video after two-second pause");
+    const auto resumed=player.getPlaybackSnapshot();
+    require(snapshotEpoch(resumed)==snapshotEpoch(before)&&resumed.network_stats->queue_full_events==0&&
+        resumed.network_stats->oversized_packet_events==0&&resumed.network_stats->reconnect_attempts==0&&
+        resumed.network_stats->audio_clock_reanchors==(gap?1u:0u)&&
+        server.sentAudioPackets()+server.sentVideoPackets()>packets+20&&server.acceptedConnections()==1,
+        "short pause mixed failure counters, used a retry or relied on old buffered output");
+    player.stopAsync();waitInQt([&]{return !player.getPlaybackSnapshot().is_session_active&&server.activeRemoteSessions()==0;},2s,
+        "short pause source did not stop cleanly");
+    std::cout<<"short_media_pause="<<mode<<" held_ms=2080 same_request_attempt_generation=1 fresh_PCM_video=1 retries=0 Full=0\n";
+    return 0;
+}
+
+// 同连接分别产生同步迟到帧和真正损坏的解码帧，核对两类计数不混入 Full 或自动重试。
+int testLiveFrameCategories(bool udp)
+{
+    if(!hasDefaultRenderEndpoint())return 77;
+    using Fixture=RtspBlackhole;
+    Fixture server(Fixture::StartupMedia::AudioVideo,testRtspAddress(),udp?Fixture::SetupTransport::Udp:Fixture::SetupTransport::Tcp,
+        Fixture::KeyVideo::Immediate,0,1,true);
+    VideoWidget widget;widget.setShowSpectrum(true);PlayerController player;player.setVideoWidget(&widget);
+    const auto request=player.requestOpen(*createStableRtspSource(server.url(),udp?RtspTransport::Udp:RtspTransport::Tcp).source);
+    waitInQt([&]{return player.getPlaybackSnapshot().state==PlaybackState::Playing;},4s,"frame classification fixture did not output");
+    server.setVideoSignal(Fixture::VideoSignal::Late);
+    remainsInQt([&]{return player.getPlaybackSnapshot().connection_attempt_id==1;},1800ms,"late frames caused reconnect");
+    const auto late=player.getPlaybackSnapshot();
+    std::cout<<"late_frame_probe transport="<<(udp?"UDP":"TCP")<<" sync_drop="<<late.stats.dropped_frames_total
+        <<" corrupt="<<late.network_stats->corrupt_frames_skipped<<" Full="<<late.network_stats->queue_full_events<<'\n';
+    require(late.stats.dropped_frames_total>=5&&late.network_stats->corrupt_frames_skipped==0&&
+        late.network_stats->queue_full_events==0&&late.network_stats->reconnect_attempts==0,
+        "synchronization drops were mislabeled as damaged frames, queue limits or retries");
+    server.setVideoSignal(Fixture::VideoSignal::Normal);
+    waitInQt([&]{return player.getPlaybackSnapshot().network_stats->last_video_output_age_seconds.value_or(10)<.15;},2s,
+        "valid video did not resume after late packets");
+    const auto before_corrupt=player.getPlaybackSnapshot();
+    server.setVideoSignal(Fixture::VideoSignal::Corrupt);
+    remainsInQt([&]{return player.getPlaybackSnapshot().connection_attempt_id==1;},1800ms,"corrupt frames caused reconnect");
+    const auto corrupt=player.getPlaybackSnapshot();
+    std::cout<<"frame_category_probe transport="<<(udp?"UDP":"TCP")<<" sync_drop="<<corrupt.stats.dropped_frames_total
+        <<" corrupt_skipped="<<corrupt.network_stats->corrupt_frames_skipped<<" Full="<<corrupt.network_stats->queue_full_events<<'\n';
+    require(corrupt.network_stats->corrupt_frames_skipped>=5&&corrupt.stats.dropped_frames_total==before_corrupt.stats.dropped_frames_total&&
+        corrupt.network_stats->queue_full_events==0&&corrupt.network_stats->oversized_packet_events==0&&
+        corrupt.network_stats->reconnect_attempts==0,
+        "decoded corrupt frames did not have a distinct counter or changed sync-drop/retry counts");
+    server.setVideoSignal(Fixture::VideoSignal::Normal);
+    waitInQt([&]{const auto v=player.getPlaybackSnapshot();return v.request_id==request&&v.state==PlaybackState::Playing&&
+        v.network_stats->last_video_output_age_seconds.value_or(10)<.15;},2s,"valid IDR did not recover after damaged samples");
+    player.stopAsync();waitInQt([&]{return !player.getPlaybackSnapshot().is_session_active&&server.activeRemoteSessions()==0;},2s,
+        "frame category fixture leaked resources");
+    std::cout<<"frame_categories_transport="<<(udp?"UDP":"TCP")<<" actual_sync_drops=1 actual_corrupt_decode_skips=1 queue_retry_counts_unchanged=1\n";
+    return 0;
+}
+
 // 一轨瞬发导致 Full，另一轨队列仍很小；所有自动连接共享原预算，不能无限重试。
 int testLiveQueueLimit(std::string_view mode)
 {
@@ -1078,6 +1158,109 @@ int testQueueRecoveryCancellation()
     }
     std::cout<<"Full_backoff_cancel=pause,stop,switch,shutdown UDP_remote_released=1 old_request_revived=0\n";
     return 0;
+}
+
+// 实际打开/探测/读包黑洞分别重复四次，不能把阶段超时丢成 EOF，也不能无界重试。
+void testFaultBlackhole(std::string_view mode)
+{
+    using Fixture=RtspBlackhole;using Stage=Fixture::StallAt;
+    const bool udp=mode.find("udp")!=std::string_view::npos;
+    const auto stage=mode.find("-open-")!=std::string_view::npos?Stage::OpenInput:
+        mode.find("-probe-")!=std::string_view::npos?Stage::ProbeStreams:Stage::VideoReadPacket;
+    Fixture server(std::vector<Stage>(4,stage),testRtspAddress(),udp?Fixture::SetupTransport::Udp:Fixture::SetupTransport::Tcp);
+    VideoWidget widget;widget.setShowSpectrum(true);PlayerController player;player.setVideoWidget(&widget);
+    const auto start=Clock::now();
+    const auto request=player.requestOpen(*createStableRtspSource(server.url(),udp?RtspTransport::Udp:RtspTransport::Tcp).source);
+    PlaybackSnapshot failed;
+    waitInQt([&]{failed=player.getPlaybackSnapshot();return failed.request_id==request&&failed.state==PlaybackState::Failed&&
+        !failed.is_session_active;},36s,"four real blackholes did not terminate within count budget");
+    const auto& stats=*failed.network_stats;
+    bool phase_ok=false;
+    if(stage==Stage::VideoReadPacket){
+        const auto* error=failed.last_error?std::get_if<MediaReadResult>(&*failed.last_error):nullptr;
+        phase_ok=error&&error->status==MediaReadStatus::Timeout&&error->stage==MediaReadStage::ReadPacket;
+    }else{
+        const auto* error=failed.last_error?std::get_if<MediaOpenResult>(&*failed.last_error):nullptr;
+        phase_ok=error&&error->status==MediaOpenStatus::Timeout&&error->stage==
+            (stage==Stage::OpenInput?MediaOpenStage::OpenInput:MediaOpenStage::ProbeStreams);
+    }
+    require(phase_ok&&stats.last_failure_reason==LiveFailureReason::IoTimeout&&stats.reconnect_attempts==3&&
+        stats.recovery_stop_reason==RecoveryStopReason::AttemptsExhausted&&stats.queue_full_events==0&&
+        stats.oversized_packet_events==0&&stats.corrupt_frames_skipped==0&&failed.stats.dropped_frames_total==0&&
+        Clock::now()-start>=26s&&server.acceptedConnections()==4,"blackhole stage/counters/budget classification changed");
+    waitInQt([&]{return server.closedConnections()==4&&server.activeRemoteSessions()==0;},1s,"blackhole left remote media session");
+    std::cout<<"fault_matrix="<<mode<<" terminal=count-budget typed_stage_timeout=1 real_extra_attempts=3 elapsed_ms="
+        <<std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-start).count()<<" unrelated_counters=0 remote_sessions=0\n";
+}
+
+// 401/403 是明确终态；404/429 暂时响应后同一用户请求仍能接入后来发布的真实视频。
+void testFaultResponses(bool udp)
+{
+    using Fixture=RtspBlackhole;using Stage=Fixture::StallAt;
+    VideoWidget widget;widget.setShowSpectrum(true);PlayerController player;player.setVideoWidget(&widget);
+    const auto transport=udp?RtspTransport::Udp:RtspTransport::Tcp;
+    for(const auto status:{Stage::Unauthorized,Stage::RejectOpen}){
+        Fixture server(status);
+        player.requestOpen(*createStableRtspSource(server.url()+"?token=MediaStudioSecretFaultMatrix",transport).source);
+        waitInQt([&]{const auto s=player.getPlaybackSnapshot();return s.state==PlaybackState::Failed&&!s.is_session_active;},3s,
+            "permanent RTSP denial did not terminate");
+        const auto denied=player.getPlaybackSnapshot();
+        require(denied.last_error&&std::holds_alternative<MediaOpenResult>(*denied.last_error)&&
+            denied.network_stats->last_failure_reason==LiveFailureReason::AccessDenied&&denied.network_stats->reconnect_attempts==0&&
+            denied.network_stats->recovery_stop_reason==RecoveryStopReason::FatalFailure&&server.acceptedConnections()==1,
+            "401/403 retried or lost its raw open error");
+    }
+    for(const auto status:{Stage::NotPublished,Stage::TemporarilyBusy}){
+        Fixture server({status,status,Stage::VideoReadPacket},testRtspAddress(),udp?Fixture::SetupTransport::Udp:Fixture::SetupTransport::Tcp);
+        const auto start=Clock::now();
+        const auto request=player.requestOpen(*createStableRtspSource(server.url()+"?token=MediaStudioSecretFaultMatrix",transport).source);
+        waitInQt([&]{const auto s=player.getPlaybackSnapshot();return s.state==PlaybackState::Reconnecting&&
+            s.network_stats->last_failure_reason==LiveFailureReason::ConnectionFailure;},3s,"404/429 classified as permanent");
+        waitInQt([&]{const auto s=player.getPlaybackSnapshot();return s.request_id==request&&s.connection_attempt_id==3&&
+            s.state==PlaybackState::Playing&&s.has_current_video_output;},7s,"source did not become playable after 404/429");
+        const auto recovered=player.getPlaybackSnapshot();
+        require(recovered.network_stats->reconnect_attempts==2&&recovered.network_stats->queue_full_events==0&&
+            recovered.network_stats->corrupt_frames_skipped==0&&recovered.stats.dropped_frames_total==0&&
+            !recovered.last_error&&Clock::now()-start>=3s&&server.acceptedConnections()==3,
+            "temporary responses altered user request, event counters or retry schedule");
+        player.stopAsync();waitInQt([&]{return !player.getPlaybackSnapshot().is_session_active&&server.activeRemoteSessions()==0;},2s,
+            "restored transient response source did not stop");
+    }
+    std::cout<<"fault_responses_transport="<<(udp?"UDP":"TCP")<<" 401_403_fatal_no_retry=1 404_429_source_later_ready=1 request_preserved=1\n";
+}
+
+// 在真实连接上观察完整 45 秒：两次短暂恢复不清预算，最后 4 秒候选退避被总期限截断。
+void testRealRecoveryTimeBudget()
+{
+    using Fixture=RtspBlackhole;
+    Fixture server(Fixture::StartupMedia::Video,testRtspAddress(),Fixture::SetupTransport::Tcp,
+        Fixture::KeyVideo::Immediate,0,4,true,60s);
+    VideoWidget widget;widget.setShowSpectrum(true);PlayerController player;player.setVideoWidget(&widget);
+    const auto request=player.requestOpen(*createStableRtspSource(server.url(),RtspTransport::Tcp).source);
+    const auto playing=[&](std::uint64_t attempt){const auto s=player.getPlaybackSnapshot();return s.request_id==request&&
+        s.connection_attempt_id==attempt&&s.state==PlaybackState::Playing&&s.has_current_video_output;};
+    waitInQt([&]{return playing(1);},4s,"real time-budget fixture did not open");
+    server.disconnectCurrent();
+    waitInQt([&]{return player.getPlaybackSnapshot().state==PlaybackState::Reconnecting;},2s,"first failure did not start real budget");
+    const auto budget_start=Clock::now();
+    waitInQt([&]{return playing(2);},5s,"first real retry did not output");
+    remainsInQt([&]{return playing(2)&&player.getPlaybackSnapshot().network_stats->recovery_retries_used==1;},
+        std::max(Clock::duration::zero(),budget_start+21s-Clock::now()),"first brief recovery incorrectly stopped or restored budget");
+    server.disconnectCurrent();
+    waitInQt([&]{return playing(3);},6s,"second real retry did not output");
+    remainsInQt([&]{return playing(3)&&player.getPlaybackSnapshot().network_stats->recovery_retries_used==2;},
+        std::max(Clock::duration::zero(),budget_start+42500ms-Clock::now()),"second brief recovery incorrectly restored budget");
+    server.disconnectCurrent();
+    PlaybackSnapshot failed;
+    waitInQt([&]{failed=player.getPlaybackSnapshot();return failed.state==PlaybackState::Failed&&!failed.is_session_active;},5s,
+        "last backoff candidate outlived real 45-second recovery budget");
+    const auto elapsed=Clock::now()-budget_start;
+    require(elapsed>=44s&&elapsed<47s&&failed.network_stats->reconnect_attempts==2&&
+        failed.network_stats->recovery_retries_used==2&&failed.network_stats->recovery_stop_reason==RecoveryStopReason::DeadlineExceeded&&
+        failed.network_stats->queue_full_events==0&&server.acceptedConnections()==3&&server.activeRemoteSessions()==0,
+        "real elapsed budget restarted, unstarted attempt was counted or resources remained");
+    std::cout<<"real_recovery_time_budget_ms="<<std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+        <<" brief_recoveries=2 actual_extra_attempts=2 clipped_unstarted_candidate=1 terminal=time-budget\n";
 }
 
 // 404 允许有限重试，403 和关闭自动选项则直接停止；候选等待不能冒充实际启动次数。
@@ -1184,13 +1367,13 @@ void testRecoveryCancellation()
 }
 
 // 单轨停止发送时，另一轨仍真实发包；不能用全连接读取超时冒充分轨输出保护。
-int testTrackOutputStall(bool audio_stall)
+int testTrackOutputStall(bool audio_stall, bool udp)
 {
     if (!hasDefaultRenderEndpoint()) return 77;
     using Fixture = RtspBlackhole;
-    const auto transport = audio_stall ? RtspTransport::Tcp : RtspTransport::Udp;
+    const auto transport = udp ? RtspTransport::Udp : RtspTransport::Tcp;
     Fixture server(Fixture::StartupMedia::AudioVideo, testRtspAddress(),
-        audio_stall ? Fixture::SetupTransport::Tcp : Fixture::SetupTransport::Udp,
+        udp ? Fixture::SetupTransport::Udp : Fixture::SetupTransport::Tcp,
         Fixture::KeyVideo::Immediate, 0, 2, true);
     VideoWidget widget;
     widget.setShowSpectrum(true);
@@ -1759,6 +1942,40 @@ void testWindowLiveControls()
     std::cout << "window_live_pause_continue_removed_row=1 return_button_reconnect=1 repeated_return_close=1\n";
 }
 
+// 暂时断供先显示缓冲而不重连，恢复后回到播放；缓冲中的真实暂停按钮仍可取消会话。
+void testWindowTransientBuffering()
+{
+    using Fixture=RtspBlackhole;
+    Fixture server(Fixture::StartupMedia::Video,testRtspAddress(),Fixture::SetupTransport::Tcp,
+        Fixture::KeyVideo::Immediate,0,1,true);
+    TestWindow window;auto& view=*window.view;
+    MainWindowNetworkTestAccess::openListed(view,*createStableRtspSource(server.url(),RtspTransport::Tcp).source);
+    const auto request=MainWindowCloseTestAccess::snapshot(view).request_id;
+    waitInQt([&]{const auto s=MainWindowCloseTestAccess::snapshot(view);return s.state==PlaybackState::Playing&&
+        s.has_current_video_output;},4s,"buffering UI fixture did not output");
+    const auto pause_and_wait=[&]{server.setMediaPaused(true);waitInQt([&]{
+        const auto s=MainWindowCloseTestAccess::snapshot(view);
+        return s.request_id==request&&s.connection_attempt_id==1&&s.state==PlaybackState::Buffering&&
+            !s.is_playing&&s.is_session_active&&!s.last_error&&s.network_stats->reconnect_attempts==0&&
+            MainWindowNetworkTestAccess::controls(view).metadata.contains(QString::fromUtf8(u8"输出中断，等待恢复"))&&
+            view.statusBar()->currentMessage().contains(QString::fromUtf8(u8"缓冲"));
+    },3500ms,"window did not show transient buffering independently of reconnect");};
+    pause_and_wait();
+    const auto buffered=MainWindowCloseTestAccess::snapshot(view);
+    server.setMediaPaused(false);
+    waitInQt([&]{const auto s=MainWindowCloseTestAccess::snapshot(view);return s.request_id==request&&
+        s.state==PlaybackState::Playing&&s.is_playing&&s.current_seconds>buffered.current_seconds+.2&&
+        s.network_stats->last_video_output_age_seconds.value_or(10)<.2&&s.network_stats->reconnect_attempts==0;},3s,
+        "transient buffering did not recover Playing from actual current video output");
+    pause_and_wait();
+    require(QMetaObject::invokeMethod(&view,"togglePlayPause",Qt::DirectConnection),"actual buffering pause action missing");
+    waitInQt([&]{const auto s=MainWindowCloseTestAccess::snapshot(view);return s.state==PlaybackState::Paused&&
+        !s.is_session_active&&server.activeRemoteSessions()==0;},2s,"buffering presentation prevented backend pause cancellation");
+    remainsInQt([&]{return server.acceptedConnections()==1;},1100ms,"paused buffering window revived source");
+    closeWindow(window.view,request,"transient-buffering");
+    std::cout<<"window_buffering=1 no_reconnect=1 actual_video_restored_Playing=1 buffering_pause_cancels=1\n";
+}
+
 // 关闭自动选项时 Full 直接失败，窗口显示明确原因、独立计数和排队 payload/跨度。
 int testWindowQueueFailure()
 {
@@ -1955,12 +2172,18 @@ int main(int argc, char* argv[])
         else if (mode == "mixed-switch-tcp" || mode == "mixed-switch-udp") return testMixedSwitchStress(mode == "mixed-switch-udp");
         else if (mode == "live-failures-tcp" || mode == "live-failures-udp") testLiveFailures(mode == "live-failures-udp");
         else if (mode.substr(0, 13) == "live-recover-") return testAutomaticRecovery(mode);
+        else if (mode.substr(0, 21) == "live-fault-blackhole-") testFaultBlackhole(mode);
+        else if (mode == "live-fault-responses-tcp" || mode == "live-fault-responses-udp") testFaultResponses(mode.find("udp") != std::string_view::npos);
+        else if (mode == "live-real-time-budget") testRealRecoveryTimeBudget();
+        else if (mode == "live-frame-categories-tcp" || mode == "live-frame-categories-udp") return testLiveFrameCategories(mode.find("udp") != std::string_view::npos);
+        else if (mode.substr(0, 12) == "live-jitter-") return testShortMediaPause(mode);
         else if (mode.substr(0, 11) == "live-queue-") { if (mode == "live-queue-cancel") return testQueueRecoveryCancellation(); return testLiveQueueLimit(mode); }
         else if (mode == "live-oversized-video-tcp") testOversizedLivePacket();
+        else if (mode == "window-transient-buffering") testWindowTransientBuffering();
         else if (mode == "window-queue-failure") return testWindowQueueFailure();
         else if (mode == "live-recovery-budget") testRecoveryBudgetIntegration();
         else if (mode == "live-recovery-cancel") testRecoveryCancellation();
-        else if (mode == "live-stall-audio" || mode == "live-stall-video") return testTrackOutputStall(mode == "live-stall-audio");
+        else if (mode.substr(0, 11) == "live-stall-") return testTrackOutputStall(mode.find("audio") != std::string_view::npos, mode.find("udp") != std::string_view::npos || mode == "live-stall-video");
         else if (mode == "live-recovery-metadata") return testRecoveryMetadata();
         else if (mode == "live-command-races") testLiveCommandRaces();
         else if (mode.substr(0, 11) == "live-start-") return testLiveStartup(mode);
