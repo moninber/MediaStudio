@@ -70,16 +70,18 @@ bool canTogglePlayback(const PlaybackSnapshot& snapshot)
 }
 
 // 直播只使用固定标签，禁止将原地址、账号、查询参数填入任何展示控件。
-QString rtspLabel(RtspTransport transport)
+QString rtspLabel(RtspTransport transport, LivePreset preset = LivePreset::Stable)
 {
-    return transport == RtspTransport::Udp ? "RTSP/UDP · 稳定" : "RTSP/TCP · 稳定";
+    return QString("RTSP/%1 · %2").arg(transport == RtspTransport::Udp ? "UDP" : "TCP",
+        preset == LivePreset::LowLatency ? "低延迟" : "稳定");
 }
 
 QString playbackDisplayLabel(const PlaybackSnapshot& snapshot)
 {
     if (snapshot.source_kind == PlaybackSourceKind::NetworkLive) {
         if (snapshot.protocol == PlaybackProtocol::Rtsp && snapshot.rtsp_transport) {
-            return rtspLabel(*snapshot.rtsp_transport);
+            return rtspLabel(*snapshot.rtsp_transport,
+                snapshot.network_stats ? snapshot.network_stats->preset : LivePreset::Stable);
         }
         return "网络直播";
     }
@@ -1121,6 +1123,9 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
                 : "<p>已断开直播。继续时重新接入最新内容。</p>";
         }
         const auto stats = snapshot.network_stats.value_or(NetworkPlaybackStats{});
+        if (stats.udp_receive) info_text += QString("<p>UDP 重排: %1 ms · %2 包</p>")
+            .arg(std::chrono::duration<double, std::milli>(stats.udp_receive->max_delay).count(), 0, 'f', 0)
+            .arg(stats.udp_receive->reorder_packets);
         info_text += QString("<p>连接尝试: %1 · 自动重试累计: %2<br>本轮已用: %3/3 · 自动重连: %4</p>")
             .arg(stats.reconnect_attempts + 1).arg(stats.reconnect_attempts).arg(stats.recovery_retries_used)
             .arg(stats.auto_reconnect_enabled ? "开" : "关");
@@ -1172,6 +1177,19 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
         info_text += QString("<p>时长: %1秒</p>").arg(info.duration, 0, 'f', 1);
     }
 
+    if (snapshot.audio_output) {
+        const auto& output = *snapshot.audio_output;
+        info_text += QString("<p><b>声卡缓冲（最近初始化）</b><br>原始请求: %1 ms · 实际尝试: %2 ms</p>")
+            .arg(output.requested.count()).arg(output.attempted.count());
+        if (output.capacity_seconds) info_text += QString("<p>设备容量: %1 ms（%2 帧 / %3 Hz）</p>")
+            .arg(*output.capacity_seconds * 1000.0, 0, 'f', 1).arg(output.device_frames).arg(output.sample_rate);
+        else info_text += "<p>设备容量: 未取得</p>";
+        if (output.usedFallback()) info_text += QString("<p>%1 ms 请求失败，已回退 %2 ms。</p>")
+            .arg(output.requested.count()).arg(output.attempted.count());
+        else if (output.attempts > 1 && !output.initialized) info_text += "<p>回退仍失败。</p>";
+        if (output.first_error) info_text += QString("<p>首次初始化错误: 0x%1</p>")
+            .arg(static_cast<quint32>(*output.first_error), 8, 16, QLatin1Char('0'));
+    }
     if (info.has_video) {
         info_text += "<hr><h4>视频</h4>";
         info_text += QString("<p>编码: %1</p>").arg(QString::fromStdString(info.video_info.codec_name).toHtmlEscaped());
@@ -1373,7 +1391,7 @@ int MainWindow::appendPlaylistEntry(PlaybackSource source)
     if (isClosing() || !source.isValid()) return -1;
     QString label;
     if (source.kind() == PlaybackSourceKind::NetworkLive && source.protocol() == PlaybackProtocol::Rtsp) {
-        label = rtspLabel(source.liveOptions()->rtsp_transport) +
+        label = rtspLabel(source.liveOptions()->rtsp_transport, source.liveOptions()->preset) +
                 QString(" #%1").arg(next_network_playlist_number_++);
     } else {
         label = QString::fromStdString(source.displayName());

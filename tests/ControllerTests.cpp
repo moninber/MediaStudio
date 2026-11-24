@@ -105,6 +105,13 @@ struct MainWindowNetworkTestAccess {
     // 读取控制器保存的本地首选速度，和当前源的播放能力独立验证。
     static float preferredSpeed(const MainWindow& window) { return window.player_->getSpeed(); }
 
+    // 同步渲染指定的按值诊断历史，检查回退文案；设备回退本身另由真实 COM 代理测试覆盖。
+    static QString renderMetadata(MainWindow& window, const PlaybackSnapshot& snapshot)
+    {
+        window.updateMediaInfoPanel(snapshot);
+        return window.text_media_info_->toPlainText();
+    }
+
     // 复用列表生产入口，避免测试另行维护“当前直播源”。
     static void openListed(MainWindow& window, const PlaybackSource& source)
     {
@@ -1494,6 +1501,7 @@ int testLiveStartup(std::string_view mode)
     const bool native = mode == "live-start-native";
     const bool no_key = mode == "live-start-no-key";
     const bool offset_start = mode == "live-start-av-offset-tcp";
+    const bool low = mode.find("-low-") != std::string_view::npos;
     const auto media = mode.find("-av-") != std::string_view::npos ? Fixture::StartupMedia::AudioVideo
         : mode.find("-audio-") != std::string_view::npos ? Fixture::StartupMedia::Audio : Fixture::StartupMedia::Video;
     const bool audio = media != Fixture::StartupMedia::Video;
@@ -1513,17 +1521,19 @@ int testLiveStartup(std::string_view mode)
     }
     const auto expected_transport = udp ? Fixture::SetupTransport::Udp : Fixture::SetupTransport::Tcp;
     const auto key_video = no_key ? Fixture::KeyVideo::NeverSend
-        : video && !offset_start ? Fixture::KeyVideo::AwaitRelease : Fixture::KeyVideo::Immediate;
-    Fixture server(media, testRtspAddress(), expected_transport, key_video, offset_start ? 8 : 0);
+        : video && !offset_start && !low ? Fixture::KeyVideo::AwaitRelease : Fixture::KeyVideo::Immediate;
+    // 低延迟正常起播按真实节奏供包；旧有限夹具瞬发约两秒音频，应当被 750 ms 限界拒收。
+    Fixture server(media, testRtspAddress(), expected_transport, key_video, offset_start ? 8 : 0, 1, low);
     PlayerController player;
     player.setVideoWidget(&widget);
-    const auto source = createStableRtspSource(server.url(), udp ? RtspTransport::Udp : RtspTransport::Tcp, false);
-    require(source.source.has_value(), "fixture playback source failed validation");
+    const auto source = PlaybackSource::networkLive(server.url(),
+        {udp ? RtspTransport::Udp : RtspTransport::Tcp, low ? LivePreset::LowLatency : LivePreset::Stable, false});
+    require(source.isValid(), "fixture playback source failed validation");
     const auto started = Clock::now();
-    const auto request = player.requestOpen(*source.source);
+    const auto request = player.requestOpen(source);
     require(request > 0, "live supervisor rejected the fixture request");
 
-    if (video && !offset_start) {
+    if (video && !offset_start && !low) {
         PlaybackSnapshot waiting;
         waitInQt([&] {
             waiting = player.getPlaybackSnapshot();
@@ -1617,6 +1627,86 @@ int testLiveStartup(std::string_view mode)
     player.shutdown();
     waitInQt([&] { return !server.isHoldingConnection(); }, 1s, "live fixture peer did not observe disconnect");
     return 0;
+}
+
+// 内部测试入口核对四组参数真正到达音频线程；暂停保留历史，切到无音轨文件必须清掉历史。
+int testLiveBufferPresets()
+{
+    if (!hasDefaultRenderEndpoint()) return 77;
+    using Fixture = RtspBlackhole;
+    const VideoFixtures files;
+    VideoWidget widget;
+    PlayerController player;
+    player.setVideoWidget(&widget);
+    for (const auto preset : {LivePreset::Stable, LivePreset::LowLatency}) {
+        for (const auto transport : {RtspTransport::Tcp, RtspTransport::Udp}) {
+            const bool low = preset == LivePreset::LowLatency;
+            const bool udp = transport == RtspTransport::Udp;
+            Fixture server(Fixture::StartupMedia::Audio, testRtspAddress(),
+                udp ? Fixture::SetupTransport::Udp : Fixture::SetupTransport::Tcp,
+                Fixture::KeyVideo::Immediate, 0, 1, true);
+            const auto request = player.requestOpen(PlaybackSource::networkLive(server.url(), {transport, preset, false}));
+            PlaybackSnapshot output;
+            waitInQt([&] {
+                output = player.getPlaybackSnapshot();
+                return output.request_id == request && output.state == PlaybackState::Playing && output.audio_output &&
+                    output.network_stats && output.network_stats->first_pcm_seconds;
+            }, 4s, "preset was not carried to actual PCM output");
+            const auto& audio = *output.audio_output;
+            require(audio.initialized && audio.requested == (low ? 100ms : 350ms) && audio.capacity_seconds &&
+                audio.device_frames > 0 && audio.sample_rate > 0 &&
+                std::abs(*audio.capacity_seconds - static_cast<double>(audio.device_frames) / audio.sample_rate) < 1e-12 &&
+                output.network_stats->preset == preset && output.network_stats->udp_receive.has_value() == udp,
+                "controller published requested buffer as capacity or stale protocol/preset");
+            require(player.pause() == request, "live pause failed");
+            waitInQt([&] { const auto stopped = player.getPlaybackSnapshot(); return stopped.state == PlaybackState::Paused &&
+                !stopped.is_session_active && server.activeRemoteSessions() == 0; }, 2s, "preset pause left active resources");
+            require(player.getPlaybackSnapshot().audio_output->device_frames == audio.device_frames,
+                "pause erased last measured buffer history");
+            const auto local = player.requestOpen(PlaybackSource::localFile(files.first().u8string()));
+            const auto local_output = waitForVideo(player, local, 64);
+            require(!local_output.audio_output && !local_output.network_stats && audio.requested == (low ? 100ms : 350ms),
+                "old audio/network history leaked into a new silent file or snapshot copy mutated");
+            std::cout << "controller_preset=" << (low ? "low" : "stable") << " UDP=" << udp
+                << " requested_ms=" << audio.requested.count() << " actual_capacity_ms=" << *audio.capacity_seconds * 1000
+                << " real_PCM=1 pause_released=1 source_history_reset=1\n";
+        }
+    }
+    player.shutdown();
+    return 0;
+}
+
+// 明确区分请求、实际容量、回退成功和回退失败；测试输入是诊断历史，不伪装硬件故障。
+void testWindowAudioBufferReport()
+{
+    TestWindow window;
+    PlaybackSnapshot snapshot;
+    snapshot.source_kind = PlaybackSourceKind::NetworkLive;
+    snapshot.protocol = PlaybackProtocol::Rtsp;
+    snapshot.network_stats.emplace();
+    snapshot.network_stats->preset = LivePreset::LowLatency;
+    snapshot.rtsp_transport = RtspTransport::Udp;
+    snapshot.network_stats->udp_receive = RtspUdpReceiveSettings{100ms, 128};
+    snapshot.audio_output = AudioBufferReport{100ms, 350ms, 2, true, false,
+        static_cast<std::int32_t>(E_FAIL), {}, 15435, 44100, .35};
+    const auto rendered = MainWindowNetworkTestAccess::renderMetadata(*window.view, snapshot);
+    require(rendered.contains(QString::fromUtf8(u8"低延迟")) &&
+        rendered.contains(QString::fromUtf8(u8"原始请求: 100 ms")) &&
+        rendered.contains(QString::fromUtf8(u8"设备容量: 350.0 ms")) &&
+        rendered.contains(QString::fromUtf8(u8"已回退 350 ms")) && rendered.contains("15435") && rendered.contains("80004005"),
+        "window hid actual capacity/fallback or claimed 100 ms succeeded");
+    snapshot.audio_output->initialized = false;
+    snapshot.audio_output->device_frames = 0;
+    snapshot.audio_output->capacity_seconds.reset();
+    const auto failed = MainWindowNetworkTestAccess::renderMetadata(*window.view, snapshot);
+    require(failed.contains(QString::fromUtf8(u8"回退仍失败")) && failed.contains(QString::fromUtf8(u8"设备容量: 未取得")) &&
+        !failed.contains(QString::fromUtf8(u8"已回退")), "failed fallback advertised successful low latency");
+    snapshot.audio_output.reset();
+    snapshot.network_stats.reset();
+    snapshot.source_kind = PlaybackSourceKind::LocalFile;
+    require(!MainWindowNetworkTestAccess::renderMetadata(*window.view, snapshot).contains(QString::fromUtf8(u8"声卡缓冲")),
+        "old buffer history remained in the next source panel");
+    std::cout << "window_actual_capacity_fallback_and_failure=1 diagnostic_input_only=1 history_reset=1\n";
 }
 
 // 检查已接到关窗命令的快照中不再有旧源标记或可显示内容。
@@ -2155,6 +2245,8 @@ int main(int argc, char* argv[])
         QApplication app(argc, argv);
         app.setQuitOnLastWindowClosed(false);
         if (mode == "controller-local") testControllerLocal();
+        else if (mode == "live-buffer-presets") return testLiveBufferPresets();
+        else if (mode == "window-audio-buffer-report") testWindowAudioBufferReport();
         else if (mode == "controller-supersede") testControllerSupersede();
         else if (mode == "controller-blocked-read") testControllerBlockedRead();
         else if (mode == "window-close-open") testWindowCloseRtsp(RtspBlackhole::StallAt::OpenInput, "open");

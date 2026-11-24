@@ -121,6 +121,8 @@ public:
     // 返回会话打开时按值缓存的 time_base，不在队列统计中跨线程读取 AVStream。
     AVRational audioPacketTimeBase() const noexcept { return audio_time_base_; }
     AVRational videoPacketTimeBase() const noexcept { return video_time_base_; }
+    // 打开时核对运行中 FFmpeg 实际采用的 UDP 参数；GUI 只取副本，不访问格式上下文。
+    std::optional<RtspUdpReceiveSettings> udpReceiveSettings() const noexcept { return udp_receive_settings_; }
     int getOutputAudioSampleRate() const { return TARGET_SAMPLE_RATE; }
     int getOutputAudioChannels() const { return TARGET_CHANNELS; }
 
@@ -142,6 +144,7 @@ private:
     AVFormatContext* format_ctx_;     // 由 supervisor 独占，解码线程不访问 AVStream。
     std::shared_ptr<MediaIoControl> io_; // FFmpeg 回调使用的对象，在关闭封装后释放。
     std::chrono::milliseconds read_timeout_{0};
+    std::optional<RtspUdpReceiveSettings> udp_receive_settings_;
     bool network_input_ = false;
     bool read_deadline_active_ = false; // Again 和跳过非选中包沿用同一次读取的期限。
     AVCodecContext* video_codec_ctx_; // 视频解码器上下文

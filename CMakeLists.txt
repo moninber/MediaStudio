@@ -60,6 +60,7 @@ set(MEDIASTUDIO_HEADERS
     src/MediaInfo.h
     src/MediaDecoder.h
     src/AudioOutput.h
+    src/AudioBufferSettings.h
     src/VideoRenderer.h
     src/AudioVisualizer.h
     src/MediaTranscoder.h
@@ -179,7 +180,7 @@ if(BUILD_TESTING)
 
     # 测试可直接从构建目录运行，不依赖播放器部署步骤或已配置的全局 PATH。
     get_filename_component(mediastudio_compiler_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
-    foreach(test_case IN ITEMS contracts local-file rtsp-cancel rtsp-timeout rtsp-stable rtsp-recovery-deadline)
+    foreach(test_case IN ITEMS contracts local-file rtsp-cancel rtsp-timeout rtsp-stable rtsp-presets rtsp-recovery-deadline)
         add_test(NAME MediaStudio.Playback.${test_case} COMMAND MediaStudioPlaybackTests ${test_case})
         set_tests_properties(MediaStudio.Playback.${test_case} PROPERTIES TIMEOUT 18)
         if(WIN32)
@@ -210,7 +211,22 @@ if(BUILD_TESTING)
         endif()
     endforeach()
 
-    # 恢复策略只依赖单调时间值；不启动窗口、声卡或真实网络，也不等待真实的 45 秒。
+    if(WIN32)
+        # 真实 WASAPI 容量/PCM 与一次性故障注入；检查失败客户端释放后才创建回退客户端。
+        add_executable(MediaStudioAudioTests tests/AudioOutputTests.cpp src/AudioOutput.cpp)
+        set_target_properties(MediaStudioAudioTests PROPERTIES AUTOMOC OFF RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+        target_include_directories(MediaStudioAudioTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(MediaStudioAudioTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_link_libraries(MediaStudioAudioTests PRIVATE ole32 uuid)
+        foreach(test_case IN ITEMS default low fallback fallback-fails fallback-cancel invalid format-failure)
+            set(test_name MediaStudio.Audio.${test_case})
+            add_test(NAME ${test_name} COMMAND MediaStudioAudioTests ${test_case})
+            set_tests_properties(${test_name} PROPERTIES TIMEOUT 10 SKIP_RETURN_CODE 77
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${mediastudio_compiler_bin}")
+        endforeach()
+    endif()
+
+    # 恢复策略使用可控单调时钟，不等待真实的 45 秒。
     add_executable(MediaStudioRecoveryTests tests/RecoveryTests.cpp src/LiveRecovery.cpp src/MediaIo.cpp)
     set_target_properties(MediaStudioRecoveryTests PROPERTIES
         AUTOMOC OFF
@@ -264,6 +280,7 @@ if(BUILD_TESTING)
     foreach(test_case IN ITEMS controller-local controller-supersede controller-blocked-read packet-epochs widget-epochs
                           window-close-open window-close-probe window-close-read window-stop-reopen window-close-transcode
                           window-close-modal window-mixed-rtsp live-start-av-tcp live-start-av-udp
+                          live-start-av-low-tcp live-start-av-low-udp
                           live-start-video-tcp live-start-video-udp live-start-audio-tcp live-start-audio-udp
                           live-start-no-key live-start-av-offset-tcp live-pause-open live-pause-probe live-pause-read
                           live-pause-av-tcp live-pause-av-udp live-command-races window-live-controls
@@ -279,7 +296,8 @@ if(BUILD_TESTING)
                           live-fault-blackhole-open-tcp live-fault-blackhole-open-udp
                           live-fault-blackhole-probe-tcp live-fault-blackhole-probe-udp
                           live-fault-blackhole-read-tcp live-fault-blackhole-read-udp
-                          live-fault-responses-tcp live-fault-responses-udp live-real-time-budget window-transient-buffering)
+                          live-fault-responses-tcp live-fault-responses-udp live-real-time-budget window-transient-buffering
+                          live-buffer-presets window-audio-buffer-report)
         set(test_name MediaStudio.Session.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES
@@ -291,7 +309,7 @@ if(BUILD_TESTING)
         if(test_case MATCHES "^live-start-(av|audio)-" OR test_case MATCHES "^live-pause-av-" OR
            test_case MATCHES "^live-cycle-audio-" OR test_case MATCHES "^mixed-switch-" OR
            test_case MATCHES "^live-recover-(av|audio)-" OR test_case MATCHES "^live-stall-" OR
-           test_case STREQUAL "live-recovery-metadata" OR test_case MATCHES "^live-queue-" OR
+           test_case STREQUAL "live-recovery-metadata" OR test_case STREQUAL "live-buffer-presets" OR test_case MATCHES "^live-queue-" OR
            test_case STREQUAL "window-queue-failure" OR test_case MATCHES "^live-jitter-" OR
            test_case MATCHES "^live-frame-categories-")
             set_property(TEST ${test_name} PROPERTY SKIP_RETURN_CODE 77)

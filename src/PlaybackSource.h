@@ -4,6 +4,7 @@
 #include <optional>
 #include <string>
 #include "PacketQueueTypes.h"
+#include "AudioBufferSettings.h"
 
 // 源类型由调用方显式选择，不根据扩展名或“是否网络”猜测播放行为。
 enum class PlaybackSourceKind { LocalFile, NetworkLive, NetworkVod };
@@ -65,6 +66,28 @@ enum class EndOfStreamBehavior { Drain, RecoverLive };
 enum class QueueFullBehavior { LegacyThrottle, ReconnectLive, Backpressure };
 enum class ReconnectPosition { None, LiveEdge, LastPlayedPosition };
 
+struct RtspUdpReceiveSettings {
+    std::chrono::microseconds max_delay{0};
+    int reorder_packets = 0;
+};
+
+// 一套直播预设的唯一数值来源；传输层、队列和音频线程只消费按值配置。
+struct LivePresetSettings {
+    std::chrono::milliseconds open_timeout;
+    std::chrono::milliseconds probe_timeout;
+    std::chrono::milliseconds read_timeout;
+    std::chrono::milliseconds initial_output_timeout;
+    std::chrono::milliseconds output_stall_timeout;
+    PacketQueueLimits audio_queue;
+    PacketQueueLimits video_queue;
+    AudioBufferRequest audio_buffer;
+    RtspUdpReceiveSettings rtsp_udp;
+    // RTSP 低延迟仅减少帧率估算的帧数，避免探测缓存集中吐包顶满 750 ms 队列；空值保留 FFmpeg 默认。
+    std::optional<int> rtsp_fps_probe_frames;
+};
+
+const LivePresetSettings& livePresetSettings(LivePreset preset) noexcept;
+
 // 描述各类源应采用的策略。EOF 排空、队列限界和重接由后续播放流程接入。
 struct PlaybackPolicy {
     PauseBehavior pause = PauseBehavior::KeepPosition;
@@ -77,6 +100,12 @@ struct PlaybackPolicy {
     std::chrono::milliseconds read_timeout{0};
     PacketQueueLimits audio_queue_limits;
     PacketQueueLimits video_queue_limits;
+    AudioBufferRequest audio_buffer;
+    std::chrono::milliseconds initial_output_timeout{0};
+    std::chrono::milliseconds output_stall_timeout{0};
+    // 仅 RTSP/UDP 使用，不把重排参数套给 TCP、RTMP、SRT 或本地文件。
+    std::optional<RtspUdpReceiveSettings> rtsp_udp;
+    std::optional<int> rtsp_fps_probe_frames;
 };
 
 struct PlaybackCapabilities {

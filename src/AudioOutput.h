@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <functional>
 #include <vector>
+#include "AudioBufferSettings.h"
 
 // 区分 PCM 已提交、部分提交、声卡暂满、命令中断和设备失败。
 enum class AudioWriteResult { Written, Pending, WouldBlock, Interrupted, Error };
@@ -62,7 +63,10 @@ public:
      * @param channels 声道数
      * @return true=成功, false=失败
      */
-    bool init(int sample_rate, int channels);
+    bool init(int sample_rate, int channels, AudioBufferRequest buffer = {},
+              const std::function<bool()>& can_continue = {});
+    // 只由设备线程读取，再按值发布给控制器；cleanup 后仍可保留最近初始化的诊断历史。
+    AudioBufferReport bufferReport() const;
 
     /** @brief 释放WASAPI资源 */
     void cleanup();
@@ -83,6 +87,12 @@ public:
     bool reset();
 
 private:
+    friend struct AudioOutputTestAccess;
+    // 默认创建真实设备客户端；测试可用 COM 代理拒绝首次请求，核对失败后的释放/重建边界。
+    using ClientFactory = std::function<HRESULT(IMMDevice*, IAudioClient**)>;
+    ClientFactory client_factory_;
+    HRESULT activateClient();
+    void releaseClient();
     // 调试构建检查所有设备调用来自构造线程。
     void assertOwnerThread() const noexcept;
 
@@ -101,6 +111,7 @@ private:
     std::uint64_t submitted_frames_;
     bool com_initialized_;                     // 是否由本对象初始化了COM
     UINT32 buffer_frame_count_;                // 实际 WASAPI 缓冲区帧数
+    AudioBufferReport buffer_report_;
 #ifndef NDEBUG
     const DWORD owner_thread_id_ = GetCurrentThreadId();
 #endif

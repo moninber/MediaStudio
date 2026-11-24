@@ -15,8 +15,6 @@ using namespace std::chrono_literals;
 
 namespace {
 using Clock = std::chrono::steady_clock;
-constexpr auto LiveInitialOutputLimit = 10s;
-constexpr auto LiveOutputLimit = 10s;
 constexpr double LiveInitialAvSkewSeconds = 1.0;
 constexpr double LiveClockJumpSeconds = 10.0;
 }
@@ -464,6 +462,7 @@ void PlayerController::supervisorLoop()
                     snapshot_.connection_attempt_id = request.epoch.connection_attempt_id;
                     snapshot_.generation = request.epoch.generation;
                     snapshot_.media_info = {};
+                    snapshot_.audio_output.reset();
                     snapshot_.stats = {};
                     snapshot_.state = PlaybackState::Opening;
                     snapshot_.has_current_video_output = false;
@@ -527,10 +526,11 @@ std::optional<PlaybackError> PlayerController::runRequest(const OpenRequest& req
         playing_ = !live;
         if (live) {
             const auto now = Clock::now();
+            snapshot_.network_stats->udp_receive = decoder_.udpReceiveSettings();
             snapshot_.network_stats->input_ready_seconds =
                 std::chrono::duration<double>(now - connection_started_at_).count();
-            request.io->beginInitialOutputDeadline(now + LiveInitialOutputLimit);
-            request.io->beginOutputWatchdogs(snapshot_.media_info.has_audio, snapshot_.media_info.has_video, now + LiveOutputLimit);
+            request.io->beginInitialOutputDeadline(now + policy.initial_output_timeout);
+            request.io->beginOutputWatchdogs(snapshot_.media_info.has_audio, snapshot_.media_info.has_video, now + policy.output_stall_timeout);
         }
     }
 
@@ -711,7 +711,11 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
             AudioOutput device;
             const int sample_rate = decoder_.getOutputAudioSampleRate();
             const int channels = decoder_.getOutputAudioChannels();
-            const bool opened = running() && device.init(sample_rate, channels);
+            const bool opened = running() && device.init(sample_rate, channels, policy.audio_buffer,
+                [&] { return is_current(epoch_now()); });
+            // 只发布按值诊断；GUI 不访问声卡，取消后的旧初始化不能覆盖新会话。
+            const auto buffer_report = device.bufferReport();
+            publish(epoch_now(), [&] { snapshot_.audio_output = buffer_report; });
             init.set_value(opened);
             if (!opened) return;
 
@@ -863,7 +867,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                         }
                         if (live) publish(epoch, [&] {
                             last_audio_output_at_ = last_write;
-                            request.io->noteAudioOutput(last_write + LiveOutputLimit);
+                            request.io->noteAudioOutput(last_write + policy.output_stall_timeout);
                             record_live_output(snapshot_.network_stats->first_pcm_seconds, last_write);
                         });
                         if (live) next_audio_pts = trustworthy_pts
@@ -1021,7 +1025,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                         snapshot_.has_current_video_output = true;
                         if (live) {
                             last_video_output_at_ = submitted_at;
-                            request.io->noteVideoOutput(submitted_at + LiveOutputLimit);
+                            request.io->noteVideoOutput(submitted_at + policy.output_stall_timeout);
                             record_live_output(snapshot_.network_stats->first_video_submit_seconds, submitted_at);
                         }
                     }

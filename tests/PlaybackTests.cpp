@@ -96,6 +96,53 @@ void testSourcePolicies()
             vod_policy.read_timeout == 10s, "VoD policy");
 }
 
+// 表格契约独立于设备：期限、三维限额、音频请求及 UDP 单位必须成套，且不串入其他协议。
+void testPresetContracts()
+{
+    for (const auto preset : {LivePreset::Stable, LivePreset::LowLatency}) {
+        const bool low = preset == LivePreset::LowLatency;
+        const auto& config = livePresetSettings(preset);
+        require(config.open_timeout == 5s && config.probe_timeout == 5s && config.read_timeout == (low ? 3s : 5s) &&
+            config.initial_output_timeout == 10s && config.output_stall_timeout == 10s,
+            "central live IO/output deadlines differ from the handoff");
+        require(config.audio_queue.packets == (low ? 256u : 512u) && config.video_queue.packets == config.audio_queue.packets &&
+            config.audio_queue.payload_bytes == (low ? 1u : 2u) * 1024 * 1024 &&
+            config.video_queue.payload_bytes == (low ? 8u : 16u) * 1024 * 1024 &&
+            config.audio_queue.timestamp_span == (low ? 750ms : 2000ms) &&
+            config.video_queue.timestamp_span == config.audio_queue.timestamp_span,
+            "central live queue contract mismatch");
+        require(config.audio_buffer.duration == (low ? 100ms : 350ms) &&
+            config.audio_buffer.fallback == (low ? std::optional{350ms} : std::nullopt) &&
+            config.rtsp_udp.max_delay == std::chrono::microseconds{low ? 100000 : 500000} &&
+            config.rtsp_udp.reorder_packets == (low ? 128 : 512) &&
+            config.rtsp_fps_probe_frames == (low ? std::optional{8} : std::nullopt), "audio/UDP/probe preset or microsecond unit mismatch");
+        for (const auto transport : {RtspTransport::Tcp, RtspTransport::Udp}) {
+            const auto policy = playbackPolicy(PlaybackSource::networkLive("rtsp://example.test/live", {transport, preset}));
+            require(policy.rtsp_udp.has_value() == (transport == RtspTransport::Udp) &&
+                policy.audio_buffer.duration == config.audio_buffer.duration &&
+                policy.audio_buffer.fallback == config.audio_buffer.fallback &&
+                policy.rtsp_fps_probe_frames == config.rtsp_fps_probe_frames &&
+                policy.initial_output_timeout == config.initial_output_timeout &&
+                policy.output_stall_timeout == config.output_stall_timeout, "source did not select its complete preset");
+            if (policy.rtsp_udp) require(policy.rtsp_udp->max_delay == config.rtsp_udp.max_delay &&
+                policy.rtsp_udp->reorder_packets == config.rtsp_udp.reorder_packets, "UDP preset was changed by policy");
+        }
+        for (const auto* url : {"rtmp://example.test/live", "srt://example.test:9000"}) {
+            const auto other = playbackPolicy(PlaybackSource::networkLive(url, {RtspTransport::Udp, preset}));
+            require(!other.rtsp_udp && !other.rtsp_fps_probe_frames,
+                "RTSP options leaked into RTMP/SRT");
+        }
+    }
+    for (const auto& source : {PlaybackSource::localFile("fixture.wav"), PlaybackSource::networkVod("https://example.test/file")}) {
+        const auto policy = playbackPolicy(source);
+        require(policy.audio_buffer.duration == 350ms && !policy.audio_buffer.fallback && !policy.rtsp_udp && !policy.rtsp_fps_probe_frames,
+            "network preset changed file/VoD audio defaults");
+    }
+    require(!PlaybackSource::networkLive("rtsp://example.test/live", {RtspTransport::Tcp, static_cast<LivePreset>(999)}).isValid(),
+        "invalid preset enum silently selected low latency");
+    std::cout << "preset_contracts=stable,low IO_queues_audio_UDP_units=1 RTSP_UDP_only=1 file_default_350ms=1\n";
+}
+
 // 时长和定位能力分别验证，快照副本保留原请求、媒体、统计和错误。
 void testCapabilitiesAndSnapshot()
 {
@@ -508,6 +555,35 @@ void testStableRtsp()
     std::cout << "stable_rtsp_rejected_safe=1\n";
 }
 
+// 在实际加载的 FFmpeg 上核对四组协议参数；重开本地文件后不得保留上次 UDP 观测。
+void testRtspPresets()
+{
+    const auto* address = std::getenv("MEDIASTUDIO_TEST_RTSP_ADDRESS");
+    MediaDecoder decoder;
+    for (const auto preset : {LivePreset::Stable, LivePreset::LowLatency}) {
+        for (const auto transport : {RtspTransport::Udp, RtspTransport::Tcp}) {
+            const bool udp = transport == RtspTransport::Udp;
+            RtspBlackhole server(RtspBlackhole::StallAt::ReadPacket, address ? address : "127.0.0.1",
+                udp ? RtspBlackhole::SetupTransport::Udp : RtspBlackhole::SetupTransport::Tcp);
+            require(decoder.open(PlaybackSource::networkLive(server.url(), {transport, preset, false})).status == MediaOpenStatus::Opened,
+                "actual RTSP preset failed to open");
+            const auto applied = decoder.udpReceiveSettings();
+            const auto& expected = livePresetSettings(preset).rtsp_udp;
+            require(applied.has_value() == udp && (!udp || (applied->max_delay == expected.max_delay &&
+                applied->reorder_packets == expected.reorder_packets)), "loaded FFmpeg UDP values differ or leaked into TCP");
+            auto packet = makePacket();
+            require(decoder.readPacketResult(packet.get()).status == MediaReadStatus::Packet, "configured RTSP produced no RTP");
+            std::cout << "actual_rtsp_preset=" << (preset == LivePreset::Stable ? "stable" : "low")
+                << " UDP=" << udp << " max_delay_us=" << (applied ? applied->max_delay.count() : -1)
+                << " reorder_packets=" << (applied ? applied->reorder_packets : -1) << '\n';
+            decoder.close();
+            require(!decoder.udpReceiveSettings(), "closed decoder retained UDP settings");
+        }
+    }
+    const TemporaryWave wave;
+    require(decoder.open(wave.path().u8string()) && !decoder.udpReceiveSettings(), "UDP configuration persisted into a local source");
+}
+
 } // namespace
 
 // 每个 CTest 启动一个进程，夹具或解码器异常时仍由外层超时保护。
@@ -517,6 +593,7 @@ int main(int argc, char* argv[])
         const std::string_view mode = argc > 1 ? argv[1] : "";
         if (mode == "contracts" && argc == 2) {
             testSourcePolicies();
+            testPresetContracts();
             testCapabilitiesAndSnapshot();
             testErrorClassification();
         } else if (mode == "local-file" && argc == 2) {
@@ -531,6 +608,8 @@ int main(int argc, char* argv[])
             testRecoveryIoDeadline();
         } else if (mode == "rtsp-stable" && argc == 2) {
             testStableRtsp();
+        } else if (mode == "rtsp-presets" && argc == 2) {
+            testRtspPresets();
         } else {
             throw std::runtime_error("expected contracts, local-file, external-local <path>, rtsp-cancel, rtsp-timeout or rtsp-stable");
         }

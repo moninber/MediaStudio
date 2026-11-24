@@ -733,6 +733,39 @@ GUI 每 200 ms 调用 `getPlaybackSnapshot()`。所需轨道超过约 1 秒没�
 
 ---
 
+### 4.16 成套直播预设、声卡实际容量与失败回退（4.1）
+
+入口仍是 `PlaybackSource::networkLive()` 保存播放项设置，`playbackPolicy()` 按源类型选择策略。直播的打开/探测/读取期限、首输出及分轨输出期限、三维队列限额、音频请求和 RTSP 重排参数现在统一来自 `livePresetSettings()`，不再在控制器和声卡后端分别写常量。本地文件继续使用原有预读与 350 ms 请求，HTTP 点播也不继承直播限额；RTMP/SRT 在阶段 5 接入，不能收到 RTSP 专属选项。
+
+| 参数 | Stable | LowLatency（内部验证，界面暂不开放） |
+| --- | --- | --- |
+| 打开 / 探测 / 读取 | 5 s / 5 s / 5 s | 5 s / 5 s / 3 s |
+| 首输出 / 活动轨道无输出 | 10 s / 10 s | 10 s / 10 s |
+| 每轨包数 | 512 | 256 |
+| 音频 / 视频 payload | 2 MiB / 16 MiB | 1 MiB / 8 MiB |
+| 可信时间戳跨度 | 2 s | 750 ms |
+| WASAPI 请求 | 350 ms | 100 ms，初始化失败可回退 350 ms |
+| RTSP/UDP max_delay / reorder_queue_size | 500 ms / 512 包 | 100 ms / 128 包 |
+| RTSP 帧率估算帧数 | FFmpeg 默认 | 8 帧 |
+
+`MediaDecoder::open()` 只对 RTSP/UDP 传 `max_delay`（内部 microseconds，直接写微秒整数）和 `reorder_queue_size`（包数）。打开后从实际加载的 FFmpeg 格式上下文和私有 AVOption 回读并核对，缓存的是实际配置值，不能拿这些值冒充实时积压或全链路延迟；TCP 没有 UDP 重排观测，close/重开会清掉缓存。参数语义见 [FFmpeg RTSP 协议文档](https://ffmpeg.org/ffmpeg-protocols.html#rtsp)。
+
+本轮实测还发现：样片以低延迟参数起播时，默认探测缓存集中吐包，音频队列约 33 包后触发 750 ms 跨度限界。仅对低延迟 RTSP 将 `fps_probe_size` 设为 8 后解决短时起播；稳定模式和本地文件保留默认探测。它只减少帧率估算样本，不跳过格式/轨道探测，不启用 nobuffer，不丢参考帧，也不放宽队列限额。8 帧是首批 H.264/AAC 样片的工程校准值，不能保证所有可变帧率输入的估算精度；字段和默认分析逻辑见 [FFmpeg 8.0 AVFormatContext](https://ffmpeg.org/doxygen/8.0/structAVFormatContext.html) 与 [avformat_find_stream_info 实现](https://ffmpeg.org/doxygen/8.0/demux_8c_source.html)。
+
+延长观察后，推流端日志显示它在握手延迟约 0.6 秒后，以 1.05 倍速追赶发送。媒体主时钟按约 1.00 倍速前进，队列跨度因此持续增长并最终 Full；进一步减少帧率探测不能消除发送速率差，故保留 8 帧。正常实时验证显式使用 `-readrate_catchup 1 -readrate_initial_burst 0`，而原默认追赶发送的 Full 证据仍保留，不能把它混入正常 1.00 倍速场景。参数意义见 [FFmpeg readrate 文档](https://ffmpeg.org/ffmpeg.html#Main-options)。4.1 对持续快送仍执行既有硬限界/有限恢复，提前根据相对积压返回直播留给 4.3。
+
+`PlayerController::demuxAndPlay()` 在音频 worker 中创建 `AudioOutput`，把选中预设的请求及取消查询传给 `init()`。`init()` 先校验正数和单位转换溢出，再初始化当前线程 COM、默认端点和客户端；保留共享模式 16 位 PCM 及自动格式转换。毫秒乘 10000 后成为 WASAPI 的 100 ns 单位。只有第一次 `Initialize` 失败且存在 fallback 时，才释放 render/audio client，再从保留的端点 Activate 新客户端，尝试一次 350 ms；格式、激活或取得实际容量失败不靠改变时长盲目重试。微软说明初始化失败后的同一客户端也可能无法再次初始化，因此必须释放重建，见 [IAudioClient::Initialize](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-initialize)。
+
+取消查询检查请求取消、当前代次和直播期限：在初始化前、首次失败释放后、新客户端激活后和初始化成功后检查，取消即收尾且不继续回退。WASAPI 原生调用在当前调用返回后观察取消，不承诺强行中断驱动内部调用。设备初始化和释放不持快照锁/解码锁。`releaseClient()` 在设备线程 Stop 后依次 Release render/client 并清设备运行状态；`cleanup()` 再释放端点、枚举器、格式，平衡本线程的 CoInitializeEx。没有跨线程 COM 共享，也没有增加设备互斥锁。
+
+成功后只用 `GetBufferSize()` 帧数除以当前 PCM 采样率记录实际容量，和请求值、最终尝试值、次数、首次/最终 HRESULT 分开保存于 `AudioBufferReport`。本机实际得到 100 ms = 4410 帧、350 ms = 15435 帧（44100 Hz）；其他设备须以实际返回为准，不能从请求值推断。状态栏 Buf 仍是当前 padding 对应的待播时长，不是设备总容量。
+
+`bufferReport()` 只由音频 worker 读取并按值交给 `publish`：发布时短暂取得 snapshot_mutex，再核对 request/attempt/generation 及取消，匹配才写入快照。GUI 的 `updateMediaInfoPanel()` 只读快照，显示原始请求、最终尝试和实际容量，回退成功明确显示 100→350 ms；回退失败不显示成功容量。暂停/失败可保留“最近初始化”历史，同连接 seek 不丢设备容量；新请求和自动连接尝试清掉旧报告，避免切到纯视频文件还显示上路声卡容量。
+
+`AudioOutputTests` 用真实设备 COM 代理注入首次 Initialize 失败，核对旧客户端先 Release 才 Activate 新客户端，并真实执行后续 350 ms 初始化和 PCM 写入；另覆盖两次失败、回退前取消、非法时长/溢出和格式失败不回退。控制器用例核对四组预设/传输的真实 PCM 和暂停/切源隔离，界面用例只注入诊断快照检查文案。故障注入不代表本机硬件自然拒绝了 100 ms。本轮只完成成套参数及必要观测；相对积压指标、持续积压恢复和低延迟公开入口仍按 4.2～4.3 推进。
+
+---
+
 ## 5. OpenGL视频渲染
 
 ### 5.1 渲染管线

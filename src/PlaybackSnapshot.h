@@ -43,6 +43,7 @@ struct NetworkPlaybackStats {
     unsigned int recovery_retries_used = 0;
     bool auto_reconnect_enabled = false;
     LivePreset preset = LivePreset::Stable;
+    std::optional<RtspUdpReceiveSettings> udp_receive;
     std::optional<LiveFailureReason> last_failure_reason;
     std::optional<RecoveryStopReason> recovery_stop_reason;
     std::optional<double> retry_in_seconds;
@@ -85,6 +86,7 @@ struct PlaybackSnapshot {
     std::optional<double> live_elapsed_seconds;  // 从本连接的首次输出起计，不使用上游 PTS。
     PlaybackStats stats;
     MediaInfo media_info;
+    std::optional<AudioBufferReport> audio_output; // 最近初始化结果，按连接重置；暂停/失败可保留历史。
     std::optional<PlaybackError> last_error;
     std::optional<NetworkPlaybackStats> network_stats;
 };

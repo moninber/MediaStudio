@@ -37,25 +37,46 @@ void AudioOutput::assertOwnerThread() const noexcept
     assert(owner_thread_id_ == GetCurrentThreadId());
 }
 
-// 使用原有共享模式 16 位 PCM 和缓冲请求，在工作线程初始化 COM 与设备。
-bool AudioOutput::init(int sample_rate, int channels)
+// 保留共享模式 16 位 PCM，由预设指定缓冲请求；初始化、回退和释放均留在音频线程。
+bool AudioOutput::init(int sample_rate, int channels, AudioBufferRequest buffer,
+                       const std::function<bool()>& can_continue)
 {
     cleanup();
+    buffer_report_ = {};
+    buffer_report_.requested = buffer.duration;
+    const auto cancelled = [&] {
+        if (!can_continue || can_continue()) return false;
+        buffer_report_.cancelled = true;
+        return true;
+    };
+    const auto fail = [&](HRESULT error, const char* reason) {
+        if (!buffer_report_.first_error) buffer_report_.first_error = static_cast<std::int32_t>(error);
+        buffer_report_.last_error = static_cast<std::int32_t>(error);
+        std::cerr << "[AudioOutput] " << reason << " (hr=0x" << std::hex << static_cast<std::uint32_t>(error) << std::dec << ")" << std::endl;
+        cleanup();
+        return false;
+    };
+    const auto valid_duration = [](std::chrono::milliseconds duration) {
+        return duration.count() > 0 && duration.count() <= std::numeric_limits<REFERENCE_TIME>::max() / 10000;
+    };
+    if (!valid_duration(buffer.duration) || (buffer.fallback &&
+        (!valid_duration(*buffer.fallback) || *buffer.fallback <= buffer.duration))) {
+        return fail(E_INVALIDARG, "音频缓冲请求无效");
+    }
+    if (cancelled()) return false;
 
     constexpr unsigned int bytes_per_sample = 2;
     if (sample_rate <= 0 || channels <= 0 ||
         static_cast<unsigned int>(channels) > std::numeric_limits<WORD>::max() / bytes_per_sample ||
         static_cast<std::uint64_t>(sample_rate) * channels * bytes_per_sample > std::numeric_limits<DWORD>::max()) {
-        std::cerr << "[AudioOutput] PCM 格式参数无效" << std::endl;
-        return false;
+        return fail(E_INVALIDARG, "PCM 格式参数无效");
     }
 
     // 后台线程需要自己初始化COM（WASAPI是COM对象）
     // COINIT_MULTITHREADED适合后台工作线程
     const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(com_hr)) {
-        std::cerr << "[AudioOutput] 初始化 COM 失败 (hr=0x" << std::hex << com_hr << std::dec << ")" << std::endl;
-        return false;
+        return fail(com_hr, "初始化 COM 失败");
     }
     com_initialized_ = true;
 
@@ -72,8 +93,7 @@ bool AudioOutput::init(int sample_rate, int channels)
         (void**)&device_enumerator_     // 输出接口指针
     );
     if (FAILED(hr)) {
-        std::cerr << "[AudioOutput] 创建设备枚举器失败" << std::endl;
-        return false;
+        return fail(hr, "创建设备枚举器失败");
     }
 
     // --------------------------------------------------------
@@ -83,8 +103,7 @@ bool AudioOutput::init(int sample_rate, int channels)
     // --------------------------------------------------------
     hr = device_enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, &device_);
     if (FAILED(hr)) {
-        std::cerr << "[AudioOutput] 获取默认音频端点失败" << std::endl;
-        return false;
+        return fail(hr, "获取默认音频端点失败");
     }
 
     // --------------------------------------------------------
@@ -92,10 +111,9 @@ bool AudioOutput::init(int sample_rate, int channels)
     // IAudioClient是WASAPI的核心接口
     // 它管理音频流的格式、缓冲区和状态
     // --------------------------------------------------------
-    hr = device_->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&audio_client_);
+    hr = activateClient();
     if (FAILED(hr)) {
-        std::cerr << "[AudioOutput] 激活音频客户端失败" << std::endl;
-        return false;
+        return fail(hr, "激活音频客户端失败");
     }
 
     // --------------------------------------------------------
@@ -126,7 +144,7 @@ bool AudioOutput::init(int sample_rate, int channels)
         wave_format_ = (WAVEFORMATEX*)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
         if (!wave_format_) {
             CoTaskMemFree(closest_match);
-            return false;
+            return fail(E_OUTOFMEMORY, "无法分配音频格式");
         }
         *wave_format_ = desired_format;
         CoTaskMemFree(closest_match);
@@ -135,14 +153,13 @@ bool AudioOutput::init(int sample_rate, int channels)
         // 请求的格式完全支持
         wave_format_ = (WAVEFORMATEX*)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
         if (!wave_format_) {
-            return false;
+            return fail(E_OUTOFMEMORY, "无法分配音频格式");
         }
         *wave_format_ = desired_format;
     }
     else {
-        std::cerr << "[AudioOutput] 音频格式不支持" << std::endl;
         if (closest_match) CoTaskMemFree(closest_match);
-        return false;
+        return fail(FAILED(hr) ? hr : AUDCLNT_E_UNSUPPORTED_FORMAT, "音频格式不支持");
     }
 
     // --------------------------------------------------------
@@ -150,67 +167,77 @@ bool AudioOutput::init(int sample_rate, int channels)
     // 分配音频缓冲区，指定缓冲持续时间
     // REFERENCE_TIME单位：100纳秒（1秒 = 10,000,000 × 100ns）
     // --------------------------------------------------------
-    REFERENCE_TIME buffer_duration = 3500000; // 保留原有的 0.35 秒共享模式缓冲请求。
-    DWORD stream_flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    hr = audio_client_->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,  // 共享模式（与其他应用共享设备）
-        stream_flags,               // 允许音频引擎自动转换到设备混音格式
-        buffer_duration,            // 缓冲区持续时间
-        0,                          // 设备周期（共享模式设0）
-        wave_format_,               // 音频格式
-        nullptr                     // 无事件会话
-    );
-    if (FAILED(hr)) {
-        std::cerr << "[AudioOutput] 初始化音频客户端失败 (hr=0x"
-                  << std::hex << hr << std::dec << ")" << std::endl;
-        return false;
+    const auto initialize = [&](std::chrono::milliseconds duration) {
+        buffer_report_.attempted = duration;
+        ++buffer_report_.attempts;
+        const REFERENCE_TIME ticks = duration.count() * 10000; // 明确从 ms 转成 100 ns。
+        const DWORD flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        return audio_client_->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, ticks, 0, wave_format_, nullptr);
+    };
+    if (cancelled()) { cleanup(); return false; }
+    hr = initialize(buffer.duration);
+    if (FAILED(hr) && buffer.fallback) {
+        buffer_report_.first_error = static_cast<std::int32_t>(hr);
+        // 失败的 IAudioClient 不能可靠地再次 Initialize；先释放旧客户端，再激活新对象。
+        releaseClient();
+        if (cancelled()) { cleanup(); return false; }
+        hr = activateClient();
+        if (FAILED(hr)) return fail(hr, "回退时无法创建新音频客户端");
+        if (cancelled()) { cleanup(); return false; }
+        std::cerr << "[AudioOutput] " << buffer.duration.count() << " ms 请求失败，尝试回退 "
+                  << buffer.fallback->count() << " ms (hr=0x" << std::hex
+                  << static_cast<std::uint32_t>(*buffer_report_.first_error) << std::dec << ")" << std::endl;
+        hr = initialize(*buffer.fallback);
     }
-
-    // --------------------------------------------------------
-    // 步骤6：获取渲染客户端接口
-    // IAudioRenderClient用于向缓冲区写入PCM数据
-    // --------------------------------------------------------
+    if (FAILED(hr)) return fail(hr, "初始化音频缓冲失败");
+    if (cancelled()) { cleanup(); return false; }
     hr = audio_client_->GetService(__uuidof(IAudioRenderClient), (void**)&render_client_);
-    if (FAILED(hr)) {
-        std::cerr << "[AudioOutput] 获取渲染客户端失败" << std::endl;
-        return false;
-    }
-
-    // 获取实际分配的缓冲区大小
+    if (FAILED(hr)) return fail(hr, "获取渲染客户端失败");
     hr = audio_client_->GetBufferSize(&buffer_frame_count_);
-    if (FAILED(hr) || buffer_frame_count_ == 0) {
-        std::cerr << "[AudioOutput] 无法取得音频缓冲区大小" << std::endl;
-        return false;
-    }
+    if (FAILED(hr) || buffer_frame_count_ == 0) return fail(FAILED(hr) ? hr : E_FAIL, "无法取得音频缓冲区大小");
+    buffer_report_.initialized = true;
+    buffer_report_.device_frames = buffer_frame_count_;
+    buffer_report_.sample_rate = wave_format_->nSamplesPerSec;
+    buffer_report_.capacity_seconds = static_cast<double>(buffer_frame_count_) / wave_format_->nSamplesPerSec;
+    std::cout << "[AudioOutput] 初始化成功: " << sample_rate << "Hz, " << channels << "ch, 16bit, requested_ms="
+              << buffer_report_.requested.count() << " selected_ms=" << buffer_report_.attempted.count()
+              << " device_frames=" << buffer_frame_count_ << " capacity_ms=" << *buffer_report_.capacity_seconds * 1000.0
+              << " fallback=" << buffer_report_.usedFallback() << std::endl;
 
-    std::cout << "[AudioOutput] 初始化成功: " << sample_rate << "Hz, "
-              << channels << "ch, 16bit, buf=" << buffer_frame_count_ << "frames" << std::endl;
     return true;
+}
+
+// 激活、释放及诊断读取都在构造线程执行，不把 COM 接口暴露给 GUI。
+HRESULT AudioOutput::activateClient()
+{
+    assertOwnerThread();
+    return client_factory_ ? client_factory_(device_, &audio_client_)
+        : device_->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&audio_client_));
+}
+
+void AudioOutput::releaseClient()
+{
+    assertOwnerThread();
+    if (audio_client_ && playing_) audio_client_->Stop();
+    if (render_client_) { render_client_->Release(); render_client_ = nullptr; }
+    if (audio_client_) {
+        audio_client_->Release(); audio_client_ = nullptr;
+    }
+    playing_ = paused_ = false;
+    submitted_frames_ = buffer_frame_count_ = 0;
+}
+
+AudioBufferReport AudioOutput::bufferReport() const
+{
+    assertOwnerThread();
+    return buffer_report_;
 }
 
 // 停止设备后依次释放 COM 接口和格式，再平衡本线程的 CoInitializeEx。
 void AudioOutput::cleanup()
 {
     assertOwnerThread();
-    // 停止播放
-    if (audio_client_ && playing_) {
-        audio_client_->Stop();
-    }
-    playing_ = false;
-    paused_ = false;
-    submitted_frames_ = 0;
-    buffer_frame_count_ = 0;
-
-    // 释放COM接口（调用Release()减少引用计数）
-    // 释放顺序：后获取的先释放
-    if (render_client_) {
-        render_client_->Release();
-        render_client_ = nullptr;
-    }
-    if (audio_client_) {
-        audio_client_->Release();
-        audio_client_ = nullptr;
-    }
+    releaseClient();
     if (device_) {
         device_->Release();
         device_ = nullptr;

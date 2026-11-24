@@ -218,6 +218,10 @@ MediaOpenResult MediaDecoder::open(const PlaybackSource& source, std::shared_ptr
     if (options_result >= 0 && !local_file) {
         options_result = av_dict_set(&options, "rtsp_transport", udp ? "udp" : "tcp", 0);
     }
+    if (options_result >= 0 && policy.rtsp_udp) {
+        options_result = av_dict_set_int(&options, "max_delay", policy.rtsp_udp->max_delay.count(), 0);
+        if (options_result >= 0) options_result = av_dict_set_int(&options, "reorder_queue_size", policy.rtsp_udp->reorder_packets, 0);
+    }
     if (options_result < 0) {
         av_dict_free(&options);
         return fail(classifyOpenResult(options_result, io_->stopReason(), MediaOpenStage::OpenInput));
@@ -237,8 +241,19 @@ MediaOpenResult MediaDecoder::open(const PlaybackSource& source, std::shared_ptr
     if (open_result.status != MediaOpenStatus::Opened) {
         return fail(open_result);
     }
+    if (policy.rtsp_udp) {
+        std::int64_t reorder_packets = 0;
+        const int queried = av_opt_get_int(format_ctx_->priv_data, "reorder_queue_size", 0, &reorder_packets);
+        if (queried < 0 || format_ctx_->max_delay != policy.rtsp_udp->max_delay.count() ||
+            reorder_packets != policy.rtsp_udp->reorder_packets) {
+            return fail({MediaOpenStatus::Error, queried < 0 ? queried : AVERROR(EINVAL), MediaOpenStage::OpenInput});
+        }
+        udp_receive_settings_ = RtspUdpReceiveSettings{std::chrono::microseconds{format_ctx_->max_delay}, static_cast<int>(reorder_packets)};
+    }
 
     // 探测可能继续读数据，独立于打开阶段重新计时。
+    // 仅减少低延迟 RTSP 的帧率估算样本；仍完整探测格式/轨道并保留探测包，不丢参考帧。
+    if (policy.rtsp_fps_probe_frames) format_ctx_->fps_probe_size = *policy.rtsp_fps_probe_frames;
     io_->armDeadline(policy.probe_timeout);
     const int probe_ret = avformat_find_stream_info(format_ctx_, nullptr);
     const auto probe_result = classifyOpenResult(probe_ret, io_->stopReason(), MediaOpenStage::ProbeStreams);
@@ -406,6 +421,7 @@ void MediaDecoder::close()
     video_stream_index_ = -1;
     audio_stream_index_ = -1;
     video_time_base_ = {0, 1};
+    udp_receive_settings_.reset();
     audio_time_base_ = {0, 1};
     current_time_ = 0.0;
     playback_speed_ = 1.0f;

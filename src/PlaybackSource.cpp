@@ -154,9 +154,10 @@ PlaybackSource PlaybackSource::localFile(std::string path, std::string display_n
 PlaybackSource PlaybackSource::networkLive(std::string url, LiveSourceOptions options)
 {
     const auto protocol = protocolOf(url);
-    const bool valid = protocol == PlaybackProtocol::Rtsp
+    const bool valid_address = protocol == PlaybackProtocol::Rtsp
         ? isRtspAddress(url) && (options.rtsp_transport == RtspTransport::Tcp || options.rtsp_transport == RtspTransport::Udp)
         : (protocol == PlaybackProtocol::Rtmp || protocol == PlaybackProtocol::Srt) && hasNetworkAuthority(url, true);
+    const bool valid = valid_address && (options.preset == LivePreset::Stable || options.preset == LivePreset::LowLatency);
     return PlaybackSource(PlaybackSourceKind::NetworkLive, std::move(url), protocolDisplayName(protocol), valid, options);
 }
 
@@ -193,6 +194,19 @@ RtspSourceValidation createStableRtspSource(std::string url, RtspTransport trans
     return {std::move(source), RtspSourceError::None};
 }
 
+// 所有带单位的直播预设数值集中于此；低延迟入口要等持续积压策略完整后再开放。
+const LivePresetSettings& livePresetSettings(LivePreset preset) noexcept
+{
+    using namespace std::chrono_literals;
+    static const LivePresetSettings stable{5s, 5s, 5s, 10s, 10s,
+        {512, 2 * 1024 * 1024, 2s}, {512, 16 * 1024 * 1024, 2s},
+        {350ms, {}}, {500ms, 512}, {}};
+    static const LivePresetSettings low_latency{5s, 5s, 3s, 10s, 10s,
+        {256, 1024 * 1024, 750ms}, {256, 8 * 1024 * 1024, 750ms},
+        {100ms, 350ms}, {100ms, 128}, 8};
+    return preset == LivePreset::LowLatency ? low_latency : stable;
+}
+
 // 网络源共享期限设施，业务策略按三类源独立选择。
 PlaybackPolicy playbackPolicy(const PlaybackSource& source) noexcept
 {
@@ -201,22 +215,26 @@ PlaybackPolicy playbackPolicy(const PlaybackSource& source) noexcept
     switch (source.kind()) {
         case PlaybackSourceKind::LocalFile:
             break;
-        case PlaybackSourceKind::NetworkLive:
+        case PlaybackSourceKind::NetworkLive: {
+            const auto& settings = livePresetSettings(source.liveOptions()->preset);
             policy.pause = PauseBehavior::DisconnectLive;
             policy.end_of_stream = EndOfStreamBehavior::RecoverLive;
             policy.queue_full = QueueFullBehavior::ReconnectLive;
             policy.reconnect_position = ReconnectPosition::LiveEdge;
-            policy.open_timeout = 5s;
-            policy.probe_timeout = 5s;
-            policy.read_timeout = source.liveOptions()->preset == LivePreset::LowLatency ? 3s : 5s;
-            if (source.liveOptions()->preset == LivePreset::Stable) {
-                policy.audio_queue_limits = {512, 2 * 1024 * 1024, 2s};
-                policy.video_queue_limits = {512, 16 * 1024 * 1024, 2s};
-            } else {
-                policy.audio_queue_limits = {256, 1024 * 1024, 750ms};
-                policy.video_queue_limits = {256, 8 * 1024 * 1024, 750ms};
+            policy.open_timeout = settings.open_timeout;
+            policy.probe_timeout = settings.probe_timeout;
+            policy.read_timeout = settings.read_timeout;
+            policy.initial_output_timeout = settings.initial_output_timeout;
+            policy.output_stall_timeout = settings.output_stall_timeout;
+            policy.audio_queue_limits = settings.audio_queue;
+            policy.video_queue_limits = settings.video_queue;
+            policy.audio_buffer = settings.audio_buffer;
+            if (source.protocol() == PlaybackProtocol::Rtsp) {
+                policy.rtsp_fps_probe_frames = settings.rtsp_fps_probe_frames;
+                if (source.liveOptions()->rtsp_transport == RtspTransport::Udp) policy.rtsp_udp = settings.rtsp_udp;
             }
             break;
+        }
         case PlaybackSourceKind::NetworkVod:
             policy.pause = PauseBehavior::FreezeVod;
             policy.queue_full = QueueFullBehavior::Backpressure;
