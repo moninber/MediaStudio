@@ -16,12 +16,12 @@ struct MediaOpenResult {
     MediaOpenStage stage;
 };
 
-enum class MediaReadStatus { Packet, Again, EndOfStream, Timeout, Cancelled, Error };
-enum class MediaReadStage { ReadPacket, InitialOutput, AudioOutput, VideoOutput, RecoveryBudget };
+enum class MediaReadStatus { Packet, Again, EndOfStream, Timeout, Cancelled, Error, QueueFull, PacketTooLarge };
+enum class MediaReadStage { ReadPacket, InitialOutput, AudioOutput, VideoOutput, RecoveryBudget, AudioQueue, VideoQueue };
 
 struct MediaReadResult {
     MediaReadStatus status;
-    int ffmpegError; // 分类与 FFmpeg 原始返回值分别保存。
+    int ffmpegError; // 分类与 FFmpeg 原始返回值分别保存；应用队列事件未调用 FFmpeg，用 0。
     MediaReadStage stage = MediaReadStage::ReadPacket;
 };
 

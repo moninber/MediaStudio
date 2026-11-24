@@ -259,7 +259,8 @@ void testPacketEpochs()
     const PlaybackEpoch first{5, 9, 1};
     const PlaybackEpoch obsolete{5, 9, 2};
     const PlaybackEpoch latest{6, 10, 3};
-    require(queue.push(input.get(), first) && queue.push(input.get(), obsolete), "could not queue tagged packets");
+    require(queue.push(input.get(), first).status == PacketPushStatus::Queued &&
+            queue.push(input.get(), obsolete).status == PacketPushStatus::Queued, "could not queue tagged packets");
     av_packet_unref(input.get());
     PlaybackEpoch popped;
     require(queue.pop(output.get(), popped, false) && popped == first &&
@@ -269,15 +270,15 @@ void testPacketEpochs()
     queue.reset();
     require(queue.size() == 0 && !queue.pop(input.get(), popped, false) && popped == first &&
             output->data[0] == 11, "reset modified in-flight work or preserved a queued old packet");
-    require(queue.push(output.get(), latest), "empty reset queue did not accept the latest epoch");
+    require(queue.push(output.get(), latest).status == PacketPushStatus::Queued, "empty reset queue did not accept the latest epoch");
     queue.finish();
     require(queue.pop(input.get(), popped, false) && popped == latest && input->data[0] == 11 &&
             !queue.pop(output.get(), popped, false), "finish did not drain exactly the latest packet");
     queue.reset();
-    require(queue.push(input.get(), latest), "reset after finish failed");
+    require(queue.push(input.get(), latest).status == PacketPushStatus::Queued, "reset after finish failed");
     queue.abort();
     require(queue.isAborted() && queue.size() == 0 && !queue.pop(output.get(), popped, false) &&
-            !queue.push(input.get(), latest), "abort did not discard or reject pending work");
+            queue.push(input.get(), latest).status == PacketPushStatus::Aborted, "abort did not discard or reject pending work");
 }
 
 // 等到目标请求交付真实视频，再核对时钟、媒体信息和本次连接编号。
@@ -451,7 +452,8 @@ void testControllerBlockedRead()
     PlayerController player;
     player.setVideoWidget(&widget);
 
-    const auto source = PlaybackSource::networkLive(server.url(), {RtspTransport::Tcp, LivePreset::LowLatency});
+    // 此处验证稳定链路的读包取消；低延迟 750 ms 限额另由队列/策略测试覆盖。
+    const auto source = PlaybackSource::networkLive(server.url(), {RtspTransport::Tcp, LivePreset::Stable});
     const auto request = player.requestOpen(source);
     require(request > 0, "controller did not accept the video request");
     waitUntil([&] { return server.isHoldingConnection(); }, 2s, "RTSP server did not send its partial record");
@@ -984,6 +986,100 @@ int testAutomaticRecovery(std::string_view mode)
     return 0;
 }
 
+// 一轨瞬发导致 Full，另一轨队列仍很小；所有自动连接共享原预算，不能无限重试。
+int testLiveQueueLimit(std::string_view mode)
+{
+    if (!hasDefaultRenderEndpoint()) return 77;
+    using Fixture=RtspBlackhole;
+    const bool audio=mode.find("audio")!=std::string_view::npos;
+    const bool udp=mode.find("udp")!=std::string_view::npos;
+    Fixture server(Fixture::StartupMedia::AudioVideo,testRtspAddress(),udp?Fixture::SetupTransport::Udp:Fixture::SetupTransport::Tcp,
+        Fixture::KeyVideo::Immediate,0,4,true);
+    VideoWidget widget;widget.setShowSpectrum(true);
+    PlayerController player;player.setVideoWidget(&widget);
+    const auto request=player.requestOpen(*createStableRtspSource(server.url(),udp?RtspTransport::Udp:RtspTransport::Tcp).source);
+    waitInQt([&]{return player.getPlaybackSnapshot().state==PlaybackState::Playing;},4s,"queue burst fixture never produced initial AV output");
+    const auto original=player.getPlaybackSnapshot();
+    server.releaseQueueBurst(audio?Fixture::QueueBurst::Audio:Fixture::QueueBurst::Video);
+    PlaybackSnapshot first;
+    waitInQt([&]{first=player.getPlaybackSnapshot();return first.state==PlaybackState::Reconnecting;},5s,"single-track Full did not start recovery");
+    const auto* error=first.last_error?std::get_if<MediaReadResult>(&*first.last_error):nullptr;
+    require(error&&error->status==MediaReadStatus::QueueFull&&error->ffmpegError==0&&
+        error->stage==(audio?MediaReadStage::AudioQueue:MediaReadStage::VideoQueue)&&first.network_stats&&
+        first.network_stats->queue_full_events==1&&first.network_stats->oversized_packet_events==0&&
+        first.network_stats->last_queue_limit==PacketQueueLimit::TimestampSpan&&
+        (audio?first.network_stats->video_queue.peak_packets<51:first.network_stats->audio_queue.peak_packets<101),
+        "single-track queue limit was lost, invented an FFmpeg error or required both queues full");
+    requireStaleOutputRejected(widget,snapshotEpoch(original),snapshotEpoch(first));
+    PlaybackSnapshot failed;
+    waitInQt([&]{failed=player.getPlaybackSnapshot();return failed.request_id==request&&failed.state==PlaybackState::Failed&&
+        !failed.is_session_active;},17s,"repeated Full did not terminate within the retry count budget");
+    const auto& stats=*failed.network_stats;
+    require(stats.reconnect_attempts==3&&stats.recovery_retries_used==3&&stats.queue_full_events==4&&
+        stats.oversized_packet_events==0&&stats.last_failure_reason==LiveFailureReason::QueueLimit&&
+        stats.recovery_stop_reason==RecoveryStopReason::AttemptsExhausted&&stats.audio_queue.withinLimits()&&
+        stats.video_queue.withinLimits()&&stats.audio_queue.peak_payload_bytes<=stats.audio_queue.limits.payload_bytes&&
+        stats.video_queue.peak_payload_bytes<=stats.video_queue.limits.payload_bytes,
+        "Full bypassed shared budgets, exceeded payload limits or mixed event counters");
+    waitInQt([&]{return server.closedConnections()==4&&server.activeRemoteSessions()==0;},1s,"Full recovery leaked RTSP sessions");
+    remainsInQt([&]{return server.acceptedConnections()==4;},200ms,"exhausted Full opened a fifth connection");
+    std::cout<<"queue_full_track="<<(audio?"audio":"video")<<" transport="<<(udp?"UDP":"TCP")
+        <<" single_track_full=1 packet_and_byte_caps_preserved=1 actual_retries=3 Full_events=4 raw_error=0 finite_exit=1\n";
+    return 0;
+}
+
+// FU-A 分片在真实解复用层重组为超 16 MiB 的单个视频包；只能报错，不能继续重试同一负载。
+void testOversizedLivePacket()
+{
+    using Fixture=RtspBlackhole;
+    Fixture server(Fixture::StartupMedia::Video,testRtspAddress(),Fixture::SetupTransport::Tcp,
+        Fixture::KeyVideo::Immediate,0,2,true);
+    VideoWidget widget;widget.setShowSpectrum(true);PlayerController player;player.setVideoWidget(&widget);
+    const auto request=player.requestOpen(*createStableRtspSource(server.url(),RtspTransport::Tcp).source);
+    waitInQt([&]{return player.getPlaybackSnapshot().state==PlaybackState::Playing;},4s,"oversized fixture never produced initial video");
+    server.releaseQueueBurst(Fixture::QueueBurst::OversizedVideo);
+    PlaybackSnapshot failed;
+    waitInQt([&]{failed=player.getPlaybackSnapshot();return failed.request_id==request&&failed.state==PlaybackState::Failed&&
+        !failed.is_session_active;},7s,"oversized AVPacket did not become a terminal failure");
+    const auto* error=failed.last_error?std::get_if<MediaReadResult>(&*failed.last_error):nullptr;
+    require(error&&error->status==MediaReadStatus::PacketTooLarge&&error->stage==MediaReadStage::VideoQueue&&
+        error->ffmpegError==0&&failed.network_stats&&failed.network_stats->reconnect_attempts==0&&
+        failed.network_stats->oversized_packet_events==1&&failed.network_stats->queue_full_events==0&&
+        failed.network_stats->last_failure_reason==LiveFailureReason::PacketTooLarge&&
+        failed.network_stats->recovery_stop_reason==RecoveryStopReason::FatalFailure&&
+        failed.network_stats->video_queue.peak_payload_bytes<16*1024*1024&&failed.network_stats->video_queue.oversized_packets==1,
+        "oversized packet entered the queue, used a retry or was counted as ordinary Full");
+    remainsInQt([&]{return server.acceptedConnections()==1;},1200ms,"oversized packet was automatically retried");
+    std::cout<<"actual_FU_A_AVPacket_over_16MiB=1 accepted_oversized=0 automatic_retries=0 typed_fatal=1\n";
+}
+
+// Full 后的退避也服从最后一条用户命令，不能留下队列、远端 UDP 会话或旧恢复流程。
+int testQueueRecoveryCancellation()
+{
+    if(!hasDefaultRenderEndpoint())return 77;
+    using Fixture=RtspBlackhole;const VideoFixtures files;
+    for(const int command:{0,1,2,3}){
+        Fixture server(Fixture::StartupMedia::AudioVideo,testRtspAddress(),Fixture::SetupTransport::Udp,
+            Fixture::KeyVideo::Immediate,0,2,true);
+        VideoWidget widget;widget.setShowSpectrum(true);PlayerController player;player.setVideoWidget(&widget);
+        player.requestOpen(*createStableRtspSource(server.url(),RtspTransport::Udp).source);
+        waitInQt([&]{return player.getPlaybackSnapshot().state==PlaybackState::Playing;},4s,"cancel fixture did not output");
+        server.releaseQueueBurst(Fixture::QueueBurst::Video);
+        waitInQt([&]{return player.getPlaybackSnapshot().state==PlaybackState::Reconnecting;},5s,"no Full backoff to cancel");
+        const auto start=Clock::now();
+        if(command==0)player.pause();if(command==1)player.stopAsync();
+        if(command==2)player.requestOpen(PlaybackSource::localFile(files.first().u8string()));
+        if(command==3)player.requestShutdown();
+        require(Clock::now()-start<100ms,"Full cancellation blocked UI command");
+        waitInQt([&]{const auto s=player.getPlaybackSnapshot();return server.activeRemoteSessions()==0&&
+            (command==2?s.source_kind==PlaybackSourceKind::LocalFile&&s.has_current_video_output&&!s.network_stats:
+                command==3?player.isShutdownComplete():!s.is_session_active);},2s,"Full cancel did not settle resources/new file");
+        remainsInQt([&]{return server.acceptedConnections()==1;},1100ms,"cancelled Full recovery revived live source");
+    }
+    std::cout<<"Full_backoff_cancel=pause,stop,switch,shutdown UDP_remote_released=1 old_request_revived=0\n";
+    return 0;
+}
+
 // 404 允许有限重试，403 和关闭自动选项则直接停止；候选等待不能冒充实际启动次数。
 void testRecoveryBudgetIntegration()
 {
@@ -1113,9 +1209,12 @@ int testTrackOutputStall(bool audio_stall)
     }, 13s, "live track remained usable merely because the other track continued sending packets");
     const auto* error = stalled.last_error ? std::get_if<MediaReadResult>(&*stalled.last_error) : nullptr;
     const auto packets_after = audio_stall ? server.sentVideoPackets() : server.sentAudioPackets();
-    require(error && error->status == MediaReadStatus::Timeout &&
-        error->stage == (audio_stall ? MediaReadStage::AudioOutput : MediaReadStage::VideoOutput) &&
-        Clock::now() - started >= 9s && packets_after > packets_before + 100 && !stalled.has_current_video_output,
+    const bool bounded_queue_recovery = audio_stall && error && error->status == MediaReadStatus::QueueFull &&
+        error->stage == MediaReadStage::VideoQueue && stalled.network_stats->queue_full_events == 1;
+    require(error && (bounded_queue_recovery || (error->status == MediaReadStatus::Timeout &&
+        error->stage == (audio_stall ? MediaReadStage::AudioOutput : MediaReadStage::VideoOutput))) &&
+        Clock::now() - started >= (bounded_queue_recovery ? 1500ms : 9000ms) &&
+        packets_after > packets_before + (bounded_queue_recovery ? 30u : 100u) && !stalled.has_current_video_output,
         "track-specific output failure was confused with a global read failure or healthy output");
     requireStaleOutputRejected(widget, snapshotEpoch(initial), snapshotEpoch(stalled));
     server.setTrackStalled(audio_stall, false);
@@ -1126,7 +1225,8 @@ int testTrackOutputStall(bool audio_stall)
     player.stopAsync();
     waitInQt([&] { return !player.getPlaybackSnapshot().is_session_active && server.closedConnections() == 2 &&
         server.activeRemoteSessions() == 0; }, 2s, "track recovery could not be stopped cleanly");
-    std::cout << "stalled_track=" << (audio_stall ? "audio" : "video") << " other_packets_continued=1 typed_output_timeout=1 both_tracks_restored=1\n";
+    std::cout << "stalled_track=" << (audio_stall ? "audio" : "video") << " other_packets_continued=1 guard="
+        << (bounded_queue_recovery ? "video-queue-span" : "track-output-timeout") << " both_tracks_restored=1\n";
     return 0;
 }
 
@@ -1659,6 +1759,29 @@ void testWindowLiveControls()
     std::cout << "window_live_pause_continue_removed_row=1 return_button_reconnect=1 repeated_return_close=1\n";
 }
 
+// 关闭自动选项时 Full 直接失败，窗口显示明确原因、独立计数和排队 payload/跨度。
+int testWindowQueueFailure()
+{
+    if(!hasDefaultRenderEndpoint())return 77;
+    using Fixture=RtspBlackhole;
+    Fixture server(Fixture::StartupMedia::AudioVideo,testRtspAddress(),Fixture::SetupTransport::Tcp,
+        Fixture::KeyVideo::Immediate,0,1,true);
+    TestWindow window;auto& view=*window.view;
+    MainWindowNetworkTestAccess::openListed(view,*createStableRtspSource(server.url(),RtspTransport::Tcp,false).source);
+    waitInQt([&]{return MainWindowCloseTestAccess::snapshot(view).state==PlaybackState::Playing;},4s,"window queue fixture did not output");
+    server.releaseQueueBurst(Fixture::QueueBurst::Audio);
+    waitInQt([&]{const auto s=MainWindowCloseTestAccess::snapshot(view);return s.state==PlaybackState::Failed&&!s.is_session_active&&
+        view.statusBar()->currentMessage().contains(QString::fromUtf8(u8"队列达到限额"))&&
+        view.statusBar()->currentMessage().contains(QString::fromUtf8(u8"自动重连已关闭"));},5s,"window hid Full or ignored disabled recovery");
+    const auto s=MainWindowCloseTestAccess::snapshot(view);
+    const auto info=MainWindowNetworkTestAccess::controls(view).metadata;
+    require(s.network_stats&&s.network_stats->queue_full_events==1&&s.network_stats->reconnect_attempts==0&&
+        info.contains(QString::fromUtf8(u8"队列 Full 累计: 1"))&&info.contains("payload:")&&info.contains(QString::fromUtf8(u8"跨度:")),
+        "window queue statistics were missing or mislabeled");
+    closeWindow(window.view,s.request_id,"queue-Full-disabled");
+    return 0;
+}
+
 // 窗口展示真实退避和恢复计数；手动回到直播开启新请求，不继承自动计数。
 void testWindowAutomaticRecovery()
 {
@@ -1832,6 +1955,9 @@ int main(int argc, char* argv[])
         else if (mode == "mixed-switch-tcp" || mode == "mixed-switch-udp") return testMixedSwitchStress(mode == "mixed-switch-udp");
         else if (mode == "live-failures-tcp" || mode == "live-failures-udp") testLiveFailures(mode == "live-failures-udp");
         else if (mode.substr(0, 13) == "live-recover-") return testAutomaticRecovery(mode);
+        else if (mode.substr(0, 11) == "live-queue-") { if (mode == "live-queue-cancel") return testQueueRecoveryCancellation(); return testLiveQueueLimit(mode); }
+        else if (mode == "live-oversized-video-tcp") testOversizedLivePacket();
+        else if (mode == "window-queue-failure") return testWindowQueueFailure();
         else if (mode == "live-recovery-budget") testRecoveryBudgetIntegration();
         else if (mode == "live-recovery-cancel") testRecoveryCancellation();
         else if (mode == "live-stall-audio" || mode == "live-stall-video") return testTrackOutputStall(mode == "live-stall-audio");

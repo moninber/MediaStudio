@@ -247,6 +247,7 @@ public:
     void setTrackStalled(bool audio, bool stalled) noexcept { (audio ? stall_audio_ : stall_video_).store(stalled); }
     unsigned int sentAudioPackets() const noexcept { return sent_audio_.load(); }
     unsigned int sentVideoPackets() const noexcept { return sent_video_.load(); }
+    void releaseQueueBurst(QueueBurst burst) noexcept { queue_burst_.store(static_cast<int>(burst) + 1); }
 
 private:
     // 夹具自身的期限是故障保护；正常测试在此之前由 FFmpeg 返回。
@@ -317,6 +318,10 @@ private:
     bool sendRtp(SOCKET socket, const sockaddr_in& peer, std::size_t track, const std::array<unsigned char, N>& packet)
     {
         const std::string_view bytes{reinterpret_cast<const char*>(packet.data()), packet.size()};
+        return sendRtp(socket, peer, track, bytes);
+    }
+    bool sendRtp(SOCKET socket, const sockaddr_in& peer, std::size_t track, std::string_view bytes)
+    {
         auto& target = tracks_[track];
         return target.udp ? target.udp->sendRtp(peer, target.client_port, bytes) : writeAll(socket, bytes);
     }
@@ -324,11 +329,12 @@ private:
     // 纯视频流量小于预读阈值；UDP 丢弃后续数据，TCP 则用半包等待剩余字节。
     bool sendVideoThenStall(SOCKET socket, const sockaddr_in& peer)
     {
-        for (std::uint16_t seq = 1; seq <= 60; ++seq) {
+        // 正常阻塞读夹具只预送 1880 ms，保留足够的探测样本且不越过稳定模式 2 秒限界。
+        for (std::uint16_t seq = 1; seq <= 48; ++seq) {
             if (!sendRtp(socket, peer, 0, h264Rtp(seq))) return false;
         }
         if (tracks_[0].udp) return true;
-        const auto incomplete = h264Rtp(61);
+        const auto incomplete = h264Rtp(49);
         return writeAll(socket, {reinterpret_cast<const char*>(incomplete.data()), 5});
     }
 
@@ -344,7 +350,8 @@ private:
         // 直播加入点的音轨先于首个可解码视频 0.4 秒，避免把预探测的非关键视频当成主时钟起点。
         // 即时开始的测试两轨同时发送，只有视频的 RTP 时间戳可带人为偏移。
         const auto audio_origin = origin_seconds * 8000 + (video && key_video_ == KeyVideo::AwaitRelease ? 44800 : 0);
-        const auto total = video ? gate_at_frame + 24 : 72;
+        const auto total = video && key_video_ != KeyVideo::Immediate ? gate_at_frame + 24 : video ? 48 : 40;
+        std::uint16_t audio_sequence = 0;
         for (std::uint16_t seq = 1; seq <= total; ++seq) {
             if (video && seq > gate_at_frame && key_video_ == KeyVideo::NeverSend) {
                 while (!stopping_.load() && !disconnect_.load() && Clock::now() < hard_deadline_) {
@@ -359,10 +366,11 @@ private:
                 }
                 if (!key_released_.load()) return false;
             }
-            if (audio) {
+            // 等关键包用例只预送 400 ms 音频，不以 6 秒瞬时音频积压冒充正常等待。
+            if (audio && (key_video_ != KeyVideo::AwaitRelease || seq <= 10 || seq > gate_at_frame)) {
                 const auto channel = static_cast<unsigned char>(audio_track * 2);
-                const auto first = static_cast<std::uint16_t>(seq * 2 - 1);
-                const auto second = static_cast<std::uint16_t>(seq * 2);
+                const auto first = ++audio_sequence;
+                const auto second = ++audio_sequence;
                 if (!sendRtp(socket, peer, audio_track, pcmuRtp(first, audio_origin, channel)) ||
                     !sendRtp(socket, peer, audio_track, pcmuRtp(second, audio_origin, channel))) return false;
             }
@@ -419,6 +427,7 @@ private:
         const auto audio_track = video ? 1u : 0u;
         for (std::uint16_t seq = 1; !stopping_.load() && !disconnect_.load() && Clock::now() < hard_deadline_; ++seq) {
             if (!pollControl(socket, pending)) return false;
+            if (seq > 25 && queue_burst_.load()) return sendQueueBurst(socket, peer, seq, video, pending);
             if (audio && !stall_audio_.load()) {
                 const auto channel = static_cast<unsigned char>(audio_track * 2);
                 if (!sendRtp(socket, peer, audio_track, pcmuRtp(seq * 2 - 1, 2700 * 8000, channel)) ||
@@ -431,6 +440,60 @@ private:
             }
             next += 40ms;
             std::this_thread::sleep_until(next);
+        }
+        return false;
+    }
+
+    // 真实 RTP 先经 FFmpeg 重组为 AVPacket，再由生产队列决定是否 Full/单包过大。
+    bool sendQueueBurst(SOCKET socket, const sockaddr_in& peer, std::uint16_t first, bool video, std::string& pending)
+    {
+        const auto burst = static_cast<QueueBurst>(queue_burst_.load() - 1);
+        if (burst == QueueBurst::Audio) {
+            const auto track = video ? 1u : 0u;
+            for (std::uint16_t i = 0; i < 300; ++i) {
+                if (!sendRtp(socket, peer, track, pcmuRtp(first * 2 - 1 + i, 2700 * 8000, track * 2))) return false;
+                ++sent_audio_;
+            }
+        } else if (burst == QueueBurst::Video) {
+            for (std::uint16_t i = 0; i < 160; ++i) {
+                if (!sendRtp(socket, peer, 0, h264Rtp(first + i, 2700 * 90000))) return false;
+                ++sent_video_;
+            }
+        } else {
+            // 单个 NAL 大于稳定模式的 16 MiB；FU-A 分片共享时间戳，末片才置 marker。
+            std::size_t remaining = 16 * 1024 * 1024 + 1024;
+            auto sequence = first;
+            bool start = true;
+            const std::uint32_t timestamp = 2700u * 90000u + first * 3600u;
+            while (remaining) {
+                const auto count = std::min<std::size_t>(60000, remaining);
+                const bool end = count == remaining;
+                std::string fragment(18 + count, char{0x55});
+                fragment[0] = '$'; fragment[1] = 0;
+                fragment[2] = static_cast<char>((fragment.size() - 4) >> 8);
+                fragment[3] = static_cast<char>(fragment.size() - 4);
+                fragment[4] = static_cast<char>(0x80); fragment[5] = static_cast<char>(96 | (end ? 0x80 : 0));
+                fragment[6] = static_cast<char>(sequence >> 8); fragment[7] = static_cast<char>(sequence++);
+                for (int i = 0; i < 4; ++i) fragment[8 + i] = static_cast<char>(timestamp >> (8 * (3 - i)));
+                fragment[12] = 0x12; fragment[13] = 0x34; fragment[14] = 0x56; fragment[15] = 0x78;
+                fragment[16] = 0x7c; fragment[17] = static_cast<char>(5 | (start ? 0x80 : 0) | (end ? 0x40 : 0));
+                if (start) {
+                    // 保留有效 IDR slice 头，再附加大负载；无效头可能一直被 parser 缓存而没有 AVPacket。
+                    const auto idr = h264Rtp(first);
+                    std::copy(idr.begin() + 17, idr.end(), fragment.begin() + 18);
+                }
+                if (!sendRtp(socket, peer, 0, fragment)) return false;
+                remaining -= count; start = false; ++sent_video_;
+            }
+            // 下一帧给 H.264 parser 明确的帧边界，不能拿读包超时当作超大单包已验证。
+            auto next = h264Rtp(sequence);
+            for (int i = 0; i < 4; ++i) next[8 + i] = static_cast<unsigned char>((timestamp + 3600u) >> (8 * (3 - i)));
+            if (!sendRtp(socket, peer, 0, next)) return false;
+        }
+        // 继续处理关闭消息，不能用测试服务端主动 EOF 冒充客户端的队列故障。
+        while (!stopping_.load() && !disconnect_.load() && Clock::now() < hard_deadline_) {
+            if (!pollControl(socket, pending)) return false;
+            std::this_thread::sleep_for(5ms);
         }
         return false;
     }
@@ -580,6 +643,7 @@ private:
     std::atomic<unsigned int> remote_sessions_{0};
     const bool continuous_;
     std::atomic<bool> disconnect_{false};
+    std::atomic<int> queue_burst_{0};
     std::atomic<bool> stall_audio_{false};
     std::atomic<bool> stall_video_{false};
     std::atomic<unsigned int> sent_audio_{0};
@@ -612,3 +676,4 @@ void RtspBlackhole::disconnectCurrent() noexcept { impl_->disconnectCurrent(); }
 void RtspBlackhole::setTrackStalled(bool audio, bool stalled) noexcept { impl_->setTrackStalled(audio, stalled); }
 unsigned int RtspBlackhole::sentAudioPackets() const noexcept { return impl_->sentAudioPackets(); }
 unsigned int RtspBlackhole::sentVideoPackets() const noexcept { return impl_->sentVideoPackets(); }
+void RtspBlackhole::releaseQueueBurst(QueueBurst burst) noexcept { impl_->releaseQueueBurst(burst); }

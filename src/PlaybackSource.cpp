@@ -209,6 +209,13 @@ PlaybackPolicy playbackPolicy(const PlaybackSource& source) noexcept
             policy.open_timeout = 5s;
             policy.probe_timeout = 5s;
             policy.read_timeout = source.liveOptions()->preset == LivePreset::LowLatency ? 3s : 5s;
+            if (source.liveOptions()->preset == LivePreset::Stable) {
+                policy.audio_queue_limits = {512, 2 * 1024 * 1024, 2s};
+                policy.video_queue_limits = {512, 16 * 1024 * 1024, 2s};
+            } else {
+                policy.audio_queue_limits = {256, 1024 * 1024, 750ms};
+                policy.video_queue_limits = {256, 8 * 1024 * 1024, 750ms};
+            }
             break;
         case PlaybackSourceKind::NetworkVod:
             policy.pause = PauseBehavior::FreezeVod;

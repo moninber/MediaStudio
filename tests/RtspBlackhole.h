@@ -12,6 +12,7 @@ public:
     enum class SetupTransport { None, Tcp, Udp };
     enum class StartupMedia { Audio, Video, AudioVideo };
     enum class KeyVideo { Immediate, AwaitRelease, NeverSend };
+    enum class QueueBurst { Audio, Video, OversizedVideo };
 
     // 默认先完成握手并提供有效音频，保留读包取消测试的行为。
     explicit RtspBlackhole(StallAt stall = StallAt::ReadPacket, const std::string& bind_address = "127.0.0.1",
@@ -46,6 +47,8 @@ public:
     void setTrackStalled(bool audio, bool stalled) noexcept;
     unsigned int sentAudioPackets() const noexcept;
     unsigned int sentVideoPackets() const noexcept;
+    // 连续正常供包至少一秒后按轨道瞬发；跨自动连接保留，用于验证 Full 共享有限预算。
+    void releaseQueueBurst(QueueBurst burst) noexcept;
 
 private:
     class Impl;

@@ -118,6 +118,9 @@ public:
     // 便捷访问器
     bool hasVideo() const { return media_info_.has_video; }
     bool hasAudio() const { return media_info_.has_audio; }
+    // 返回会话打开时按值缓存的 time_base，不在队列统计中跨线程读取 AVStream。
+    AVRational audioPacketTimeBase() const noexcept { return audio_time_base_; }
+    AVRational videoPacketTimeBase() const noexcept { return video_time_base_; }
     int getOutputAudioSampleRate() const { return TARGET_SAMPLE_RATE; }
     int getOutputAudioChannels() const { return TARGET_CHANNELS; }
 

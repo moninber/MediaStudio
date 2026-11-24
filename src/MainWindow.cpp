@@ -93,11 +93,26 @@ QString formatMilestone(const std::optional<double>& seconds)
         ? QString("%1 ms").arg(*seconds * 1000.0, 0, 'f', 0) : QString("—");
 }
 
+QString queueLimitLabel(PacketQueueLimit limit)
+{
+    switch (limit) {
+        case PacketQueueLimit::Packets: return "包数";
+        case PacketQueueLimit::PayloadBytes: return "payload 字节";
+        case PacketQueueLimit::TimestampSpan: return "时间戳跨度";
+        default: return "—";
+    }
+}
+
 // 提示只使用固定错误分类，不拼接远端文本或原始网络地址。
 QString recoveryFailureLabel(const PlaybackSnapshot& snapshot)
 {
     if (snapshot.last_error) {
         if (const auto* read = std::get_if<MediaReadResult>(&*snapshot.last_error)) {
+            if (read->status == MediaReadStatus::QueueFull) return read->stage == MediaReadStage::AudioQueue
+                ? "音频队列达到限额" : "视频队列达到限额";
+            if (read->status == MediaReadStatus::PacketTooLarge) return snapshot.network_stats &&
+                snapshot.network_stats->preset == LivePreset::LowLatency
+                ? "单包超过低延迟限额，请重新以稳定模式打开" : "单包超过稳定模式限额，不支持此负载";
             if (read->stage == MediaReadStage::AudioOutput) return "音频输出超时";
             if (read->stage == MediaReadStage::VideoOutput) return "视频输出超时";
             if (read->stage == MediaReadStage::InitialOutput) return "等待首次输出失败";
@@ -121,6 +136,8 @@ QString recoveryFailureLabel(const PlaybackSnapshot& snapshot)
         case LiveFailureReason::SetupFailed: return "媒体初始化失败";
         case LiveFailureReason::OutputTimeout: return "媒体输出失活";
         case LiveFailureReason::LiveEof: return "直播结束或连接中断";
+        case LiveFailureReason::QueueLimit: return "队列达到限额";
+        case LiveFailureReason::PacketTooLarge: return "单包过大";
         default: return "连接失败或中断";
     }
 }
@@ -1108,6 +1125,21 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
             .arg(stats.reconnect_attempts + 1).arg(stats.reconnect_attempts).arg(stats.recovery_retries_used)
             .arg(stats.auto_reconnect_enabled ? "开" : "关");
         if (stats.last_failure_reason) info_text += QString("<p>最近故障: %1</p>").arg(recoveryFailureLabel(snapshot));
+        info_text += QString("<p>队列 Full 累计: %1 · 超大单包: %2</p>")
+            .arg(stats.queue_full_events).arg(stats.oversized_packet_events);
+        if (stats.last_queue_limit) info_text += QString("<p>最近触发限界: %1</p>").arg(queueLimitLabel(*stats.last_queue_limit));
+        const auto queue_info = [](const QString& name, const PacketQueueStats& queue) {
+            const auto span = queue.timestamp_span_seconds ? QString("%1 ms").arg(*queue.timestamp_span_seconds * 1000.0, 0, 'f', 0)
+                : QString("不可用");
+            return QString("<p><b>%1队列</b><br>包数: %2/%3 · payload: %4/%5 KiB<br>跨度: %6 / %7 ms"
+                           "<br>峰值: %8 包 · %9 KiB</p>")
+                .arg(name).arg(queue.packets).arg(queue.limits.packets)
+                .arg(queue.payload_bytes / 1024.0, 0, 'f', 1).arg(queue.limits.payload_bytes / 1024.0, 0, 'f', 0)
+                .arg(span).arg(std::chrono::duration<double, std::milli>(queue.limits.timestamp_span).count(), 0, 'f', 0)
+                .arg(queue.peak_packets).arg(queue.peak_payload_bytes / 1024.0, 0, 'f', 1);
+        };
+        if (info.has_audio) info_text += queue_info("音频", stats.audio_queue);
+        if (info.has_video) info_text += queue_info("视频", stats.video_queue);
         if (snapshot.state == PlaybackState::Reconnecting) info_text += "<p>旧连接及声音已释放，正在等待重试。</p>";
         // 视频就绪以有效帧提交为准；频谱可隐藏画面，因此绘制有独立时刻。
         if (info.has_audio || info.has_video) {
@@ -1219,6 +1251,12 @@ void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
                     const auto stopped = snapshot.network_stats ? snapshot.network_stats->recovery_stop_reason : std::nullopt;
                     if (stopped == RecoveryStopReason::AttemptsExhausted) status = "播放失败，重试次数已用尽: " + name;
                     if (stopped == RecoveryStopReason::DeadlineExceeded) status = "播放失败，恢复总时间已用尽: " + name;
+                    if (read && read->status == MediaReadStatus::PacketTooLarge) {
+                        status = "播放失败，" + recoveryFailureLabel(snapshot) + ": " + name;
+                    }
+                    if (read && read->status == MediaReadStatus::QueueFull && stopped == RecoveryStopReason::Disabled) {
+                        status = "播放失败，队列达到限额（自动重连已关闭）: " + name;
+                    }
                 }
                 break;
             }

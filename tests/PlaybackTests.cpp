@@ -63,6 +63,19 @@ void testSourcePolicies()
     const auto local_policy = playbackPolicy(file);
     const auto live_policy = playbackPolicy(live);
     const auto vod_policy = playbackPolicy(vod);
+    require(live_policy.audio_queue_limits.packets == 512 && live_policy.video_queue_limits.packets == 512 &&
+            live_policy.audio_queue_limits.payload_bytes == 2 * 1024 * 1024 &&
+            live_policy.video_queue_limits.payload_bytes == 16 * 1024 * 1024 &&
+            live_policy.audio_queue_limits.timestamp_span == 2s && live_policy.video_queue_limits.timestamp_span == 2s,
+            "stable live queue limits differ from the handoff");
+    const auto fast_policy = playbackPolicy(fast);
+    require(fast_policy.audio_queue_limits.packets == 256 && fast_policy.video_queue_limits.packets == 256 &&
+            fast_policy.audio_queue_limits.payload_bytes == 1024 * 1024 &&
+            fast_policy.video_queue_limits.payload_bytes == 8 * 1024 * 1024 &&
+            fast_policy.audio_queue_limits.timestamp_span == 750ms && fast_policy.video_queue_limits.timestamp_span == 750ms &&
+            local_policy.audio_queue_limits.packets == 0 && local_policy.video_queue_limits.payload_bytes == 0 &&
+            vod_policy.queue_full == QueueFullBehavior::Backpressure,
+            "queue presets leaked into local files or prescribed VoD reconnection");
     require(local_policy.pause == PauseBehavior::KeepPosition &&
             local_policy.end_of_stream == EndOfStreamBehavior::Drain &&
             local_policy.queue_full == QueueFullBehavior::LegacyThrottle &&

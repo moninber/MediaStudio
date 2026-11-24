@@ -43,6 +43,8 @@ void testClassification()
         {MediaReadResult{MediaReadStatus::Cancelled, AVERROR(ETIMEDOUT)}, Disposition::Cancelled, Reason::UserCancelled},
         {MediaOpenResult{MediaOpenStatus::Cancelled, AVERROR_HTTP_FORBIDDEN, MediaOpenStage::OpenInput}, Disposition::Cancelled, Reason::UserCancelled},
         {MediaReadResult{MediaReadStatus::Timeout, 0}, Disposition::Retryable, Reason::IoTimeout},
+        {MediaReadResult{MediaReadStatus::QueueFull, 0, MediaReadStage::AudioQueue}, Disposition::Retryable, Reason::QueueLimit},
+        {MediaReadResult{MediaReadStatus::PacketTooLarge, 0, MediaReadStage::VideoQueue}, Disposition::Fatal, Reason::PacketTooLarge},
         {MediaReadResult{MediaReadStatus::Timeout, AVERROR_EXIT, MediaReadStage::InitialOutput}, Disposition::Retryable, Reason::OutputTimeout},
         {MediaOpenResult{MediaOpenStatus::Timeout, AVERROR_EXIT, MediaOpenStage::ProbeStreams}, Disposition::Retryable, Reason::IoTimeout},
         {MediaReadResult{MediaReadStatus::EndOfStream, AVERROR_EOF}, Disposition::Retryable, Reason::LiveEof},

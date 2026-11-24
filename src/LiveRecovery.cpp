@@ -54,6 +54,10 @@ LiveFailure classifyLiveFailure(PlaybackSourceKind kind, const PlaybackError& er
         // 可信的应用分类优先于原始码，例如最后一个缓冲包返回 0 时也可能已经超时。
         if (cancelled) return {LiveFailureDisposition::Cancelled, LiveFailureReason::UserCancelled, code};
         if (success) return {LiveFailureDisposition::None, LiveFailureReason::None, code};
+        if constexpr (std::is_same_v<Result, MediaReadResult>) {
+            if (result.status == MediaReadStatus::QueueFull) return classifyLiveFailure(kind, LiveFailureEvent::QueueLimit);
+            if (result.status == MediaReadStatus::PacketTooLarge) return classifyLiveFailure(kind, LiveFailureEvent::PacketTooLarge);
+        }
         if (timeout) {
             const auto reason = [&] {
                 if constexpr (std::is_same_v<Result, MediaReadResult>) {

@@ -193,6 +193,23 @@ if(BUILD_TESTING)
     # CTest 也检查进程输出，覆盖 FFmpeg 的 C 级 stderr 与 Qt 调试日志。
     set_property(TEST MediaStudio.Playback.rtsp-stable PROPERTY FAIL_REGULAR_EXPRESSION "MediaStudioSecret[0-9A-Za-z]+")
 
+    # 队列容量、引用所有权与条件变量唤醒单独验证，不依赖 Qt 窗口或音频设备。
+    add_executable(MediaStudioQueueTests tests/QueueTests.cpp src/PacketQueue.cpp)
+    set_target_properties(MediaStudioQueueTests PROPERTIES AUTOMOC OFF
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    target_include_directories(MediaStudioQueueTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${MEDIASTUDIO_FFMPEG_ROOT}/include")
+    target_link_libraries(MediaStudioQueueTests PRIVATE Threads::Threads FFmpeg::avcodec FFmpeg::avutil)
+    foreach(test_case IN ITEMS limits timestamps ownership backpressure concurrency lifecycle)
+        set(test_name MediaStudio.Queue.${test_case})
+        add_test(NAME ${test_name} COMMAND MediaStudioQueueTests ${test_case})
+        set_tests_properties(${test_name} PROPERTIES TIMEOUT 10)
+        if(WIN32)
+            set_property(TEST ${test_name} PROPERTY ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:${MEDIASTUDIO_FFMPEG_ROOT}/bin"
+                "PATH=path_list_prepend:${mediastudio_compiler_bin}")
+        endif()
+    endforeach()
+
     # 恢复策略只依赖单调时间值；不启动窗口、声卡或真实网络，也不等待真实的 45 秒。
     add_executable(MediaStudioRecoveryTests tests/RecoveryTests.cpp src/LiveRecovery.cpp src/MediaIo.cpp)
     set_target_properties(MediaStudioRecoveryTests PROPERTIES
@@ -254,7 +271,9 @@ if(BUILD_TESTING)
                           mixed-switch-tcp mixed-switch-udp live-failures-tcp live-failures-udp
                           live-recover-av-tcp live-recover-av-udp live-recover-video-tcp live-recover-video-udp
                           live-recover-audio-tcp live-recover-audio-udp live-recovery-budget live-recovery-cancel
-                          live-stall-audio live-stall-video live-recovery-metadata window-auto-recovery)
+                          live-stall-audio live-stall-video live-recovery-metadata window-auto-recovery
+                          live-queue-audio-tcp live-queue-audio-udp live-queue-video-tcp live-queue-video-udp
+                          live-queue-cancel live-oversized-video-tcp window-queue-failure)
         set(test_name MediaStudio.Session.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES
@@ -266,14 +285,15 @@ if(BUILD_TESTING)
         if(test_case MATCHES "^live-start-(av|audio)-" OR test_case MATCHES "^live-pause-av-" OR
            test_case MATCHES "^live-cycle-audio-" OR test_case MATCHES "^mixed-switch-" OR
            test_case MATCHES "^live-recover-(av|audio)-" OR test_case MATCHES "^live-stall-" OR
-           test_case STREQUAL "live-recovery-metadata")
+           test_case STREQUAL "live-recovery-metadata" OR test_case MATCHES "^live-queue-" OR
+           test_case STREQUAL "window-queue-failure")
             set_property(TEST ${test_name} PROPERTY SKIP_RETURN_CODE 77)
         endif()
         # 连续切换须逐个等待真实 PCM/视频输出，慢速测试机仍有有界的失败期限。
         if(test_case MATCHES "^mixed-switch-")
             set_property(TEST ${test_name} PROPERTY TIMEOUT 45)
         endif()
-        if(test_case MATCHES "^live-recover" OR test_case MATCHES "^live-stall-")
+        if(test_case MATCHES "^live-recover" OR test_case MATCHES "^live-stall-" OR test_case MATCHES "^live-queue-")
             set_property(TEST ${test_name} PROPERTY TIMEOUT 35)
         endif()
         if(TARGET Qt6::QOffscreenIntegrationPlugin)

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <optional>
 #include <string>
+#include "PacketQueueTypes.h"
 
 // 源类型由调用方显式选择，不根据扩展名或“是否网络”猜测播放行为。
 enum class PlaybackSourceKind { LocalFile, NetworkLive, NetworkVod };
@@ -74,6 +75,8 @@ struct PlaybackPolicy {
     std::chrono::milliseconds open_timeout{0};
     std::chrono::milliseconds probe_timeout{0};
     std::chrono::milliseconds read_timeout{0};
+    PacketQueueLimits audio_queue_limits;
+    PacketQueueLimits video_queue_limits;
 };
 
 struct PlaybackCapabilities {

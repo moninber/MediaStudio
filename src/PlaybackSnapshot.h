@@ -42,6 +42,7 @@ struct NetworkPlaybackStats {
     std::uint64_t reconnect_attempts = 0;
     unsigned int recovery_retries_used = 0;
     bool auto_reconnect_enabled = false;
+    LivePreset preset = LivePreset::Stable;
     std::optional<LiveFailureReason> last_failure_reason;
     std::optional<RecoveryStopReason> recovery_stop_reason;
     std::optional<double> retry_in_seconds;
@@ -49,6 +50,12 @@ struct NetworkPlaybackStats {
     std::optional<double> input_ready_seconds;
     std::optional<double> last_audio_output_age_seconds;
     std::optional<double> last_video_output_age_seconds;
+    PacketQueueStats audio_queue;
+    PacketQueueStats video_queue;
+    // 按显式用户请求累计，跨自动连接保留；与同步丢帧/损坏帧分别计数。
+    std::uint64_t queue_full_events = 0;
+    std::uint64_t oversized_packet_events = 0;
+    std::optional<PacketQueueLimit> last_queue_limit;
     // 各阶段仅记首次，从当前连接尝试开始计时，自动重建时重置。
     std::optional<double> first_packet_seconds;
     std::optional<double> first_pcm_seconds;

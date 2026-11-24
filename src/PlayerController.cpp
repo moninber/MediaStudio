@@ -101,6 +101,7 @@ std::uint64_t PlayerController::requestOpenLocked(PlaybackSource source, bool re
     if (source.kind() == PlaybackSourceKind::NetworkLive) {
         snapshot_.network_stats.emplace();
         snapshot_.network_stats->auto_reconnect_enabled = source.liveOptions()->auto_reconnect;
+        snapshot_.network_stats->preset = source.liveOptions()->preset;
     }
     resume_state_ = PlaybackState::Playing;
     if (video_widget_) video_widget_->setPlaybackEpoch(epoch, retain_frame);
@@ -283,6 +284,17 @@ PlaybackSnapshot PlayerController::getPlaybackSnapshot() const
             std::chrono::duration<double>(now - *last_audio_output_at_).count();
         if (last_video_output_at_) snapshot.network_stats->last_video_output_age_seconds =
             std::chrono::duration<double>(now - *last_video_output_at_).count();
+        // 新命令可能还在等待旧 worker 退出；Opening 不展示旧队列的峰值/计数。
+        if (snapshot.state == PlaybackState::Opening && current_source_) {
+            const auto policy = playbackPolicy(*current_source_);
+            snapshot.network_stats->audio_queue = {};
+            snapshot.network_stats->video_queue = {};
+            snapshot.network_stats->audio_queue.limits = policy.audio_queue_limits;
+            snapshot.network_stats->video_queue.limits = policy.video_queue_limits;
+        } else {
+            snapshot.network_stats->audio_queue = audio_packets_.stats();
+            snapshot.network_stats->video_queue = video_packets_.stats();
+        }
     }
     snapshot.stats.audio_queue_packets = audio_packets_.size();
     snapshot.stats.video_queue_packets = video_packets_.size();
@@ -356,6 +368,10 @@ void PlayerController::supervisorLoop()
         pending_open_.reset();
         auto* video = video_widget_;
         const bool live = request.source.kind() == PlaybackSourceKind::NetworkLive;
+        const auto policy = playbackPolicy(request.source);
+        // 旧请求的 worker 已回收，新连接从空队列/零计数开始；探测后再安装真实 time_base。
+        audio_packets_.reset(policy.audio_queue_limits, {0, 1});
+        video_packets_.reset(policy.video_queue_limits, {0, 1});
         LiveRecoveryBudget recovery(live && request.source.liveOptions()->auto_reconnect);
         supervisor_busy_ = true;
         const auto current_request = [&] {
@@ -447,9 +463,15 @@ void PlayerController::supervisorLoop()
                     snapshot_.network_stats.emplace();
                     auto& next_stats = *snapshot_.network_stats;
                     next_stats.auto_reconnect_enabled = request.source.liveOptions()->auto_reconnect;
+                    next_stats.preset = request.source.liveOptions()->preset;
                     next_stats.reconnect_attempts = recovery.totalRetriesStarted();
                     next_stats.recovery_retries_used = recovery.retriesUsed();
                     next_stats.last_failure_reason = previous.last_failure_reason;
+                    next_stats.queue_full_events = previous.queue_full_events;
+                    next_stats.oversized_packet_events = previous.oversized_packet_events;
+                    next_stats.last_queue_limit = previous.last_queue_limit;
+                    audio_packets_.reset(policy.audio_queue_limits, {0, 1});
+                    video_packets_.reset(policy.video_queue_limits, {0, 1});
                     next_stats.attempt_started_seconds =
                         std::chrono::duration<double>(started - request_submitted_at_).count();
                     if (video) video->setPlaybackEpoch(request.epoch, true);
@@ -491,8 +513,9 @@ std::optional<PlaybackError> PlayerController::runRequest(const OpenRequest& req
         duration_ = snapshot_.media_info.duration;
         snapshot_.capabilities = initialPlaybackCapabilities(request.source.kind(), duration_ > 0.0);
         snapshot_.state = live ? PlaybackState::Buffering : PlaybackState::Playing;
-        audio_packets_.reset();
-        video_packets_.reset();
+        const auto policy = playbackPolicy(request.source);
+        audio_packets_.reset(policy.audio_queue_limits, decoder_.audioPacketTimeBase());
+        video_packets_.reset(policy.video_queue_limits, decoder_.videoPacketTimeBase());
         playing_ = !live;
         if (live) {
             const auto now = Clock::now();
@@ -515,6 +538,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
     const bool live = request.source.kind() == PlaybackSourceKind::NetworkLive;
     const bool use_audio = decoder_.hasAudio();
     const bool use_video = decoder_.hasVideo();
+    const auto policy = playbackPolicy(request.source);
 
     std::atomic<float> active_speed(local_file ? speed_.load() : 1.0f);
     decoder_.setPlaybackSpeed(active_speed.load());
@@ -594,9 +618,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
         LiveOutputHealth health;
         health.required_tracks_outputting = (!use_audio || (last_audio_output_at_ && now - *last_audio_output_at_ <= 2s)) &&
             (!use_video || (last_video_output_at_ && now - *last_video_output_at_ <= 2s));
-        // 此处仅观察包数是否在计划限界内；3.3 再强制执行包数/字节/跨度上限。
-        const int observed_packet_limit = request.source.liveOptions()->preset == LivePreset::Stable ? 512 : 256;
-        health.buffers_within_limits = audio_packets_.size() <= observed_packet_limit && video_packets_.size() <= observed_packet_limit &&
+        health.buffers_within_limits = audio_packets_.stats().withinLimits() && video_packets_.stats().withinLimits() &&
             snapshot_.stats.audio_buffer_seconds <= 1.0;
         const double media = current_time_.load();
         const double elapsed = std::chrono::duration<double>(now - health_sample_at).count();
@@ -1099,7 +1121,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
 
         const bool audio_queue_full = !audio_ready || audio_packets_.size() > 80;
         const bool video_queue_full = !use_video || video_packets_.size() > 80;
-        if (audio_queue_full && video_queue_full) {
+        if (policy.queue_full == QueueFullBehavior::LegacyThrottle && audio_queue_full && video_queue_full) {
             std::this_thread::sleep_for(2ms);
             continue;
         }
@@ -1118,7 +1140,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
             continue;
         }
 
-        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        std::unique_lock<std::mutex> lock(snapshot_mutex_);
         if (!running()) break;
         if (result.status == MediaReadStatus::Packet) {
             if (live && !snapshot_.network_stats->first_packet_seconds) {
@@ -1127,16 +1149,51 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
             }
             // 读包前捕获标签，入队时保存。暂停可保留队列，seek 则丢弃这次旧读取。
             if (!seek_requested_) {
-                if (audio_ready && decoder_.isAudioPacket(packet)) audio_packets_.push(packet, epoch);
+                // 只直播把 Full 变成有限恢复；点播预留可取消回压，等待时不持命令锁。
+                const auto enqueue = [&](PacketQueue& queue, MediaReadStage stage) {
+                    const bool backpressure = policy.queue_full == QueueFullBehavior::Backpressure;
+                    if (backpressure) lock.unlock();
+                    const auto pushed = queue.push(packet, epoch, backpressure
+                        ? PacketPushMode::WaitForSpace : PacketPushMode::Immediate);
+                    if (backpressure) lock.lock();
+                    if (!running() || currentEpochLocked() != epoch) return false;
+                    if (pushed.status == PacketPushStatus::Queued) return true;
+                    if (pushed.status == PacketPushStatus::Full || pushed.status == PacketPushStatus::PacketTooLarge) {
+                        error = MediaReadResult{pushed.status == PacketPushStatus::Full
+                            ? MediaReadStatus::QueueFull : MediaReadStatus::PacketTooLarge, 0, stage};
+                        if (live) {
+                            auto& stats = *snapshot_.network_stats;
+                            if (pushed.status == PacketPushStatus::Full) ++stats.queue_full_events;
+                            else ++stats.oversized_packet_events;
+                            stats.last_queue_limit = pushed.limit;
+                            const auto queued = queue.stats();
+                            std::cout << "[Queue] request=" << epoch.request_id << " attempt=" << epoch.connection_attempt_id
+                                << " generation=" << epoch.generation << " monotonic_ms="
+                                << std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count()
+                                << " event=" << (pushed.status == PacketPushStatus::Full ? "full" : "oversized-packet")
+                                << " track=" << (stage == MediaReadStage::AudioQueue ? "audio" : "video")
+                                << " limit=" << static_cast<int>(pushed.limit) << " queued_packets=" << queued.packets
+                                << " payload_bytes=" << queued.payload_bytes << std::endl;
+                        }
+                    } else if (pushed.status == PacketPushStatus::AllocationFailed) {
+                        error = MediaReadResult{MediaReadStatus::Error, AVERROR(ENOMEM), stage};
+                    } else {
+                        // 当前会话仍活动却拒收包属于明确错误，不能把包静默丢掉继续播放。
+                        error = MediaReadResult{MediaReadStatus::Error, AVERROR(EINVAL), stage};
+                    }
+                    return false;
+                };
+                if (audio_ready && decoder_.isAudioPacket(packet)) enqueue(audio_packets_, MediaReadStage::AudioQueue);
                 else if (use_video && decoder_.isVideoPacket(packet)) {
                     // 解码器须从关键包提示开始；坏包标记的首个关键包不打开门。
                     const bool clean_key = (packet->flags & AV_PKT_FLAG_KEY) && !(packet->flags & AV_PKT_FLAG_CORRUPT);
-                    if ((!awaiting_video_key || clean_key) && video_packets_.push(packet, epoch)) {
+                    if ((!awaiting_video_key || clean_key) && enqueue(video_packets_, MediaReadStage::VideoQueue)) {
                         awaiting_video_key = false;
                     }
                 }
             }
             av_packet_unref(packet);
+            if (error) break;
         }
         else if (result.status == MediaReadStatus::EndOfStream && local_file) {
             draining = true;
