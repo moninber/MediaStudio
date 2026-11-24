@@ -57,6 +57,7 @@ LiveFailure classifyLiveFailure(PlaybackSourceKind kind, const PlaybackError& er
         if constexpr (std::is_same_v<Result, MediaReadResult>) {
             if (result.status == MediaReadStatus::QueueFull) return classifyLiveFailure(kind, LiveFailureEvent::QueueLimit);
             if (result.status == MediaReadStatus::PacketTooLarge) return classifyLiveFailure(kind, LiveFailureEvent::PacketTooLarge);
+            if (result.status == MediaReadStatus::LiveBacklog) return classifyLiveFailure(kind, LiveFailureEvent::Backlog);
         }
         if (timeout) {
             const auto reason = [&] {
@@ -96,6 +97,8 @@ LiveFailure classifyLiveFailure(PlaybackSourceKind kind, LiveFailureEvent event)
             return {LiveFailureDisposition::Retryable, LiveFailureReason::QueueLimit, 0};
         case LiveFailureEvent::PacketTooLarge:
             return {LiveFailureDisposition::Fatal, LiveFailureReason::PacketTooLarge, 0};
+        case LiveFailureEvent::Backlog:
+            return {LiveFailureDisposition::Retryable, LiveFailureReason::Backlog, 0};
     }
     return {LiveFailureDisposition::Fatal, LiveFailureReason::InvalidSource, 0};
 }

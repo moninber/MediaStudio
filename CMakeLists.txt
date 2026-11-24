@@ -37,6 +37,7 @@ set(MEDIASTUDIO_PLAYBACK_SOURCES
 
 set(MEDIASTUDIO_SESSION_SOURCES
     src/LiveReceiveMonitor.cpp
+    src/LiveBacklog.cpp
     src/AudioOutput.cpp
     src/VideoRenderer.cpp
     src/AudioVisualizer.cpp
@@ -57,6 +58,7 @@ set(MEDIASTUDIO_HEADERS
     src/PlaybackSource.h
     src/PlaybackSnapshot.h
     src/LiveReceiveMonitor.h
+    src/LiveBacklog.h
     src/MediaIo.h
     src/LiveRecovery.h
     src/MediaInfo.h
@@ -241,6 +243,20 @@ if(BUILD_TESTING)
         endif()
     endforeach()
 
+    # 候选/撤销/持续时间与混合恢复预算，使用显式单调时间核对，不以真实睡眠代替边界检查。
+    add_executable(MediaStudioBacklogTests tests/LiveBacklogTests.cpp src/LiveBacklog.cpp src/LiveReceiveMonitor.cpp src/LiveRecovery.cpp src/MediaIo.cpp)
+    set_target_properties(MediaStudioBacklogTests PROPERTIES AUTOMOC OFF RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    target_include_directories(MediaStudioBacklogTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${MEDIASTUDIO_FFMPEG_ROOT}/include")
+    target_link_libraries(MediaStudioBacklogTests PRIVATE Threads::Threads)
+    foreach(test_case IN ITEMS gates thresholds sustained withdrawal cancellation monitor-stream budget)
+        set(test_name MediaStudio.Backlog.${test_case})
+        add_test(NAME ${test_name} COMMAND MediaStudioBacklogTests ${test_case})
+        set_tests_properties(${test_name} PROPERTIES TIMEOUT 10)
+        if(WIN32)
+            set_property(TEST ${test_name} PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${mediastudio_compiler_bin}")
+        endif()
+    endforeach()
+
     # 恢复策略使用可控单调时钟，不等待真实的 45 秒。
     add_executable(MediaStudioRecoveryTests tests/RecoveryTests.cpp src/LiveRecovery.cpp src/MediaIo.cpp)
     set_target_properties(MediaStudioRecoveryTests PROPERTIES
@@ -313,7 +329,10 @@ if(BUILD_TESTING)
                           live-fault-blackhole-read-tcp live-fault-blackhole-read-udp
                           live-fault-responses-tcp live-fault-responses-udp live-real-time-budget window-transient-buffering
                           live-buffer-presets window-audio-buffer-report live-receive-tcp live-receive-udp
-                          live-receive-auto-reset window-receive-details)
+                          live-receive-auto-reset window-receive-details
+                          live-backlog-recover-tcp live-backlog-recover-udp live-backlog-transient live-backlog-invalid
+                          live-backlog-stable live-backlog-disabled live-backlog-budget
+                          live-backlog-cancel-candidate live-backlog-cancel-backoff window-low-latency)
         set(test_name MediaStudio.Session.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES
@@ -333,6 +352,15 @@ if(BUILD_TESTING)
         # 连续切换须逐个等待真实 PCM/视频输出，慢速测试机仍有有界的失败期限。
         if(test_case MATCHES "^live-receive-")
             set_property(TEST ${test_name} PROPERTY TIMEOUT 30)
+        endif()
+        if(test_case MATCHES "^live-backlog-")
+            set_property(TEST ${test_name} PROPERTY TIMEOUT 35)
+        endif()
+        if(test_case STREQUAL "window-low-latency")
+            set_property(TEST ${test_name} PROPERTY TIMEOUT 35)
+        endif()
+        if(test_case STREQUAL "live-backlog-budget")
+            set_property(TEST ${test_name} PROPERTY TIMEOUT 65)
         endif()
         if(test_case MATCHES "^mixed-switch-")
             set_property(TEST ${test_name} PROPERTY TIMEOUT 45)

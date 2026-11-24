@@ -73,6 +73,7 @@ private:
     void retireLiveOutputLocked(VideoWidget* video);
     std::uint64_t requestOpenLocked(PlaybackSource source, bool retain_frame);
     void cancelCurrentLocked();
+    void cancelBacklogLocked(LiveBacklogReason reason);
     void resetSnapshotLocked(std::uint64_t request_id, PlaybackState state);
     std::uint64_t setPausedLocked(bool paused);
     PlaybackEpoch currentEpochLocked() const;
@@ -99,6 +100,7 @@ private:
     std::optional<double> pending_seek_;
     PlaybackSnapshot snapshot_;
     LiveReceiveMonitor receive_monitor_; // 与快照同锁，只有当前连接可写；读快照只进行有界的纯计算。
+    LiveBacklogPolicy backlog_policy_; // 纯候选状态同锁访问，GUI 取消不等待 supervisor/网络。
     std::chrono::steady_clock::time_point request_submitted_at_{};
     std::chrono::steady_clock::time_point connection_started_at_{};
     std::optional<std::chrono::steady_clock::time_point> live_output_started_at_;

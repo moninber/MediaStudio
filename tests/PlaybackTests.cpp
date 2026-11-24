@@ -116,8 +116,16 @@ void testPresetContracts()
             config.rtsp_udp.max_delay == std::chrono::microseconds{low ? 100000 : 500000} &&
             config.rtsp_udp.reorder_packets == (low ? 128 : 512) &&
             config.rtsp_fps_probe_frames == (low ? std::optional{8} : std::nullopt), "audio/UDP/probe preset or microsecond unit mismatch");
+        require(config.backlog.has_value() == low && (!low || (config.backlog->lag_threshold == 1500ms &&
+            config.backlog->progress_limit == .8 && config.backlog->sustained_for == 3s &&
+            config.backlog->minimum_observations == 3 && config.backlog->max_dts_age == 3s && config.backlog->warmup == 2s)),
+            "central backlog preset differs from the handoff");
         for (const auto transport : {RtspTransport::Tcp, RtspTransport::Udp}) {
             const auto policy = playbackPolicy(PlaybackSource::networkLive("rtsp://example.test/live", {transport, preset}));
+            const auto entry = createRtspSource("rtsp://example.test/live", {transport, preset, false});
+            require(entry.source && entry.source->liveOptions()->preset == preset &&
+                entry.source->liveOptions()->rtsp_transport == transport && !entry.source->liveOptions()->auto_reconnect &&
+                policy.backlog.has_value() == low, "public RTSP factory lost mode/transport/automatic selection");
             require(policy.rtsp_udp.has_value() == (transport == RtspTransport::Udp) &&
                 policy.audio_buffer.duration == config.audio_buffer.duration &&
                 policy.audio_buffer.fallback == config.audio_buffer.fallback &&

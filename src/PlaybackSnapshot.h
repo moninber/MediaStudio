@@ -39,6 +39,10 @@ struct PlaybackStats {
 // 网络观测尚未采样时使用空值，不把未采集的数据显示为零码率或零包龄。
 struct NetworkPlaybackStats {
     LiveReceiveStats receive;
+    LiveBacklogStats backlog;
+    std::uint64_t backlog_candidates = 0;
+    std::uint64_t backlog_candidates_cleared = 0;
+    std::uint64_t backlog_reconnect_requests = 0; // 请求不等于实际启动；自动重试另记 reconnect_attempts。
     std::uint64_t reconnect_attempts = 0;
     unsigned int recovery_retries_used = 0;
     bool auto_reconnect_enabled = false;

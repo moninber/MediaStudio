@@ -44,6 +44,7 @@ void PlayerController::resetSnapshotLocked(std::uint64_t request_id, PlaybackSta
 {
     snapshot_ = {};
     receive_monitor_ = {};
+    backlog_policy_ = {};
     snapshot_.request_id = request_id;
     snapshot_.state = state;
     request_submitted_at_ = {};
@@ -60,11 +61,22 @@ void PlayerController::cancelCurrentLocked()
 {
     if (active_io_) active_io_->cancel();
     if (active_recovery_) active_recovery_->cancel();
+    cancelBacklogLocked(LiveBacklogReason::UserCancelled);
     pending_open_.reset();
     pending_seek_.reset();
     seek_requested_ = false;
     playing_ = false;
     paused_ = false;
+}
+
+// GUI 和 supervisor 同用快照锁：撤销尚未提交的候选，不把取消或候选请求算成自动连接。
+void PlayerController::cancelBacklogLocked(LiveBacklogReason reason)
+{
+    const auto decision = backlog_policy_.cancel(reason);
+    if (snapshot_.network_stats) {
+        if (decision.candidate_cleared) ++snapshot_.network_stats->backlog_candidates_cleared;
+        snapshot_.network_stats->backlog = backlog_policy_.stats();
+    }
 }
 
 std::uint64_t PlayerController::requestOpen(const PlaybackSource& source)
@@ -101,6 +113,8 @@ std::uint64_t PlayerController::requestOpenLocked(PlaybackSource source, bool re
         snapshot_.network_stats.emplace();
         snapshot_.network_stats->auto_reconnect_enabled = source.liveOptions()->auto_reconnect;
         snapshot_.network_stats->preset = source.liveOptions()->preset;
+        backlog_policy_.reset(playbackPolicy(source).backlog, source.liveOptions()->auto_reconnect, submitted_at);
+        snapshot_.network_stats->backlog = backlog_policy_.stats();
     }
     resume_state_ = PlaybackState::Playing;
     if (video_widget_) video_widget_->setPlaybackEpoch(epoch, retain_frame);
@@ -280,6 +294,7 @@ PlaybackSnapshot PlayerController::getPlaybackSnapshot() const
     if (snapshot.network_stats) {
         const auto now = Clock::now();
         snapshot.network_stats->receive = receive_monitor_.snapshot(now);
+        snapshot.network_stats->backlog = backlog_policy_.stats();
         if (last_audio_output_at_) snapshot.network_stats->last_audio_output_age_seconds =
             std::chrono::duration<double>(now - *last_audio_output_at_).count();
         if (last_video_output_at_) snapshot.network_stats->last_video_output_age_seconds =
@@ -334,6 +349,8 @@ void PlayerController::retireLiveOutputLocked(VideoWidget* video)
 {
     const auto now = Clock::now();
     receive_monitor_.finish(now);
+    cancelBacklogLocked(active_recovery_ && active_recovery_->isCancelled()
+        ? LiveBacklogReason::UserCancelled : LiveBacklogReason::ConnectionEnded);
     if (live_output_started_at_) {
         snapshot_.live_elapsed_seconds = std::chrono::duration<double>(now - *live_output_started_at_).count();
         live_output_started_at_.reset();
@@ -467,6 +484,7 @@ void PlayerController::supervisorLoop()
                     snapshot_.media_info = {};
                     snapshot_.audio_output.reset();
                     receive_monitor_ = {};
+                    backlog_policy_.reset(policy.backlog, request.source.liveOptions()->auto_reconnect, started);
                     snapshot_.stats = {};
                     snapshot_.state = PlaybackState::Opening;
                     snapshot_.has_current_video_output = false;
@@ -481,6 +499,10 @@ void PlayerController::supervisorLoop()
                     next_stats.queue_full_events = previous.queue_full_events;
                     next_stats.oversized_packet_events = previous.oversized_packet_events;
                     next_stats.last_queue_limit = previous.last_queue_limit;
+                    next_stats.backlog = backlog_policy_.stats();
+                    next_stats.backlog_candidates = previous.backlog_candidates;
+                    next_stats.backlog_candidates_cleared = previous.backlog_candidates_cleared;
+                    next_stats.backlog_reconnect_requests = previous.backlog_reconnect_requests;
                     audio_packets_.reset(policy.audio_queue_limits, {0, 1});
                     video_packets_.reset(policy.video_queue_limits, {0, 1});
                     next_stats.attempt_started_seconds =
@@ -565,7 +587,6 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
     std::atomic<bool> workers_done(false);
     std::atomic<bool> worker_allocation_failed(false);
     std::atomic<int> audio_error(0);
-    std::atomic<bool> video_timing_known(false);
 
     auto epoch_now = [&] {
         return PlaybackEpoch{request.epoch.request_id, request.epoch.connection_attempt_id, stream_generation.load()};
@@ -609,12 +630,52 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
         return audio_clock.epoch == epoch ? audio_clock : AudioClockSample{};
     };
 
+    bool backlog_reconnect_requested = false;
+    // supervisor 只请求正常收尾；不在 GUI/音频线程关闭输入，不另建恢复线程。
+    auto update_backlog = [&] {
+        if (!live) return;
+        const auto now = Clock::now();
+        const auto epoch = epoch_now();
+        LiveReceiveStats received;
+        LiveBacklogDecision decision;
+        LiveBacklogStats status;
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            if (!is_current(epoch) || epoch != currentEpochLocked()) return;
+            received = receive_monitor_.snapshot(now);
+            decision = backlog_policy_.observe(received, now);
+            status = backlog_policy_.stats();
+            auto& stats = *snapshot_.network_stats;
+            stats.backlog = status;
+            if (decision.candidate_started) ++stats.backlog_candidates;
+            if (decision.candidate_cleared) ++stats.backlog_candidates_cleared;
+            if (decision.request_reconnect) {
+                ++stats.backlog_reconnect_requests;
+                backlog_reconnect_requested = true;
+            }
+        }
+        // 日志在快照锁外；只记录事件，不为每个包打印或让 GUI 等待 stdout。
+        const auto log_event = [&](const char* event) {
+            std::cout << "[Backlog] request=" << epoch.request_id << " attempt=" << epoch.connection_attempt_id
+                << " generation=" << epoch.generation << " monotonic_ms="
+                << std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count()
+                << " event=" << event << " window=" << received.sample_sequence << " domain=" << received.timestamp_domain
+                << " observations=" << status.observations << " confirmed_s=" << status.confirmed_seconds
+                << " clear_reason=" << static_cast<int>(status.last_clear_reason.value_or(LiveBacklogReason::None))
+                << " rate=" << (received.media_progress_rate ? std::to_string(*received.media_progress_rate) : "unavailable")
+                << " lag_s=" << (received.relative_lag_seconds ? std::to_string(*received.relative_lag_seconds) : "unavailable") << std::endl;
+        };
+        if (decision.candidate_cleared) log_event("candidate-cleared");
+        if (decision.candidate_started) log_event("candidate-started");
+        if (decision.request_reconnect) log_event("reconnect-requested");
+    };
+
     bool recovery_output_observed = false;
     auto health_sample_at = Clock::now() - 1s;
-    std::optional<double> previous_media_position;
     // 只在 supervisor 调策略；worker 仅发布实际输出时间，不能并发修改恢复预算。
     auto update_recovery = [&] {
         if (!live || !recovery) return;
+        update_backlog();
         std::lock_guard<std::mutex> lock(snapshot_mutex_);
         if (!is_current(epoch_now()) || currentEpochLocked() != epoch_now()) return;
         if (!recovery_output_observed && outputs_ready_at_) {
@@ -634,15 +695,12 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
             (!use_video || (last_video_output_at_ && now - *last_video_output_at_ <= 2s));
         health.buffers_within_limits = audio_packets_.stats().withinLimits() && video_packets_.stats().withinLimits() &&
             snapshot_.stats.audio_buffer_seconds <= 1.0;
-        const double media = current_time_.load();
-        const double elapsed = std::chrono::duration<double>(now - health_sample_at).count();
-        const bool timing_known = use_audio ? audio_clock.uses_source_pts : video_timing_known.load();
-        if (timing_known && previous_media_position) {
-            const double advanced = media - *previous_media_position;
-            // 时间域跳变撤销这次测量；可信的慢速推进不能恢复预算。
-            if (advanced >= 0.0 && advanced <= elapsed * 2.0) health.media_progress_healthy = advanced >= elapsed * 0.8;
+        const auto received = receive_monitor_.snapshot(now);
+        // 可信输入持续慢于实时则不能恢复预算；DTS 不可用时依旧由持续输出和有界缓冲判断。
+        if (received.timing_state == LiveTimingState::Ready && received.media_progress_rate) {
+            health.media_progress_healthy = *received.media_progress_rate >= livePresetSettings(request.source.liveOptions()->preset)
+                .backlog.value_or(LiveBacklogSettings{}).progress_limit;
         }
-        previous_media_position = media;
         health_sample_at = now;
         if (recovery->observeOutputs(now, health)) {
             std::cout << "[Recovery] request=" << request.epoch.request_id
@@ -956,7 +1014,6 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                     if (!is_current(epoch) || audio_error) return;
 
                     const bool valid_pts = frame.has_valid_pts && std::isfinite(frame.pts);
-                    video_timing_known = valid_pts;
                     const bool clock_jump = valid_pts && last_live_video_pts &&
                         std::abs(frame.pts - *last_live_video_pts) > LiveClockJumpSeconds;
                     const bool first_valid_pts = valid_pts && !last_live_video_pts;
@@ -1108,6 +1165,10 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
     bool awaiting_video_key = live && use_video;
     while (packet && running()) {
         update_recovery();
+        if (backlog_reconnect_requested) {
+            error = MediaReadResult{MediaReadStatus::LiveBacklog, 0};
+            break;
+        }
         if (live) {
             if (const auto stage = request.io->liveDeadlineStage()) {
                 error = MediaReadResult{MediaReadStatus::Timeout, AVERROR(ETIMEDOUT), *stage};
@@ -1183,7 +1244,6 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
         // 格式上下文仅 supervisor 使用。网络等包期间，worker 仍可用缓存的 time_base 解码。
         const MediaReadResult result = decoder_.readPacketResult(packet);
         const auto received_at = Clock::now();
-        update_recovery();
         if (live) {
             if (const auto stage = request.io->liveDeadlineStage()) {
                 error = MediaReadResult{MediaReadStatus::Timeout, result.ffmpegError, *stage};
@@ -1276,6 +1336,12 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
         }
         else {
             error = result;
+            break;
+        }
+        lock.unlock();
+        update_recovery(); // 先记当前包，再判断参考失效/换域是否应撤销候选。
+        if (backlog_reconnect_requested) {
+            error = MediaReadResult{MediaReadStatus::LiveBacklog, 0};
             break;
         }
     }

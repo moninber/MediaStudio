@@ -24,6 +24,7 @@ struct LiveReceiveStats {
     LiveTimingState timing_state = LiveTimingState::Waiting;
     std::uint64_t timestamp_domain = 0;
     std::optional<double> reference_dts_age_seconds;
+    std::optional<double> baseline_age_seconds;
     std::optional<double> media_progress_rate;
     std::optional<double> relative_lag_seconds;
 };

@@ -95,6 +95,7 @@ LiveReceiveStats LiveReceiveMonitor::snapshot(Clock::time_point now) const
     if (!started_ || now < *started_) return result;
     if (last_packet_at_) result.last_packet_age_seconds = seconds(now - *last_packet_at_);
     if (latest_) result.reference_dts_age_seconds = seconds(now - latest_->at);
+    if (anchor_) result.baseline_age_seconds = seconds(now - anchor_->at);
     if (latest_ && now - latest_->at > 3s) result.timing_state = LiveTimingState::Stale;
     const auto complete = std::chrono::duration_cast<std::chrono::seconds>(now - *started_).count();
     if (complete < 1) return result;

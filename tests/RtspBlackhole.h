@@ -51,6 +51,8 @@ public:
     void setTrackStalled(bool audio, bool stalled) noexcept;
     // 暂停 RTP 与媒体时间，控制连接仍可处理 TEARDOWN；与丢包后 PTS 前进的单轨开关分开。
     void setMediaPaused(bool paused) noexcept;
+    // 媒体时间每帧仍推进 40 ms，改变发送间隔以真实产生 0.5x/1.0x 的输入推进。
+    void setFramePeriod(std::chrono::milliseconds period) noexcept;
     // 真正发送滞后时间戳或截短的 IDR 负载，用解码结果核验丢帧/损坏跳过分类。
     void setVideoSignal(VideoSignal signal) noexcept;
     unsigned int sentAudioPackets() const noexcept;

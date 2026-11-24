@@ -182,28 +182,34 @@ const LiveSourceOptions* PlaybackSource::liveOptions() const noexcept
     return kind_ == PlaybackSourceKind::NetworkLive ? &live_options_ : nullptr;
 }
 
-// 稳定模式默认启用有限重连；参数按播放项保存，继续和手动重接沿用同一配置。
-RtspSourceValidation createStableRtspSource(std::string url, RtspTransport transport, bool auto_reconnect)
+// 两套预设共用结构化校验；原始地址只进入内存源，继续/手动重接沿用保存的整组选项。
+RtspSourceValidation createRtspSource(std::string url, LiveSourceOptions options)
 {
     if (protocolOf(url) != PlaybackProtocol::Rtsp) {
         return {{}, url.find("://") == std::string::npos
             ? RtspSourceError::InvalidAddress : RtspSourceError::UnsupportedProtocol};
     }
-    auto source = PlaybackSource::networkLive(std::move(url), {transport, LivePreset::Stable, auto_reconnect});
+    auto source = PlaybackSource::networkLive(std::move(url), options);
     if (!source.isValid()) return {{}, RtspSourceError::InvalidAddress};
     return {std::move(source), RtspSourceError::None};
 }
 
-// 所有带单位的直播预设数值集中于此；低延迟入口要等持续积压策略完整后再开放。
+// 保留稳定模式入口的兼容契约，默认仍启用有限重连。
+RtspSourceValidation createStableRtspSource(std::string url, RtspTransport transport, bool auto_reconnect)
+{
+    return createRtspSource(std::move(url), {transport, LivePreset::Stable, auto_reconnect});
+}
+
+// 所有带单位的直播预设数值集中于此；稳定模式没有主动积压策略。
 const LivePresetSettings& livePresetSettings(LivePreset preset) noexcept
 {
     using namespace std::chrono_literals;
     static const LivePresetSettings stable{5s, 5s, 5s, 10s, 10s,
         {512, 2 * 1024 * 1024, 2s}, {512, 16 * 1024 * 1024, 2s},
-        {350ms, {}}, {500ms, 512}, {}};
+        {350ms, {}}, {500ms, 512}, {}, {}};
     static const LivePresetSettings low_latency{5s, 5s, 3s, 10s, 10s,
         {256, 1024 * 1024, 750ms}, {256, 8 * 1024 * 1024, 750ms},
-        {100ms, 350ms}, {100ms, 128}, 8};
+        {100ms, 350ms}, {100ms, 128}, 8, LiveBacklogSettings{}};
     return preset == LivePreset::LowLatency ? low_latency : stable;
 }
 
@@ -229,6 +235,7 @@ PlaybackPolicy playbackPolicy(const PlaybackSource& source) noexcept
             policy.audio_queue_limits = settings.audio_queue;
             policy.video_queue_limits = settings.video_queue;
             policy.audio_buffer = settings.audio_buffer;
+            policy.backlog = settings.backlog;
             if (source.protocol() == PlaybackProtocol::Rtsp) {
                 policy.rtsp_fps_probe_frames = settings.rtsp_fps_probe_frames;
                 if (source.liveOptions()->rtsp_transport == RtspTransport::Udp) policy.rtsp_udp = settings.rtsp_udp;

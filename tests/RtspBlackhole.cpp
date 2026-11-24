@@ -247,6 +247,7 @@ public:
     void disconnectCurrent() noexcept { disconnect_.store(true); }
     void setTrackStalled(bool audio, bool stalled) noexcept { (audio ? stall_audio_ : stall_video_).store(stalled); }
     void setMediaPaused(bool paused) noexcept { media_paused_.store(paused); }
+    void setFramePeriod(std::chrono::milliseconds period) noexcept { frame_period_ms_.store(static_cast<int>(std::clamp<std::int64_t>(period.count(), 1, 1000))); }
     void setVideoSignal(VideoSignal signal) noexcept { video_signal_.store(signal); }
     unsigned int sentAudioPackets() const noexcept { return sent_audio_.load(); }
     unsigned int sentVideoPackets() const noexcept { return sent_video_.load(); }
@@ -453,7 +454,7 @@ private:
                 } else if (!sendRtp(socket, peer, 0, packet)) return false;
                 ++sent_video_;
             }
-            next += 40ms;
+            next += std::chrono::milliseconds{frame_period_ms_.load()};
             std::this_thread::sleep_until(next);
             ++seq;
         }
@@ -668,6 +669,7 @@ private:
     std::atomic<bool> stall_audio_{false};
     std::atomic<bool> stall_video_{false};
     std::atomic<bool> media_paused_{false};
+    std::atomic<int> frame_period_ms_{40};
     std::atomic<VideoSignal> video_signal_{VideoSignal::Normal};
     std::atomic<unsigned int> sent_audio_{0};
     std::atomic<unsigned int> sent_video_{0};
@@ -699,6 +701,7 @@ unsigned int RtspBlackhole::activeRemoteSessions() const noexcept { return impl_
 void RtspBlackhole::disconnectCurrent() noexcept { impl_->disconnectCurrent(); }
 void RtspBlackhole::setTrackStalled(bool audio, bool stalled) noexcept { impl_->setTrackStalled(audio, stalled); }
 void RtspBlackhole::setMediaPaused(bool paused) noexcept { impl_->setMediaPaused(paused); }
+void RtspBlackhole::setFramePeriod(std::chrono::milliseconds period) noexcept { impl_->setFramePeriod(period); }
 void RtspBlackhole::setVideoSignal(VideoSignal signal) noexcept { impl_->setVideoSignal(signal); }
 unsigned int RtspBlackhole::sentAudioPackets() const noexcept { return impl_->sentAudioPackets(); }
 unsigned int RtspBlackhole::sentVideoPackets() const noexcept { return impl_->sentVideoPackets(); }

@@ -15,7 +15,7 @@ enum class LiveFailureDisposition { None, Cancelled, Fatal, Retryable };
 enum class LiveFailureReason {
     None, NotLive, UserCancelled, InvalidSource, UnsupportedInput, AccessDenied,
     DecoderUnavailable, ResourceExhausted, SetupFailed, UnclassifiedInterruption,
-    ConnectionFailure, IoTimeout, LiveEof, OutputTimeout, QueueLimit, PacketTooLarge
+    ConnectionFailure, IoTimeout, LiveEof, OutputTimeout, QueueLimit, PacketTooLarge, Backlog
 };
 
 struct LiveFailure {
@@ -25,7 +25,7 @@ struct LiveFailure {
 };
 
 // 输出失活和队列限界由后续会话接入产生事件，不能伪造 FFmpeg 错误码。
-enum class LiveFailureEvent { OutputStalled, QueueLimit, PacketTooLarge };
+enum class LiveFailureEvent { OutputStalled, QueueLimit, PacketTooLarge, Backlog };
 LiveFailure classifyLiveFailure(PlaybackSourceKind kind, const PlaybackError& error) noexcept;
 LiveFailure classifyLiveFailure(PlaybackSourceKind kind, LiveFailureEvent event) noexcept;
 

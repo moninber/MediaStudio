@@ -119,6 +119,25 @@ QString receiveRateLabel(const std::optional<double>& bps)
         : QString("%1 kb/s").arg(*bps / 1000.0, 0, 'f', 1);
 }
 
+// 只翻译固定分类，候选撤销、重接请求与实际启动次数分别展示。
+QString backlogReasonLabel(LiveBacklogReason reason)
+{
+    switch (reason) {
+        case LiveBacklogReason::StablePreset: return "稳定模式关闭";
+        case LiveBacklogReason::AutomaticDisabled: return "自动重连已关闭";
+        case LiveBacklogReason::WarmingUp: return "基准预热中";
+        case LiveBacklogReason::InvalidReference: return "参考样本不可用";
+        case LiveBacklogReason::SampleGap: return "有效秒窗中断";
+        case LiveBacklogReason::BaselineChanged: return "时间戳基准变化";
+        case LiveBacklogReason::LagBelowThreshold: return "滞后未超阈值";
+        case LiveBacklogReason::ProgressRecovered: return "媒体推进已恢复";
+        case LiveBacklogReason::LagFalling: return "相对滞后回落";
+        case LiveBacklogReason::UserCancelled: return "用户已取消";
+        case LiveBacklogReason::ConnectionEnded: return "连接已结束";
+        default: return "—";
+    }
+}
+
 QString queueLimitLabel(PacketQueueLimit limit)
 {
     switch (limit) {
@@ -134,6 +153,7 @@ QString recoveryFailureLabel(const PlaybackSnapshot& snapshot)
 {
     if (snapshot.last_error) {
         if (const auto* read = std::get_if<MediaReadResult>(&*snapshot.last_error)) {
+            if (read->status == MediaReadStatus::LiveBacklog) return "持续积压，重新接入直播";
             if (read->status == MediaReadStatus::QueueFull) return read->stage == MediaReadStage::AudioQueue
                 ? "音频队列达到限额" : "视频队列达到限额";
             if (read->status == MediaReadStatus::PacketTooLarge) return snapshot.network_stats &&
@@ -161,6 +181,7 @@ QString recoveryFailureLabel(const PlaybackSnapshot& snapshot)
         case LiveFailureReason::ResourceExhausted: return "资源不足";
         case LiveFailureReason::SetupFailed: return "媒体初始化失败";
         case LiveFailureReason::OutputTimeout: return "媒体输出失活";
+        case LiveFailureReason::Backlog: return "持续积压";
         case LiveFailureReason::LiveEof: return "直播结束或连接中断";
         case LiveFailureReason::QueueLimit: return "队列达到限额";
         case LiveFailureReason::PacketTooLarge: return "单包过大";
@@ -803,11 +824,16 @@ void MainWindow::openNetworkMedia()
     transport->addItem("TCP", static_cast<int>(RtspTransport::Tcp));
     transport->addItem("UDP", static_cast<int>(RtspTransport::Udp));
     form->addRow("传输方式：", transport);
-    form->addRow("播放模式：", new QLabel("稳定", &dialog));
+    auto* preset = new QComboBox(&dialog);
+    preset->setObjectName("livePresetSelector");
+    preset->addItem("稳定", static_cast<int>(LivePreset::Stable));
+    preset->addItem("低延迟", static_cast<int>(LivePreset::LowLatency));
+    preset->setToolTip("稳定模式优先连续播放；低延迟使用较小缓冲，自动重连开启时会根据持续积压重新接入。");
+    form->addRow("播放模式：", preset);
     auto* automatic = new QCheckBox("自动重连", &dialog);
     automatic->setObjectName("autoReconnectOption");
     automatic->setChecked(true);
-    automatic->setToolTip("断流后最多重试 3 次；暂停、停止和切源会取消恢复。");
+    automatic->setToolTip("断流或低延迟持续积压共用最多 3 次重试；关闭后不主动积压重接，暂停、停止和切源会取消恢复。");
     form->addRow(automatic);
 
     auto* error_label = new QLabel(&dialog);
@@ -825,7 +851,8 @@ void MainWindow::openNetworkMedia()
     connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
         if (isClosing()) { dialog.reject(); return; }
         const auto selected_transport = static_cast<RtspTransport>(transport->currentData().toInt());
-        auto result = createStableRtspSource(url_input->text().toStdString(), selected_transport, automatic->isChecked());
+        const auto selected_preset = static_cast<LivePreset>(preset->currentData().toInt());
+        auto result = createRtspSource(url_input->text().toStdString(), {selected_transport, selected_preset, automatic->isChecked()});
         if (!result.source) {
             error_label->setText(result.error == RtspSourceError::UnsupportedProtocol
                 ? "当前版本仅支持 RTSP 直播地址。" : "请输入有效的 RTSP 地址。");
@@ -1164,6 +1191,16 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
         info_text += QString("<p>参考流: %1 · %2<br>媒体推进: %3 · 相对滞后变化: %4"
                              "<br>DTS 新鲜度: %5</p><p>相对值以本连接的时间戳基准计算，不表示端到端延迟。</p>")
             .arg(track, timingStateLabel(receive.timing_state), progress, lag, formatMilestone(receive.reference_dts_age_seconds));
+        const auto& backlog = stats.backlog;
+        const auto backlog_state = backlog.state == LiveBacklogState::Candidate ? "候选"
+            : backlog.state == LiveBacklogState::ReconnectRequested ? "已请求重接"
+            : backlog.state == LiveBacklogState::Disabled ? "未启用" : "等待";
+        info_text += QString("<p>积压恢复: %1 · %2<br>有效观测: %3 次 · 已确认持续: %4 s"
+                             "<br>本请求候选: %5 · 撤销: %6 · 重接请求: %7</p>")
+            .arg(backlog_state, backlogReasonLabel(backlog.reason)).arg(backlog.observations)
+            .arg(backlog.confirmed_seconds, 0, 'f', 1).arg(stats.backlog_candidates)
+            .arg(stats.backlog_candidates_cleared).arg(stats.backlog_reconnect_requests);
+        if (backlog.last_clear_reason) info_text += QString("<p>最近撤销原因: %1</p>").arg(backlogReasonLabel(*backlog.last_clear_reason));
         if (stats.udp_receive) info_text += QString("<p>UDP 重排: %1 ms · %2 包</p>")
             .arg(std::chrono::duration<double, std::milli>(stats.udp_receive->max_delay).count(), 0, 'f', 0)
             .arg(stats.udp_receive->reorder_packets);

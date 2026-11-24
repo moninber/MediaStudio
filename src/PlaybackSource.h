@@ -5,6 +5,7 @@
 #include <string>
 #include "PacketQueueTypes.h"
 #include "AudioBufferSettings.h"
+#include "LiveBacklog.h"
 
 // 源类型由调用方显式选择，不根据扩展名或“是否网络”猜测播放行为。
 enum class PlaybackSourceKind { LocalFile, NetworkLive, NetworkVod };
@@ -53,11 +54,12 @@ private:
 
 enum class RtspSourceError { None, UnsupportedProtocol, InvalidAddress };
 
-// 用户入口只建立稳定 RTSP 源，错误由调用方翻译为不含地址的提示。
+// 两套 RTSP 预设共用校验结果，错误由调用方翻译为不含地址的提示。
 struct RtspSourceValidation {
     std::optional<PlaybackSource> source;
     RtspSourceError error;
 };
+RtspSourceValidation createRtspSource(std::string url, LiveSourceOptions options = {});
 
 RtspSourceValidation createStableRtspSource(std::string url, RtspTransport transport, bool auto_reconnect = true);
 
@@ -84,6 +86,7 @@ struct LivePresetSettings {
     RtspUdpReceiveSettings rtsp_udp;
     // RTSP 低延迟仅减少帧率估算的帧数，避免探测缓存集中吐包顶满 750 ms 队列；空值保留 FFmpeg 默认。
     std::optional<int> rtsp_fps_probe_frames;
+    std::optional<LiveBacklogSettings> backlog;
 };
 
 const LivePresetSettings& livePresetSettings(LivePreset preset) noexcept;
@@ -106,6 +109,7 @@ struct PlaybackPolicy {
     // 仅 RTSP/UDP 使用，不把重排参数套给 TCP、RTMP、SRT 或本地文件。
     std::optional<RtspUdpReceiveSettings> rtsp_udp;
     std::optional<int> rtsp_fps_probe_frames;
+    std::optional<LiveBacklogSettings> backlog;
 };
 
 struct PlaybackCapabilities {

@@ -16,7 +16,7 @@ struct MediaOpenResult {
     MediaOpenStage stage;
 };
 
-enum class MediaReadStatus { Packet, Again, EndOfStream, Timeout, Cancelled, Error, QueueFull, PacketTooLarge };
+enum class MediaReadStatus { Packet, Again, EndOfStream, Timeout, Cancelled, Error, QueueFull, PacketTooLarge, LiveBacklog };
 enum class MediaReadStage { ReadPacket, InitialOutput, AudioOutput, VideoOutput, RecoveryBudget, AudioQueue, VideoQueue };
 
 struct MediaReadResult {

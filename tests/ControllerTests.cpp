@@ -1845,6 +1845,168 @@ void testWindowReceiveDetails()
     std::cout << "window_payload_units=1 relative_lag_not_end_to_end=1 unavailable_reason=1 compact_summary=1 file_UI_preserved=1\n";
 }
 
+// 用实际 RTP 发送间隔产生 0.5x 接收推进，而不是向控制器注入“积压”布尔量。
+void testLiveBacklog(std::string_view mode)
+{
+    using Fixture = RtspBlackhole;
+    const bool udp = mode.find("-udp") != std::string_view::npos;
+    const bool stable = mode == "live-backlog-stable";
+    const bool disabled = mode == "live-backlog-disabled";
+    const bool transient = mode == "live-backlog-transient";
+    const bool invalid = mode == "live-backlog-invalid";
+    const bool budget = mode == "live-backlog-budget";
+    const bool cancel_candidate = mode == "live-backlog-cancel-candidate";
+    const bool cancel_backoff = mode == "live-backlog-cancel-backoff";
+    Fixture server(Fixture::StartupMedia::Video, testRtspAddress(), udp ? Fixture::SetupTransport::Udp : Fixture::SetupTransport::Tcp,
+        Fixture::KeyVideo::Immediate, 0, budget ? 4 : 2, true, 60s);
+    server.setFramePeriod(80ms);
+    VideoWidget widget; PlayerController player; player.setVideoWidget(&widget);
+    const auto source = createRtspSource(server.url(), {udp ? RtspTransport::Udp : RtspTransport::Tcp,
+        stable ? LivePreset::Stable : LivePreset::LowLatency, !disabled});
+    require(source.source.has_value(), "backlog source validation failed");
+    const auto request = player.requestOpen(*source.source);
+    if (stable || disabled) {
+        waitInQt([&] { const auto s = player.getPlaybackSnapshot(); const auto& r = s.network_stats->receive;
+            return s.state == PlaybackState::Playing && r.relative_lag_seconds.value_or(0) > 3 &&
+                r.media_progress_rate && *r.media_progress_rate < .8;
+        }, 13s, "slow input did not produce real receive-lag evidence in the gated mode");
+        const auto s = player.getPlaybackSnapshot();
+        require(s.connection_attempt_id == 1 && s.network_stats->backlog.state == LiveBacklogState::Disabled &&
+            s.network_stats->backlog_candidates == 0 && s.network_stats->backlog_reconnect_requests == 0 &&
+            s.network_stats->reconnect_attempts == 0 && s.network_stats->queue_full_events == 0,
+            "stable/automatic-off mode performed proactive backlog recovery");
+    } else if (budget) {
+        PlaybackSnapshot failed;
+        waitInQt([&] { failed = player.getPlaybackSnapshot(); return failed.state == PlaybackState::Failed && !failed.is_session_active;
+        }, 58s, "repeated backlog requests bypassed the finite retry budget");
+        const auto& stats = *failed.network_stats;
+        const auto* error = failed.last_error ? std::get_if<MediaReadResult>(&*failed.last_error) : nullptr;
+        std::cout << "backlog_budget_probe candidates=" << stats.backlog_candidates << " requests=" << stats.backlog_reconnect_requests
+            << " retries=" << stats.reconnect_attempts << " used=" << stats.recovery_retries_used << " Full=" << stats.queue_full_events
+            << " stop=" << static_cast<int>(stats.recovery_stop_reason.value_or(RecoveryStopReason::None))
+            << " reason=" << static_cast<int>(stats.last_failure_reason.value_or(LiveFailureReason::None))
+            << " status=" << (error ? static_cast<int>(error->status) : -1) << " ffmpeg=" << (error ? error->ffmpegError : -1)
+            << " accepted=" << server.acceptedConnections() << " remote=" << server.activeRemoteSessions() << '\n';
+        waitInQt([&] { return server.activeRemoteSessions() == 0; }, 1s, "terminal backlog attempt left a remote session");
+        require(failed.request_id == request && stats.backlog_candidates == 4 && stats.backlog_reconnect_requests == 4 &&
+            stats.reconnect_attempts == 3 && stats.recovery_retries_used == 3 && stats.queue_full_events == 0 &&
+            stats.recovery_stop_reason == RecoveryStopReason::AttemptsExhausted && stats.last_failure_reason == LiveFailureReason::Backlog &&
+            error && error->status == MediaReadStatus::LiveBacklog && error->ffmpegError == 0 && server.acceptedConnections() == 4 &&
+            server.activeRemoteSessions() == 0, "backlog budget/counts/cause were conflated with Full, manual requests or FFmpeg errors");
+    } else {
+        waitInQt([&] { const auto s = player.getPlaybackSnapshot(); return s.network_stats->backlog.state == LiveBacklogState::Candidate;
+        }, 13s, "real .5x RTP did not start a candidate");
+        const auto candidate = player.getPlaybackSnapshot();
+        require(candidate.request_id == request && candidate.network_stats->backlog_candidates == 1 &&
+            candidate.network_stats->backlog_reconnect_requests == 0 && candidate.network_stats->reconnect_attempts == 0,
+            "candidate itself was counted as a connection/reconnect");
+        if (transient || invalid) {
+            if (invalid) server.setVideoSignal(Fixture::VideoSignal::Late); else server.setFramePeriod(40ms);
+            waitInQt([&] { const auto s = player.getPlaybackSnapshot(); return s.network_stats->backlog_candidates_cleared >= 1 &&
+                s.network_stats->backlog.state != LiveBacklogState::Candidate;
+            }, 2500ms, "recovered/invalid reference did not withdraw the pending candidate");
+            if (invalid) { server.setFramePeriod(40ms); server.setVideoSignal(Fixture::VideoSignal::Normal); }
+            remainsInQt([&] { const auto s = player.getPlaybackSnapshot(); return s.request_id == request &&
+                s.connection_attempt_id == 1 && s.network_stats->backlog_reconnect_requests == 0 && s.network_stats->reconnect_attempts == 0 &&
+                s.network_stats->queue_full_events == 0; }, 3500ms, "withdrawn transient candidate later reconnected");
+        } else {
+            if (!cancel_candidate) waitInQt([&] { const auto s = player.getPlaybackSnapshot(); return s.state == PlaybackState::Reconnecting &&
+                s.network_stats->backlog_reconnect_requests == 1 && s.network_stats->reconnect_attempts == 0 && server.activeRemoteSessions() == 0;
+            }, 5s, "sustained candidate did not request ordinary connection teardown/backoff");
+            if (cancel_candidate || cancel_backoff) {
+                const auto at = Clock::now(); player.pause();
+                require(Clock::now() - at < 100ms, "candidate/backoff pause blocked the UI command");
+                waitInQt([&] { const auto s = player.getPlaybackSnapshot(); return s.state == PlaybackState::Paused &&
+                    !s.is_session_active && server.activeRemoteSessions() == 0; }, 2s, "backlog cancellation left a worker/session alive");
+                const auto stopped = player.getPlaybackSnapshot();
+                require(stopped.network_stats->backlog.reason == LiveBacklogReason::UserCancelled &&
+                    stopped.network_stats->backlog_reconnect_requests == (cancel_candidate ? 0u : 1u) &&
+                    stopped.network_stats->reconnect_attempts == 0, "cancelled candidate/backoff was counted as a started automatic connection");
+                remainsInQt([&] { return server.acceptedConnections() == 1 && player.getPlaybackSnapshot().state == PlaybackState::Paused;
+                }, 1300ms, "cancelled backlog recovery reopened in the background");
+            } else {
+                server.setFramePeriod(40ms);
+                waitInQt([&] { const auto s = player.getPlaybackSnapshot(); return s.request_id == request && s.connection_attempt_id == 2 &&
+                    s.state == PlaybackState::Playing && s.network_stats->receive.timing_state == LiveTimingState::Ready;
+                }, 7s, "automatic backlog reconnect did not produce fresh video/receive anchor");
+                const auto s = player.getPlaybackSnapshot(); const auto& stats = *s.network_stats;
+                require(stats.backlog_reconnect_requests == 1 && stats.reconnect_attempts == 1 && stats.queue_full_events == 0 &&
+                    s.generation == 1 && stats.last_failure_reason == LiveFailureReason::Backlog &&
+                    stats.backlog.state == LiveBacklogState::Waiting && !s.last_error,
+                    "backlog recovery lost settings, conflated counters, or reused the old candidate");
+            }
+        }
+    }
+    player.shutdown();
+    waitInQt([&] { return server.activeRemoteSessions() == 0; }, 1s, "backlog test left an RTSP session");
+    std::cout << "backlog_mode=" << mode << " actual_RTP_pacing=0.5x request=" << request
+        << " accepted=" << server.acceptedConnections() << " active_remote=0\n";
+}
+
+// 定义在后面的关窗辅助函数，前置的公开入口用例同样走真实异步收尾。
+Clock::time_point closeWindow(QPointer<MainWindow>& view, std::uint64_t request, const char* stage,
+                              const std::function<void()>& before_close);
+
+// 实际对话框选低延迟 UDP，真实候选可由暂停撤销，继续/回到直播沿用播放项保存的配置。
+void testWindowLowLatency()
+{
+    using Fixture = RtspBlackhole;
+    Fixture server(Fixture::StartupMedia::Video, testRtspAddress(), Fixture::SetupTransport::Udp,
+        Fixture::KeyVideo::Immediate, 0, 3, true, 35s);
+    server.setFramePeriod(80ms);
+    TestWindow window; auto& view = *window.view;
+    bool defaults = false, selected = false;
+    QTimer deadline; deadline.setSingleShot(true);
+    QObject::connect(&deadline, &QTimer::timeout, &view, [&] { if (auto* d = qobject_cast<QDialog*>(QApplication::activeModalWidget())) d->reject(); });
+    deadline.start(1200);
+    QTimer::singleShot(0, &view, [&] {
+        auto* dialog = view.findChild<QDialog*>("networkMediaDialog"); if (!dialog) return;
+        auto* input = dialog->findChild<QLineEdit*>("networkUrlInput");
+        auto* transport = dialog->findChild<QComboBox*>("rtspTransportSelector");
+        auto* preset = dialog->findChild<QComboBox*>("livePresetSelector");
+        auto* automatic = dialog->findChild<QCheckBox*>("autoReconnectOption");
+        auto* buttons = dialog->findChild<QDialogButtonBox*>("networkDialogButtons");
+        if (!input || !transport || !preset || !automatic || !buttons) { dialog->reject(); return; }
+        defaults = preset->count() == 2 && preset->currentData().toInt() == static_cast<int>(LivePreset::Stable) &&
+            transport->currentData().toInt() == static_cast<int>(RtspTransport::Tcp) && automatic->isChecked();
+        input->setText(QString::fromStdString(server.url()));
+        preset->setCurrentIndex(preset->findData(static_cast<int>(LivePreset::LowLatency)));
+        transport->setCurrentIndex(transport->findData(static_cast<int>(RtspTransport::Udp)));
+        selected = true; buttons->button(QDialogButtonBox::Open)->click();
+    });
+    require(QMetaObject::invokeMethod(&view, "openNetworkMedia", Qt::DirectConnection), "network dialog slot missing");
+    deadline.stop(); require(defaults && selected, "public mode selector/defaults failed");
+    const auto request = MainWindowCloseTestAccess::snapshot(view).request_id;
+    waitInQt([&] { const auto s = MainWindowCloseTestAccess::snapshot(view); return s.network_stats &&
+        s.network_stats->backlog.state == LiveBacklogState::Candidate &&
+        MainWindowNetworkTestAccess::controls(view).metadata.contains(QString::fromUtf8(u8"积压恢复: 候选"));
+    }, 13s, "public low-latency source did not render its actual backlog candidate");
+    const auto first = MainWindowCloseTestAccess::snapshot(view);
+    require(first.rtsp_transport == RtspTransport::Udp && first.network_stats->preset == LivePreset::LowLatency &&
+        first.network_stats->video_queue.limits.packets == 256 && first.network_stats->video_queue.limits.timestamp_span == 750ms &&
+        view.statusBar()->currentMessage().contains(QString::fromUtf8(u8"低延迟")), "selected settings did not reach backend/label/queue");
+    require(QMetaObject::invokeMethod(&view, "togglePlayPause", Qt::DirectConnection), "candidate pause action missing");
+    waitInQt([&] { const auto s = MainWindowCloseTestAccess::snapshot(view); return s.state == PlaybackState::Paused && !s.is_session_active &&
+        s.network_stats->backlog_candidates_cleared == 1 && s.network_stats->backlog_reconnect_requests == 0 && server.activeRemoteSessions() == 0;
+    }, 2s, "window candidate pause did not revoke and release");
+    server.setFramePeriod(40ms);
+    require(QMetaObject::invokeMethod(&view, "togglePlayPause", Qt::DirectConnection), "low-latency continue action missing");
+    PlaybackSnapshot continued;
+    waitInQt([&] { continued = MainWindowCloseTestAccess::snapshot(view); return continued.request_id > request &&
+        continued.state == PlaybackState::Playing && continued.network_stats->receive.timing_state == LiveTimingState::Ready;
+    }, 6s, "continued low-latency source did not produce new output");
+    require(continued.rtsp_transport == RtspTransport::Udp && continued.network_stats->preset == LivePreset::LowLatency &&
+        continued.network_stats->backlog.enabled && continued.network_stats->backlog_candidates == 0,
+        "continue lost saved mode/transport or retained old request candidates");
+    require(QMetaObject::invokeMethod(&view, "returnToLive", Qt::DirectConnection), "low-latency return-to-live missing");
+    waitInQt([&] { const auto s = MainWindowCloseTestAccess::snapshot(view); return s.request_id > continued.request_id &&
+        s.state == PlaybackState::Playing && s.network_stats->preset == LivePreset::LowLatency && s.rtsp_transport == RtspTransport::Udp;
+    }, 4s, "manual return-to-live lost low-latency saved source options");
+    closeWindow(window.view, MainWindowCloseTestAccess::snapshot(view).request_id, "low-latency-dialog", {});
+    waitInQt([&] { return server.acceptedConnections() == 3 && server.activeRemoteSessions() == 0; }, 1s, "public low-latency close leaked sessions");
+    std::cout << "public_low_latency_UDP=1 stable_default=1 actual_candidate_pause=1 continue_and_return_preserve_mode=1 close_released=1\n";
+}
+
 // 检查已接到关窗命令的快照中不再有旧源标记或可显示内容。
 bool outputRetired(const PlaybackSnapshot& snapshot, std::uint64_t request)
 {
@@ -2381,6 +2543,8 @@ int main(int argc, char* argv[])
         QApplication app(argc, argv);
         app.setQuitOnLastWindowClosed(false);
         if (mode == "controller-local") testControllerLocal();
+        else if (mode == "window-low-latency") testWindowLowLatency();
+        else if (mode.substr(0, 13) == "live-backlog-") testLiveBacklog(mode);
         else if (mode == "live-receive-tcp" || mode == "live-receive-udp") testLiveReceiveObservations(mode.find("udp") != std::string_view::npos);
         else if (mode == "live-receive-auto-reset") testReceiveAutomaticReset();
         else if (mode == "window-receive-details") testWindowReceiveDetails();
