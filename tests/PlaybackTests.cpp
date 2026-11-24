@@ -169,9 +169,9 @@ void testCapabilitiesAndSnapshot()
     published.stats.audio_queue_packets = 3;
     published.last_error = MediaReadResult{MediaReadStatus::Timeout, AVERROR_EXIT};
     published.network_stats.emplace();
-    require(!published.network_stats->application_bitrate_bps && !published.network_stats->last_packet_age_seconds,
+    require(!published.network_stats->receive.application_bitrate_bps && !published.network_stats->receive.last_packet_age_seconds,
             "unsampled network metrics must be absent");
-    published.network_stats->last_packet_age_seconds = 1.5;
+    published.network_stats->receive.last_packet_age_seconds = 1.5;
     const PlaybackSnapshot saved = published;
     published.request_id = 8;
     published.connection_attempt_id = 12;
@@ -187,7 +187,7 @@ void testCapabilitiesAndSnapshot()
             saved.source_kind == PlaybackSourceKind::NetworkLive && saved.display_name == "RTSP" &&
             saved.state == PlaybackState::Reconnecting && saved.capabilities.can_return_to_live &&
             saved.media_info.audio_info.codec_name == "pcm_mulaw" && saved.stats.audio_queue_packets == 3 &&
-            saved.network_stats && saved.network_stats->last_packet_age_seconds == 1.5,
+            saved.network_stats && saved.network_stats->receive.last_packet_age_seconds == 1.5,
             "published snapshot was changed through another copy");
     const auto* error = saved.last_error ? std::get_if<MediaReadResult>(&*saved.last_error) : nullptr;
     require(error && error->status == MediaReadStatus::Timeout && error->ffmpegError == AVERROR_EXIT,

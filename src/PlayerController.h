@@ -98,6 +98,7 @@ private:
     std::optional<PlaybackSource> current_source_; // 当前源只存内存；快照不暴露原始网络地址。
     std::optional<double> pending_seek_;
     PlaybackSnapshot snapshot_;
+    LiveReceiveMonitor receive_monitor_; // 与快照同锁，只有当前连接可写；读快照只进行有界的纯计算。
     std::chrono::steady_clock::time_point request_submitted_at_{};
     std::chrono::steady_clock::time_point connection_started_at_{};
     std::optional<std::chrono::steady_clock::time_point> live_output_started_at_;

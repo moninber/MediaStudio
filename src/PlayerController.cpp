@@ -43,6 +43,7 @@ PlaybackEpoch PlayerController::currentEpochLocked() const
 void PlayerController::resetSnapshotLocked(std::uint64_t request_id, PlaybackState state)
 {
     snapshot_ = {};
+    receive_monitor_ = {};
     snapshot_.request_id = request_id;
     snapshot_.state = state;
     request_submitted_at_ = {};
@@ -278,6 +279,7 @@ PlaybackSnapshot PlayerController::getPlaybackSnapshot() const
     }
     if (snapshot.network_stats) {
         const auto now = Clock::now();
+        snapshot.network_stats->receive = receive_monitor_.snapshot(now);
         if (last_audio_output_at_) snapshot.network_stats->last_audio_output_age_seconds =
             std::chrono::duration<double>(now - *last_audio_output_at_).count();
         if (last_video_output_at_) snapshot.network_stats->last_video_output_age_seconds =
@@ -331,6 +333,7 @@ bool PlayerController::updateLocalLibraryInfo(std::uint64_t expected_request_id,
 void PlayerController::retireLiveOutputLocked(VideoWidget* video)
 {
     const auto now = Clock::now();
+    receive_monitor_.finish(now);
     if (live_output_started_at_) {
         snapshot_.live_elapsed_seconds = std::chrono::duration<double>(now - *live_output_started_at_).count();
         live_output_started_at_.reset();
@@ -463,6 +466,7 @@ void PlayerController::supervisorLoop()
                     snapshot_.generation = request.epoch.generation;
                     snapshot_.media_info = {};
                     snapshot_.audio_output.reset();
+                    receive_monitor_ = {};
                     snapshot_.stats = {};
                     snapshot_.state = PlaybackState::Opening;
                     snapshot_.has_current_video_output = false;
@@ -526,6 +530,8 @@ std::optional<PlaybackError> PlayerController::runRequest(const OpenRequest& req
         playing_ = !live;
         if (live) {
             const auto now = Clock::now();
+            receive_monitor_.reset(connection_started_at_, snapshot_.media_info.has_video
+                ? LiveReferenceTrack::Video : LiveReferenceTrack::Audio);
             snapshot_.network_stats->udp_receive = decoder_.udpReceiveSettings();
             snapshot_.network_stats->input_ready_seconds =
                 std::chrono::duration<double>(now - connection_started_at_).count();
@@ -1176,6 +1182,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
 
         // 格式上下文仅 supervisor 使用。网络等包期间，worker 仍可用缓存的 time_base 解码。
         const MediaReadResult result = decoder_.readPacketResult(packet);
+        const auto received_at = Clock::now();
         update_recovery();
         if (live) {
             if (const auto stage = request.io->liveDeadlineStage()) {
@@ -1191,6 +1198,23 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
         std::unique_lock<std::mutex> lock(snapshot_mutex_);
         if (!running()) break;
         if (result.status == MediaReadStatus::Packet) {
+            // 入队前记应用接收量：等关键帧而未入队的包仍已收到；只用缓存 time_base 换算 DTS。
+            // 不持有额外包引用，也不把 PTS/播放位置当成输入 DTS 的替代。
+            if (live && currentEpochLocked() == epoch) {
+                const bool audio_packet = decoder_.isAudioPacket(packet);
+                const bool video_packet = decoder_.isVideoPacket(packet);
+                const auto time_base = video_packet ? decoder_.videoPacketTimeBase() : decoder_.audioPacketTimeBase();
+                LiveReceivedPacket observed;
+                observed.track = video_packet ? LiveReferenceTrack::Video : audio_packet ? LiveReferenceTrack::Audio : LiveReferenceTrack::None;
+                observed.payload_bytes = packet->data && packet->size > 0 ? static_cast<std::uint64_t>(packet->size) : 0;
+                observed.corrupt = (packet->flags & AV_PKT_FLAG_CORRUPT) != 0;
+                observed.time_base_valid = time_base.num > 0 && time_base.den > 0;
+                if (observed.time_base_valid) {
+                    if (packet->dts != AV_NOPTS_VALUE) observed.dts_seconds = static_cast<double>(packet->dts) * av_q2d(time_base);
+                    if (packet->duration > 0) observed.duration_seconds = static_cast<double>(packet->duration) * av_q2d(time_base);
+                }
+                receive_monitor_.recordPacket(observed, received_at);
+            }
             if (live && !snapshot_.network_stats->first_packet_seconds) {
                 snapshot_.network_stats->first_packet_seconds =
                     std::chrono::duration<double>(Clock::now() - connection_started_at_).count();

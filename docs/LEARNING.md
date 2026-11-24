@@ -766,6 +766,33 @@ GUI 每 200 ms 调用 `getPlaybackSnapshot()`。所需轨道超过约 1 秒没�
 
 ---
 
+### 4.17 接收秒窗、DTS 媒体推进与相对滞后（4.2）
+
+观测入口放在 `PlayerController::demuxAndPlay()`：supervisor 从 `readPacketResult()` 得到选中的音视频 AVPacket 后立即记录单调到达时间，再在入队前记接收量。因等待关键帧而未入队的视频包仍是已经收到的包，触发 Full 的最后一个包也计接收；统计不等于入队成功数。只累计 packet.size 的压缩 payload，不含网络头、容器头、side data 或 FFmpeg 内部尚未返回的探测/预读流量，所以 Rx 是应用接收口径，不是网卡码率。非选中轨和空 payload 不计；带坏包标记的 payload 计流量，但不刷新有效包龄或可信 DTS。
+
+`runRequest()` 在实际媒体探测后调用 `LiveReceiveMonitor::reset()`，有选中视频就固定以视频为参考，否则使用音频。supervisor 用打开时缓存的流 time_base 将 DTS/duration 转为秒；缺少 DTS 不以 PTS、播放位置或另一轨时间戳代替。B 帧的呈现顺序可与解码顺序不同，不能用 PTS 回退误判媒体推进；DTS/PTS/duration 的单位与缺失约定见 [FFmpeg 8.0 AVPacket](https://ffmpeg.org/doxygen/8.0/structAVPacket.html)。
+
+`LiveReceiveMonitor` 不持媒体对象、线程、计时器或锁。控制器沿用 snapshot_mutex 保护 reset、recordPacket、finish 和 snapshot；记录前核对请求仍活动且 request/attempt/generation 匹配。固定八个一秒槽只保存 payload/包数及最后参考点，空间不会随播放时长增长。秒窗按本连接单调起点对齐，采用左闭右开的区间；累计只在真正收包时增加，右边界的包属于下一秒。`snapshot(now)` 只做有界纯计算，返回最近结束的一秒，窗口码率为 payload 字节数乘 8。未满一秒为不可用，已完整静默一秒才是零；重复 GUI 刷新不增加窗口编号，也不改变采样边界。即使 supervisor 阻塞在 FFmpeg，GUI 仍能得到零码率、增长的包龄，不需要额外采样线程。
+
+参考 DTS 的计算与接收窗口分开。第一次可信参考点建立本连接的时间戳锚点，至少预热两秒并确认有实际推进后才输出指标。令左右边界前最后一个同域可信 DTS 为 D_left/D_right，窗口单调时刻为 T_begin/T_end，第一参考点为 T_anchor/D_anchor：
+
+```text
+媒体推进速率 = (D_right - D_left) / (T_end - T_begin)   // 完整一秒窗口
+相对滞后变化 = (T_end - T_anchor) - (D_right - D_anchor)
+```
+
+正常 1.00x 输入通常接近 1.00x；0.50x 输入会增加相对滞后，快送可以产生负值。这里比较的是应用接收到的媒体时间与本机单调时间相对各自锚点的变化，不知道捕获时刻、服务器积压或初始链路延迟，不能将“相对滞后 80 ms”解释为现在只落后服务器 80 ms。边界前最后一个帧的采样粒度也会影响数值；不插值合成未收到的 DTS。
+
+缺少 DTS、非法 time_base、非有限 DTS、坏包、重复或回退 DTS 都撤销当前测量域，清掉锚点和推进值，但不清真实接收字节/包数。已知包节奏时，超过至少一秒且超过正常间隔八倍的前跳也撤销测量域；节奏未知保留十秒容差，与队列测量的保守原则一致。DTS 超过三秒不新鲜则显示过期和不可用；之后收到包要重新预热。新鲜音频不能掩盖参考视频失效。`timestamp_domain` 仅标识观测基准变化，不修改播放器 generation，也不增加 Full、Drop、损坏跳过或重试。
+
+`getPlaybackSnapshot()` 在已有快照锁内取得接收值副本，GUI 的 `updateMediaInfoPanel()` 与 `updatePlaybackControls()` 使用同一份快照。详情显示窗口包数/码率、窗口龄、本连接累计、有效包龄、参考流/不可用原因、DTS 新鲜度、推进及相对滞后。直播状态栏保留协议/预设所在的状态文本和 Rx/重连/FPS/A/V/Drop 摘要；队列、设备总容量与当前声卡待播 padding 放入详情，本地状态栏仍保留原来的队列/Buf。1280×720 原生窗口验证文字完整可见，不把所有详情堆到状态栏。
+
+暂停或故障退出时，`retireLiveOutputLocked()` 调用 `finish()` 冻结最近连接的接收历史，状态栏 Rx 显示不可用；历史包龄不继续增长成“仍在接收”的假象。新请求和自动尝试先清空旧观测，探测后重新选参考流，累计字节/包数、秒窗及 DTS 锚点都按连接重置；自动重试总数、Full 等原有请求累计仍按其原口径保留。取消后迟到读包通过活动状态/标签校验被拒绝，旧对象没有新线程或包引用需要 join/释放；FFmpeg、队列和 WASAPI 的原有取消与收尾流程保持不变。
+
+独立 `LiveReceiveMonitorTests` 用显式时钟核对秒窗边界、轮询独立、静默零值、有限历史、0.5/1.0/1.5x、负/大绝对 DTS、缺失/跳变/重复/非法 DTS、视频优先、三秒过期、重定锚及历史冻结。实际 RTSP TCP/UDP 用例在读包阻塞期间核对这些展示，再验证恢复预热、手动重接、暂停和本地切源；自动重连用服务器实际发送量核对接收累计清零且请求重试累计仍为 1。此编号提供观测，不新增自动积压重连，不修改恢复预算健康判定；持续候选/撤销/重接和公开低延迟入口留在 4.3。
+
+---
+
 ## 5. OpenGL视频渲染
 
 ### 5.1 渲染管线

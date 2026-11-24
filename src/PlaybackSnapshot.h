@@ -9,6 +9,7 @@
 #include "MediaIo.h"
 #include "LiveRecovery.h"
 #include "PlaybackSource.h"
+#include "LiveReceiveMonitor.h"
 
 // 界面可观察到的播放状态；后续接入网络时继续使用同一组状态。
 enum class PlaybackState {
@@ -37,8 +38,7 @@ struct PlaybackStats {
 
 // 网络观测尚未采样时使用空值，不把未采集的数据显示为零码率或零包龄。
 struct NetworkPlaybackStats {
-    std::optional<double> application_bitrate_bps;
-    std::optional<double> last_packet_age_seconds;
+    LiveReceiveStats receive;
     std::uint64_t reconnect_attempts = 0;
     unsigned int recovery_retries_used = 0;
     bool auto_reconnect_enabled = false;

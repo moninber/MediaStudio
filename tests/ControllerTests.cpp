@@ -112,6 +112,14 @@ struct MainWindowNetworkTestAccess {
         return window.text_media_info_->toPlainText();
     }
 
+    // 同一份快照走实际状态栏与详情渲染，核对两处的口径与不可用展示。
+    static QString renderNetwork(MainWindow& window, const PlaybackSnapshot& snapshot)
+    {
+        window.updatePlaybackControls(snapshot);
+        window.updateMediaInfoPanel(snapshot);
+        return window.label_debug_stats_->text();
+    }
+
     // 复用列表生产入口，避免测试另行维护“当前直播源”。
     static void openListed(MainWindow& window, const PlaybackSource& source)
     {
@@ -1709,6 +1717,134 @@ void testWindowAudioBufferReport()
     std::cout << "window_actual_capacity_fallback_and_failure=1 diagnostic_input_only=1 history_reset=1\n";
 }
 
+// 实际读包遇到静默时仍按秒显示零码率、包龄增长和 DTS 过期；恢复/用户重接必须重建基准。
+void testLiveReceiveObservations(bool udp)
+{
+    using Fixture = RtspBlackhole;
+    Fixture server(Fixture::StartupMedia::Video, testRtspAddress(), udp ? Fixture::SetupTransport::Udp : Fixture::SetupTransport::Tcp,
+        Fixture::KeyVideo::Immediate, 0, 2, true, 25s);
+    VideoWidget widget; PlayerController player; player.setVideoWidget(&widget);
+    const VideoFixtures files;
+    const auto request = player.requestOpen(*createStableRtspSource(server.url(), udp ? RtspTransport::Udp : RtspTransport::Tcp).source);
+    PlaybackSnapshot ready;
+    waitInQt([&] { ready = player.getPlaybackSnapshot(); const auto& r = ready.network_stats->receive;
+        return ready.state == PlaybackState::Playing && r.timing_state == LiveTimingState::Ready && r.sample_sequence >= 3;
+    }, 5s, "continuous RTP did not publish completed receive/DTS windows");
+    const auto before = ready.network_stats->receive;
+    require(before.active && before.reference_track == LiveReferenceTrack::Video && before.received_packets > 25 &&
+        before.application_bitrate_bps && *before.application_bitrate_bps > 0 && before.window_packets && *before.window_packets > 0 &&
+        before.last_packet_age_seconds && *before.last_packet_age_seconds < .2 && before.media_progress_rate &&
+        *before.media_progress_rate > .8 && *before.media_progress_rate < 1.2, "actual RTP receive units/reference/rate incorrect");
+    server.setMediaPaused(true);
+    PlaybackSnapshot silence;
+    waitInQt([&] { silence = player.getPlaybackSnapshot(); const auto& r = silence.network_stats->receive;
+        return r.window_packets == 0 && r.application_bitrate_bps == 0 && r.last_packet_age_seconds.value_or(0) > 1.1;
+    }, 2500ms, "blocked FFmpeg read retained nonzero receive rate or hid packet age");
+    require(silence.connection_attempt_id == 1 && silence.network_stats->reconnect_attempts == 0 &&
+        silence.network_stats->receive.received_packets == player.getPlaybackSnapshot().network_stats->receive.received_packets,
+        "silence invented receive packets or caused an observation-only reconnect");
+    waitInQt([&] { const auto s = player.getPlaybackSnapshot(); const auto& r = s.network_stats->receive;
+        return r.timing_state == LiveTimingState::Stale && !r.media_progress_rate && !r.relative_lag_seconds;
+    }, 2200ms, "DTS older than three seconds was still eligible for progress/lag");
+    const auto stale = player.getPlaybackSnapshot().network_stats->receive;
+    server.setMediaPaused(false);
+    waitInQt([&] { const auto s = player.getPlaybackSnapshot(); const auto& r = s.network_stats->receive;
+        return r.timestamp_domain > stale.timestamp_domain && r.timing_state == LiveTimingState::WarmingUp && !r.media_progress_rate;
+    }, 1s, "first packet after a stale gap reused the old timestamp anchor");
+    waitInQt([&] { const auto s = player.getPlaybackSnapshot(); return s.state == PlaybackState::Playing &&
+        s.network_stats->receive.timing_state == LiveTimingState::Ready; }, 3500ms, "new DTS anchor did not become ready after warm-up");
+    const auto preserved = player.getPlaybackSnapshot();
+    const auto next = player.returnToLive();
+    const auto opening = player.getPlaybackSnapshot();
+    require(next > request && opening.network_stats->receive.received_packets == 0 &&
+        !opening.network_stats->receive.application_bitrate_bps && !opening.network_stats->receive.last_packet_age_seconds &&
+        opening.network_stats->receive.sample_sequence == 0, "manual request exposed prior connection counters/ages while opening");
+    waitInQt([&] { const auto s = player.getPlaybackSnapshot(); return s.request_id == next && s.state == PlaybackState::Playing &&
+        s.network_stats->receive.timing_state == LiveTimingState::Ready; }, 5s, "manual rejoin did not produce fresh receive/DTS windows");
+    player.pause();
+    waitInQt([&] { const auto s = player.getPlaybackSnapshot(); return s.state == PlaybackState::Paused && !s.is_session_active &&
+        !s.network_stats->receive.active && server.activeRemoteSessions() == 0; }, 2s, "pause did not freeze metrics and release RTSP sessions");
+    const auto frozen = player.getPlaybackSnapshot().network_stats->receive;
+    remainsInQt([&] { const auto r = player.getPlaybackSnapshot().network_stats->receive;
+        return r.received_packets == frozen.received_packets && r.last_packet_age_seconds == frozen.last_packet_age_seconds &&
+            r.sample_sequence == frozen.sample_sequence; }, 180ms, "retired receive history kept aging or sampling");
+    const auto local = player.requestOpen(PlaybackSource::localFile(files.first().u8string()));
+    require(!waitForVideo(player, local, 64).network_stats && preserved.network_stats->receive.active &&
+        preserved.network_stats->receive.received_packets > 0, "new file retained network data or mutated the saved live snapshot");
+    player.shutdown();
+    std::cout << "receive_transport=" << (udp ? "UDP" : "TCP")
+        << " actual_payload_windows=1 blocked_read_zero_age_stale=1 resume_warmup=1 user_request_reset=1 pause_freeze=1 file_isolation=1\n";
+}
+
+// 自动尝试保留请求内重试累计，但接收字节/秒窗/锚点必须从新连接计；以服务器真实发送量交叉核对。
+void testReceiveAutomaticReset()
+{
+    using Fixture = RtspBlackhole;
+    Fixture server(Fixture::StartupMedia::Video, testRtspAddress(), Fixture::SetupTransport::Tcp,
+        Fixture::KeyVideo::Immediate, 0, 2, true, 20s);
+    VideoWidget widget; PlayerController player; player.setVideoWidget(&widget);
+    const auto request = player.requestOpen(*createStableRtspSource(server.url(), RtspTransport::Tcp).source);
+    waitInQt([&] { return player.getPlaybackSnapshot().network_stats->receive.received_packets >= 80; }, 5s,
+        "initial connection did not receive enough packets to distinguish a cumulative-reset bug");
+    const auto first = player.getPlaybackSnapshot();
+    const auto sent_before = server.sentVideoPackets();
+    server.disconnectCurrent();
+    waitInQt([&] { const auto s = player.getPlaybackSnapshot(); return s.state == PlaybackState::Reconnecting &&
+        !s.network_stats->receive.active; }, 4s, "failed attempt did not retire receive observations");
+    PlaybackSnapshot second;
+    waitInQt([&] { second = player.getPlaybackSnapshot(); return second.connection_attempt_id == 2 &&
+        second.state == PlaybackState::Playing && second.network_stats->receive.received_packets > 0; }, 5s,
+        "automatic retry did not resume receive observations");
+    const auto& network = *second.network_stats;
+    const auto sent_new = server.sentVideoPackets() - sent_before;
+    require(second.request_id == request && network.reconnect_attempts == 1 && network.receive.received_packets <= sent_new + 3 &&
+        network.receive.received_packets < first.network_stats->receive.received_packets &&
+        network.receive.sample_sequence < first.network_stats->receive.sample_sequence &&
+        !network.receive.media_progress_rate && network.receive.timing_state == LiveTimingState::WarmingUp,
+        "automatic attempt inherited old receive totals/window/anchor or reset the request retry count");
+    player.shutdown();
+    waitInQt([&] { return server.activeRemoteSessions() == 0; }, 1s, "automatic receive test left a media session");
+    std::cout << "automatic_receive_reset=1 request_preserved=1 retry_total=1 old_packets=" << first.network_stats->receive.received_packets
+        << " new_packets=" << network.receive.received_packets << " server_new_sent=" << sent_new << '\n';
+}
+
+// 用明确的诊断输入核对口径和不可用值；真实接收链路另由 TCP/UDP 用例覆盖。
+void testWindowReceiveDetails()
+{
+    TestWindow window; auto& view = *window.view;
+    PlaybackSnapshot s; s.request_id = 10; s.source_kind = PlaybackSourceKind::NetworkLive;
+    s.protocol = PlaybackProtocol::Rtsp; s.rtsp_transport = RtspTransport::Tcp;
+    s.state = PlaybackState::Playing; s.is_playing = true; s.network_stats.emplace();
+    s.is_session_active = true; s.media_info.has_audio = true; s.stats.audio_buffer_seconds = .08;
+    s.network_stats->reconnect_attempts = 2;
+    auto& r = s.network_stats->receive;
+    r.active = true; r.received_packets = 200; r.received_payload_bytes = 10000;
+    r.window_packets = 50; r.window_payload_bytes = 8000; r.application_bitrate_bps = 64000;
+    r.sample_sequence = 4; r.sample_age_seconds = .1; r.last_packet_age_seconds = .02;
+    r.reference_track = LiveReferenceTrack::Video; r.timing_state = LiveTimingState::Ready;
+    r.media_progress_rate = .5; r.relative_lag_seconds = 1.6; r.reference_dts_age_seconds = .02;
+    const auto summary = MainWindowNetworkTestAccess::renderNetwork(view, s);
+    const auto details = MainWindowNetworkTestAccess::controls(view).metadata;
+    require(summary.contains("Rx 64.0 kb/s") && summary.contains(QString::fromUtf8(u8"重连 2")) && summary.contains("FPS") &&
+        summary.contains("A/V") && summary.contains("Drop") && !summary.contains("Buf") &&
+        details.contains("50") && details.contains("0.50x") && details.contains("1600 ms") &&
+        details.contains(QString::fromUtf8(u8"当前声卡待播: 80 ms")) &&
+        details.contains(QString::fromUtf8(u8"不表示端到端延迟")), "network summary/details omitted required units or mislabeled relative lag");
+    r.timing_state = LiveTimingState::MissingDts; r.media_progress_rate.reset(); r.relative_lag_seconds.reset();
+    MainWindowNetworkTestAccess::renderNetwork(view, s);
+    const auto missing = MainWindowNetworkTestAccess::controls(view).metadata;
+    require(missing.contains(QString::fromUtf8(u8"缺少 DTS")) && missing.contains(QString::fromUtf8(u8"媒体推进: 不可用")) &&
+        missing.contains(QString::fromUtf8(u8"相对滞后变化: 不可用")), "missing DTS was rendered as zero rate/lag");
+    r.active = false; s.state = PlaybackState::Paused; s.is_playing = false; s.is_paused = true;
+    require(MainWindowNetworkTestAccess::renderNetwork(view, s).contains(QString::fromUtf8(u8"Rx —")) &&
+        MainWindowNetworkTestAccess::controls(view).metadata.contains(QString::fromUtf8(u8"最近连接历史")),
+        "paused history advertised a live receive rate");
+    s.source_kind = PlaybackSourceKind::LocalFile; s.network_stats.reset();
+    require(MainWindowNetworkTestAccess::renderNetwork(view, s).contains("Buf") &&
+        !MainWindowNetworkTestAccess::controls(view).metadata.contains(QString::fromUtf8(u8"接收观测")), "network fields leaked into file UI");
+    std::cout << "window_payload_units=1 relative_lag_not_end_to_end=1 unavailable_reason=1 compact_summary=1 file_UI_preserved=1\n";
+}
+
 // 检查已接到关窗命令的快照中不再有旧源标记或可显示内容。
 bool outputRetired(const PlaybackSnapshot& snapshot, std::uint64_t request)
 {
@@ -2245,6 +2381,9 @@ int main(int argc, char* argv[])
         QApplication app(argc, argv);
         app.setQuitOnLastWindowClosed(false);
         if (mode == "controller-local") testControllerLocal();
+        else if (mode == "live-receive-tcp" || mode == "live-receive-udp") testLiveReceiveObservations(mode.find("udp") != std::string_view::npos);
+        else if (mode == "live-receive-auto-reset") testReceiveAutomaticReset();
+        else if (mode == "window-receive-details") testWindowReceiveDetails();
         else if (mode == "live-buffer-presets") return testLiveBufferPresets();
         else if (mode == "window-audio-buffer-report") testWindowAudioBufferReport();
         else if (mode == "controller-supersede") testControllerSupersede();

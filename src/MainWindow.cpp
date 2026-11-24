@@ -95,6 +95,30 @@ QString formatMilestone(const std::optional<double>& seconds)
         ? QString("%1 ms").arg(*seconds * 1000.0, 0, 'f', 0) : QString("—");
 }
 
+// 所有不可用状态都有来源；缺失 DTS 不以 PTS、零速率或零滞后代替。
+QString timingStateLabel(LiveTimingState state)
+{
+    switch (state) {
+        case LiveTimingState::Ready: return "可用";
+        case LiveTimingState::WarmingUp: return "基准预热中";
+        case LiveTimingState::MissingDts: return "缺少 DTS";
+        case LiveTimingState::InvalidTimeBase: return "时间单位无效";
+        case LiveTimingState::InvalidDts: return "DTS 或包无效";
+        case LiveTimingState::RepeatedDts: return "DTS 重复";
+        case LiveTimingState::BackwardDts: return "DTS 回退";
+        case LiveTimingState::TimestampJump: return "DTS 跳变";
+        case LiveTimingState::Stale: return "DTS 已过期";
+        default: return "等待参考包";
+    }
+}
+
+QString receiveRateLabel(const std::optional<double>& bps)
+{
+    if (!bps || !std::isfinite(*bps) || *bps < 0.0) return "—";
+    return *bps >= 1000000.0 ? QString("%1 Mb/s").arg(*bps / 1000000.0, 0, 'f', 2)
+        : QString("%1 kb/s").arg(*bps / 1000.0, 0, 'f', 1);
+}
+
 QString queueLimitLabel(PacketQueueLimit limit)
 {
     switch (limit) {
@@ -1123,6 +1147,23 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
                 : "<p>已断开直播。继续时重新接入最新内容。</p>";
         }
         const auto stats = snapshot.network_stats.value_or(NetworkPlaybackStats{});
+        const auto& receive = stats.receive;
+        const auto track = receive.reference_track == LiveReferenceTrack::Video ? "视频 DTS"
+            : receive.reference_track == LiveReferenceTrack::Audio ? "音频 DTS" : "待探测";
+        const auto progress = receive.media_progress_rate
+            ? QString("%1x").arg(*receive.media_progress_rate, 0, 'f', 2) : QString("不可用");
+        const auto lag = receive.relative_lag_seconds
+            ? QString("%1 ms").arg(*receive.relative_lag_seconds * 1000.0, 0, 'f', 0) : QString("不可用");
+        info_text += QString("<h4>接收观测（%1）</h4><p>选中 payload: %2 · %3 包/1 s"
+                             "<br>本连接累计: %4 包 · %5 KiB<br>有效包龄: %6 · 窗口龄: %7</p>")
+            .arg(receive.active ? "当前连接" : receive.received_packets ? "最近连接历史" : "尚未开始")
+            .arg(receiveRateLabel(receive.application_bitrate_bps))
+            .arg(receive.window_packets ? QString::number(*receive.window_packets) : QString("—"))
+            .arg(receive.received_packets).arg(receive.received_payload_bytes / 1024.0, 0, 'f', 1)
+            .arg(formatMilestone(receive.last_packet_age_seconds), formatMilestone(receive.sample_age_seconds));
+        info_text += QString("<p>参考流: %1 · %2<br>媒体推进: %3 · 相对滞后变化: %4"
+                             "<br>DTS 新鲜度: %5</p><p>相对值以本连接的时间戳基准计算，不表示端到端延迟。</p>")
+            .arg(track, timingStateLabel(receive.timing_state), progress, lag, formatMilestone(receive.reference_dts_age_seconds));
         if (stats.udp_receive) info_text += QString("<p>UDP 重排: %1 ms · %2 包</p>")
             .arg(std::chrono::duration<double, std::milli>(stats.udp_receive->max_delay).count(), 0, 'f', 0)
             .arg(stats.udp_receive->reorder_packets);
@@ -1189,6 +1230,12 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
         else if (output.attempts > 1 && !output.initialized) info_text += "<p>回退仍失败。</p>";
         if (output.first_error) info_text += QString("<p>首次初始化错误: 0x%1</p>")
             .arg(static_cast<quint32>(*output.first_error), 8, 16, QLatin1Char('0'));
+    }
+    if (info.has_audio) {
+        // 直播状态栏不再挤入 Buf；在详情保留当前 padding，并与上方设备总容量明确区分。
+        info_text += snapshot.is_session_active
+            ? QString("<p>当前声卡待播: %1 ms</p>").arg(snapshot.stats.audio_buffer_seconds * 1000.0, 0, 'f', 0)
+            : QString("<p>当前声卡待播: —（会话已结束）</p>");
     }
     if (info.has_video) {
         info_text += "<hr><h4>视频</h4>";
@@ -1317,7 +1364,22 @@ void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
         label_duration_->setText(snapshot.state == PlaybackState::Idle ? "00:00" : "--:--");
     }
 
-    if (snapshot.is_playing || snapshot.is_paused) {
+    if (live) {
+        // 直播摘要保留 FPS/A/V/Drop，队列和声卡详值留在媒体信息，避免窄窗口挤成一长行。
+        const auto& stats = snapshot.stats;
+        const auto network = snapshot.network_stats.value_or(NetworkPlaybackStats{});
+        const bool output = snapshot.is_playing || snapshot.is_paused;
+        label_debug_stats_->setText(QString("Rx %1 | 重连 %2 | FPS %3/%4 | A/V %5 ms | Drop %6")
+            .arg(receiveRateLabel(network.receive.active ? network.receive.application_bitrate_bps : std::nullopt))
+            .arg(network.reconnect_attempts)
+            .arg(output ? QString::number(stats.render_fps, 'f', 1) : QString("--"))
+            .arg(output ? QString::number(stats.decode_fps, 'f', 1) : QString("--"))
+            .arg(output ? QString::number(stats.av_diff_ms, 'f', 0) : QString("--"))
+            .arg(stats.dropped_frames_total));
+        label_debug_stats_->setToolTip("Rx 为最近完整一秒的选中 AVPacket payload 码率；不含网络头。重连只计实际额外连接。"
+                                      "FPS 为提交/解码帧率，Drop 为同步丢帧；队列、声卡缓冲和损坏跳过见媒体信息。");
+    } else if (snapshot.is_playing || snapshot.is_paused) {
+        label_debug_stats_->setToolTip(QString{});
         const auto& stats = snapshot.stats;
         label_debug_stats_->setText(QString("FPS %1/%2 | A/V %3 ms | Drop %4 | A %5 / V %6 | Buf %7 ms")
             .arg(stats.render_fps, 0, 'f', 1)
@@ -1328,6 +1390,7 @@ void MainWindow::updatePlaybackControls(const PlaybackSnapshot& snapshot)
             .arg(stats.video_queue_packets)
             .arg(stats.audio_buffer_seconds * 1000.0, 0, 'f', 0));
     } else {
+        label_debug_stats_->setToolTip(QString{});
         label_debug_stats_->setText("FPS -- | A/V -- ms | Drop -- | A -- / V -- | Buf -- ms");
     }
 }
