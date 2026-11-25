@@ -3,6 +3,7 @@
 #include "LiveRecovery.h"
 #include "RtspBlackhole.h"
 #include "LiveProtocolServer.h"
+#include "LocalMediaFixtures.h"
 #include "VideoWidget.h"
 
 #include <QApplication>
@@ -92,6 +93,15 @@ struct MainWindowNetworkTestAccess {
 
     // 从文件倍速控件实际触发速度选择。
     static void chooseSpeed(MainWindow& window, int index) { window.combo_speed_->setCurrentIndex(index); }
+
+    // 回归直接操作已有 GUI 控件/列表入口，不绕过信号连接或另建播放控制接口。
+    static PlayerController& player(MainWindow& window) { return *window.player_; }
+    static VideoWidget& video(MainWindow& window) { return *window.video_widget_; }
+    static void chooseVolume(MainWindow& window, int volume) { window.slider_volume_->setValue(volume); }
+    static void seekRelative(MainWindow& window, double seconds) { window.seekRelative(seconds); }
+    static int append(MainWindow& window, const PlaybackSource& source) { return window.appendPlaylistEntry(source); }
+    static void openRow(MainWindow& window, int row) { window.openPlaylistEntry(row); }
+    static int currentRow(const MainWindow& window) { return window.list_playlist_->currentRow(); }
 
     // 直调界面和后端双重定位/倍速入口，验证禁用判断不依赖控件灰显。
     static void attemptLiveMutations(MainWindow& window)
@@ -2697,6 +2707,205 @@ void testWindowCloseModal()
 }
 
 // 直接验证两个异步输出入口在三种标签发生变化时拒绝迟到数据。
+// 三类本地媒体走主窗口真实控制槽；验证位置/速度实际推进，而非只检查控件或保存值。
+int testWindowLocalRegression(std::string_view mode)
+{
+    const bool audio = mode != "window-local-video", video = mode != "window-local-audio";
+    if (audio && !hasDefaultRenderEndpoint()) return 77;
+    using Access = MainWindowNetworkTestAccess;
+    const LocalMediaFixtures files;
+    TestWindow window; auto& view = *window.view; auto& player = Access::player(view);
+    const auto path = audio && video ? files.audioVideo() : audio ? files.audioOnly() : files.videoOnly();
+    Access::openListed(view, PlaybackSource::localFile(path.u8string()));
+    waitInQt([&] { const auto s = player.getPlaybackSnapshot(); return s.state == PlaybackState::Playing &&
+        s.current_seconds > .2 && (!video || s.has_current_video_output) && (!audio || s.audio_output); },
+        5s, "local regression did not produce required tracks");
+    const auto initial = player.getPlaybackSnapshot();
+    require(initial.media_info.has_audio == audio && initial.media_info.has_video == video && !initial.network_stats &&
+        initial.capabilities.can_seek && initial.capabilities.can_change_speed && initial.duration_seconds > 23.9 &&
+        initial.duration_seconds < 24.1 && initial.audio_output.has_value() == audio &&
+        (!audio || initial.audio_output->requested == 350ms), "local track capabilities or audio capacity changed");
+    waitInQt([&] { const auto c = Access::controls(view); return c.seek_enabled && c.speed_enabled; },
+        1s, "local GUI controls stayed disabled");
+    Access::chooseVolume(view, 37);
+    require(std::abs(player.getVolume()-.37f)<.001f, "volume slider did not reach player");
+    require(QMetaObject::invokeMethod(&view, "toggleMute", Qt::DirectConnection) && player.getVolume()==0,
+        "local mute did not silence the player");
+    require(QMetaObject::invokeMethod(&view, "toggleMute", Qt::DirectConnection) && std::abs(player.getVolume()-.37f)<.001f,
+        "local unmute did not restore the previous volume");
+
+    require(QMetaObject::invokeMethod(&view, "togglePlayPause", Qt::DirectConnection), "local pause action absent");
+    const auto paused = player.getPlaybackSnapshot();
+    remainsInQt([&] { const auto s = player.getPlaybackSnapshot(); return s.state==PlaybackState::Paused &&
+        s.request_id==initial.request_id && std::abs(s.current_seconds-paused.current_seconds)<.08; },
+        180ms, "local paused position moved");
+    require(QMetaObject::invokeMethod(&view, "seekPosition", Qt::DirectConnection, Q_ARG(int,250)), "local slider seek action absent");
+    waitInQt([&] { const auto s=player.getPlaybackSnapshot(); return s.generation>paused.generation &&
+        s.state==PlaybackState::Paused && std::abs(s.current_seconds-6)<.1; }, 2s, "paused slider seek did not reach quarter position");
+    const auto positioned=player.getPlaybackSnapshot();
+    require(positioned.request_id==initial.request_id && positioned.connection_attempt_id==initial.connection_attempt_id,
+        "local seek replaced request or connection");
+    requireStaleOutputRejected(Access::video(view), snapshotEpoch(paused), snapshotEpoch(positioned));
+    // 快捷键的相对定位助手是普通 C++ 方法，直接走同一入口，不为测试将它改为 Qt 槽。
+    Access::seekRelative(view,2.0);
+    waitInQt([&] { const auto s=player.getPlaybackSnapshot(); return s.generation>positioned.generation &&
+        s.state==PlaybackState::Paused && std::abs(s.current_seconds-8)<.1; }, 2s, "relative seek did not use current paused cursor");
+
+    // 每种速度先在暂停位置重建代次，再用实际单调时间核对媒体推进，覆盖音频 atempo 与纯视频时钟。
+    for (const auto [index, speed] : std::array<std::pair<int,float>,3>{{{1,.5f},{6,2.f},{3,1.f}}}) {
+        const auto before=player.getPlaybackSnapshot();
+        Access::chooseSpeed(view,index);
+        waitInQt([&] { const auto s=player.getPlaybackSnapshot(); return s.generation>before.generation &&
+            s.state==PlaybackState::Paused && std::abs(s.current_seconds-before.current_seconds)<.12; },
+            2s,"paused local speed change lost position or generation");
+        require(QMetaObject::invokeMethod(&view,"togglePlayPause",Qt::DirectConnection),"local resume action absent");
+        waitInQt([&] { const auto s=player.getPlaybackSnapshot(); return s.state==PlaybackState::Playing &&
+            s.current_seconds>before.current_seconds+.15 && (!video || s.has_current_video_output); },
+            3s,"local speed change did not resume real output");
+        const auto start=Clock::now(); const auto cursor=player.getPlaybackSnapshot().current_seconds;
+        remainsInQt([&] { return player.getPlaybackSnapshot().state==PlaybackState::Playing; },900ms,"local rate observation stopped playback");
+        const double elapsed=std::chrono::duration<double>(Clock::now()-start).count();
+        const auto after=player.getPlaybackSnapshot(); const double rate=(after.current_seconds-cursor)/elapsed;
+        require(rate>speed*.65 && rate<speed*1.35 && after.request_id==initial.request_id &&
+            after.connection_attempt_id==initial.connection_attempt_id,"actual local playback rate differs from selected speed");
+        std::cout<<"local_rate mode="<<mode<<" selected="<<speed<<" actual="<<rate<<'\n';
+        require(QMetaObject::invokeMethod(&view,"togglePlayPause",Qt::DirectConnection),"local pause after rate observation absent");
+    }
+    if (video) for (int effect=1; effect<=static_cast<int>(VideoEffect::Count); ++effect) {
+        require(QMetaObject::invokeMethod(&view,"toggleEffect",Qt::DirectConnection) &&
+            player.getEffect()==static_cast<VideoEffect>(effect%static_cast<int>(VideoEffect::Count)),"local effect cycle lost an option");
+    }
+    if (audio) {
+        require(QMetaObject::invokeMethod(&view,"toggleVisualizer",Qt::DirectConnection) && player.isVisualizerShown(),"local spectrum action absent");
+        require(QMetaObject::invokeMethod(&view,"togglePlayPause",Qt::DirectConnection),"local spectrum resume absent");
+        const auto cursor=player.getPlaybackSnapshot().current_seconds;
+        waitInQt([&] { return player.getPlaybackSnapshot().current_seconds>cursor+.2; },1s,"spectrum view stalled local audio");
+        require(QMetaObject::invokeMethod(&view,"toggleVisualizer",Qt::DirectConnection) && !player.isVisualizerShown(),"local spectrum return absent");
+    }
+    require(QMetaObject::invokeMethod(&view,"stopPlayback",Qt::DirectConnection),"local stop action absent");
+    waitInQt([&] { const auto s=player.getPlaybackSnapshot(); return s.state==PlaybackState::Idle && !s.is_session_active; },
+        2s,"local stop left an active session");
+    require(QMetaObject::invokeMethod(&view,"togglePlayPause",Qt::DirectConnection),"local replay action absent");
+    waitInQt([&] { const auto s=player.getPlaybackSnapshot(); return s.request_id>initial.request_id &&
+        s.state==PlaybackState::Playing && s.current_seconds>.1 && s.current_seconds<1; },3s,"local replay did not start a fresh request at beginning");
+    closeWindow(window.view,player.getPlaybackSnapshot().request_id,"local-full-regression");
+    std::cout<<"local_regression="<<mode<<" GUI_seek_pause_rate_volume_mute_effect_spectrum_replay=1 close_joined=1\n";
+    return 0;
+}
+
+// 复查早期 EOF 基线：临近结尾仍须播放余量、进入 Ended 并释放会话，随后可从列表重播。
+// 这里只验证当前退出/界面行为；声卡末尾至多 5 ms 的既有排空容差不冒充逐样本尾音验收。
+int testWindowLocalEof(std::string_view mode)
+{
+    const bool audio=mode!="window-local-eof-video",video=mode!="window-local-eof-audio";
+    if(audio&&!hasDefaultRenderEndpoint())return 77;
+    using Access=MainWindowNetworkTestAccess;
+    const LocalMediaFixtures files;TestWindow window;auto& view=*window.view;auto& player=Access::player(view);
+    const auto path=audio&&video?files.audioVideo():audio?files.audioOnly():files.videoOnly();
+    Access::openListed(view,PlaybackSource::localFile(path.u8string()));
+    waitInQt([&]{const auto s=player.getPlaybackSnapshot();return s.state==PlaybackState::Playing&&s.current_seconds>.2&&
+        (!audio||s.audio_output)&&(!video||s.has_current_video_output);},5s,"EOF regression did not start actual output");
+    const auto initial=player.getPlaybackSnapshot();const auto at=Clock::now();
+    require(QMetaObject::invokeMethod(&view,"seekPosition",Qt::DirectConnection,Q_ARG(int,950)),"EOF seek action absent");
+    waitInQt([&]{const auto s=player.getPlaybackSnapshot();return s.generation>initial.generation&&s.current_seconds>22.7;},
+        2s,"EOF seek did not reach last five percent");
+    waitInQt([&]{const auto s=player.getPlaybackSnapshot();return s.state==PlaybackState::Ended&&!s.is_session_active;},
+        4s,"EOF did not enter Ended and join workers");
+    const auto ended=player.getPlaybackSnapshot();
+    require(Clock::now()-at>850ms&&!ended.is_playing&&!ended.is_paused&&!ended.last_error&&
+        ended.request_id==initial.request_id&&ended.current_seconds>=23.9,"EOF skipped remaining playback or published wrong final state");
+    require(QMetaObject::invokeMethod(&view,"togglePlayPause",Qt::DirectConnection),"EOF replay action absent");
+    waitInQt([&]{const auto s=player.getPlaybackSnapshot();return s.request_id>initial.request_id&&s.state==PlaybackState::Playing&&
+        s.current_seconds>.1&&s.current_seconds<1&&(!video||s.has_current_video_output);},3s,"EOF replay did not start at beginning");
+    requireStaleOutputRejected(Access::video(view),snapshotEpoch(initial),snapshotEpoch(player.getPlaybackSnapshot()));
+    closeWindow(window.view,player.getPlaybackSnapshot().request_id,"local-EOF-regression");
+    std::cout<<"local_EOF="<<mode<<" remaining_played=1 Ended_workers_joined=1 replay_new_request=1\n";
+    return 0;
+}
+
+// 同一主窗口按列表次序跨四种网络传输和三种本地轨道，核对能力、选项及旧代输出隔离。
+int testWindowLiveIntegration(bool low)
+{
+    if (!hasDefaultRenderEndpoint()) return 77;
+    using Access=MainWindowNetworkTestAccess; using Rtsp=RtspBlackhole;
+    const auto preset=low?LivePreset::LowLatency:LivePreset::Stable;
+    Rtsp tcp(Rtsp::StartupMedia::AudioVideo,testRtspAddress(),Rtsp::SetupTransport::Tcp,Rtsp::KeyVideo::Immediate,8,3,true,45s);
+    Rtsp udp(Rtsp::StartupMedia::AudioVideo,testRtspAddress(),Rtsp::SetupTransport::Udp,Rtsp::KeyVideo::Immediate,8,3,true,45s);
+    LiveProtocolServer rtmp(PlaybackProtocol::Rtmp,3,55s),srt(PlaybackProtocol::Srt,3,55s);
+    const LocalMediaFixtures files;
+    const std::vector<PlaybackSource> sources{
+        PlaybackSource::localFile(files.audioVideo().u8string()),
+        PlaybackSource::networkLive(tcp.url(),{RtspTransport::Tcp,preset,true}),
+        PlaybackSource::networkLive(udp.url(),{RtspTransport::Udp,preset,true}),
+        PlaybackSource::networkLive(rtmp.url(),{RtspTransport::Tcp,preset,true}),
+        PlaybackSource::networkLive(srt.url()+"?rcvlatency=250000&streamid=MediaStudioSecretIntegration",{RtspTransport::Tcp,preset,true}),
+        PlaybackSource::localFile(files.videoOnly().u8string()),
+        PlaybackSource::localFile(files.audioOnly().u8string())};
+    TestWindow window;auto& view=*window.view;auto& player=Access::player(view);
+    for (const auto& source:sources) require(Access::append(view,source)>=0,"integration playlist rejected source");
+    Access::chooseVolume(view,29);
+    for (int i=0;i<static_cast<int>(VideoEffect::Sepia);++i)
+        require(QMetaObject::invokeMethod(&view,"toggleEffect",Qt::DirectConnection),"integration effect action absent");
+    require(QMetaObject::invokeMethod(&view,"toggleVisualizer",Qt::DirectConnection),"integration spectrum action absent");
+    std::uint64_t previous_request=0;std::optional<PlaybackEpoch> old_epoch;
+    const std::array<int,10> rows{0,1,2,3,4,5,6,5,0,4};
+    int previous_row=-1;
+    for (const int row:rows) {
+        const auto started=Clock::now();
+        if(row==previous_row+1 && previous_row>=0) require(QMetaObject::invokeMethod(&view,"nextFile",Qt::DirectConnection),"integration next action absent");
+        else if(row==previous_row-1) require(QMetaObject::invokeMethod(&view,"prevFile",Qt::DirectConnection),"integration previous action absent");
+        else Access::openRow(view,row);
+        require(Clock::now()-started<100ms,"integration source command blocked GUI");
+        const bool live=sources[row].kind()==PlaybackSourceKind::NetworkLive;
+        waitInQt([&] { const auto s=player.getPlaybackSnapshot();return s.request_id>previous_request &&
+            s.state==PlaybackState::Playing && (s.media_info.has_audio?s.audio_output.has_value():true) &&
+            (s.media_info.has_video?s.has_current_video_output:true) && (live?s.network_stats&&s.network_stats->first_pcm_seconds:s.current_seconds>.1); },
+            10s,"integration playlist source produced no current output");
+        const auto current=player.getPlaybackSnapshot();
+        waitInQt([&] { const auto c=Access::controls(view);return c.seek_enabled==!live&&c.speed_enabled==!live; },
+            1s,"integration controls did not follow new source capabilities");
+        require(Access::currentRow(view)==row && current.source_kind==sources[row].kind() &&
+            current.protocol==sources[row].protocol() && std::abs(player.getVolume()-.29f)<.001f &&
+            player.getEffect()==VideoEffect::Sepia && player.isVisualizerShown(),"integration selection or preferences leaked");
+        if(old_epoch)requireStaleOutputRejected(Access::video(view),*old_epoch,snapshotEpoch(current));
+        if(live) {
+            require(current.network_stats->preset==preset && current.network_stats->reconnect_attempts==0 &&
+                current.network_stats->queue_full_events==0 && Access::controls(view).library_request==0,
+                "integration live options/counters or library routing leaked");
+            const auto protocol=current.protocol;
+            if(protocol==PlaybackProtocol::Rtsp) require(!current.network_stats->input_settings && current.rtsp_transport==sources[row].liveOptions()->rtsp_transport,
+                "RTMP/SRT report leaked into RTSP");
+            else if(protocol==PlaybackProtocol::Rtmp) require(!current.rtsp_transport && current.network_stats->input_settings &&
+                current.network_stats->input_settings->rtmp_buffer==(low?200ms:1000ms) && !current.network_stats->input_settings->srt,
+                "SRT/RTSP options leaked into RTMP");
+            else require(!current.rtsp_transport && current.network_stats->input_settings && current.network_stats->input_settings->srt &&
+                !current.network_stats->input_settings->srt->latency && current.network_stats->input_settings->srt->receive_latency==250000us,
+                "integration SRT acquired preset/other protocol options");
+            Access::attemptLiveMutations(view);
+            require(player.getPlaybackSnapshot().generation==current.generation && std::abs(player.getSpeed()-1.5f)<.001f,
+                "disabled live controls changed generation or local speed preference");
+        } else {
+            require(!current.network_stats && !current.rtsp_transport && current.capabilities.can_seek &&
+                current.media_info.has_audio==(row!=5) && current.media_info.has_video==(row!=6) &&
+                (!current.audio_output || current.audio_output->requested==350ms),"live state leaked into a local track type");
+            if(row==0 && previous_row<0) {
+                Access::chooseSpeed(view,5);
+                waitInQt([&] { return player.getPlaybackSnapshot().generation>current.generation; },2s,"integration local speed was not applied");
+            }
+            waitInQt([&] { return tcp.activeRemoteSessions()==0&&udp.activeRemoteSessions()==0&&
+                rtmp.activeConnections()==0&&srt.activeConnections()==0; },2s,"local source retained an old remote session");
+        }
+        const auto settled=player.getPlaybackSnapshot();
+        require(!Access::controls(view).metadata.contains("MediaStudioSecret"),"private live query reached metadata after switch");
+        previous_request=settled.request_id;old_epoch=snapshotEpoch(settled);previous_row=row;
+    }
+    closeWindow(window.view,previous_request,"live-network-integration");
+    waitInQt([&] { return tcp.activeRemoteSessions()==0&&udp.activeRemoteSessions()==0&&rtmp.activeConnections()==0&&srt.activeConnections()==0; },
+        2s,"integration close retained remote sessions");
+    std::cout<<"live_integration low="<<low<<" sources=7 selected_steps=10 next_previous=1 capabilities_options_library_isolated=1 close_released=1\n";
+    return 0;
+}
+
 void testWidgetEpochs()
 {
     VideoWidget widget;
@@ -2742,6 +2951,9 @@ int main(int argc, char* argv[])
         QApplication app(argc, argv);
         app.setQuitOnLastWindowClosed(false);
         if (mode == "controller-local") testControllerLocal();
+        else if (mode.substr(0,17)=="window-local-eof-") return testWindowLocalEof(mode);
+        else if (mode.substr(0,13)=="window-local-") return testWindowLocalRegression(mode);
+        else if (mode=="window-integration-stable" || mode=="window-integration-low") return testWindowLiveIntegration(mode=="window-integration-low");
         else if (mode.find("live-protocol-cancel-")==0) return testOtherLiveCancellation(mode);
         else if (mode.find("live-protocol-")==0) return testOtherLiveProtocol(mode);
         else if (mode=="window-protocol-rtmp" || mode=="window-protocol-srt") return testWindowOtherLiveProtocol(mode=="window-protocol-srt");

@@ -1572,7 +1572,7 @@ void MainWindow::setInitialFiles(const std::vector<std::string>& files)
         else if (first_row < 0) first_row = row;
     }
     if (first_row >= 0) openPlaylistEntry(first_row);
-    else if (rejected) statusBar()->showMessage("启动参数只接受本地文件；RTSP 请使用“打开网络媒体”。");
+    else if (rejected) statusBar()->showMessage("启动参数只接受本地文件；直播地址请使用“打开网络媒体”。");
 }
 
 bool MainWindow::connectDatabase(const std::string& host, const std::string& user,

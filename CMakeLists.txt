@@ -292,6 +292,7 @@ if(BUILD_TESTING)
         tests/ControllerTests.cpp
         tests/RtspBlackhole.cpp
         tests/LiveProtocolServer.cpp
+        tests/LocalMediaFixtures.cpp
         ${MEDIASTUDIO_PLAYBACK_SOURCES}
         ${MEDIASTUDIO_SESSION_SOURCES}
         src/MainWindow.cpp
@@ -352,7 +353,10 @@ if(BUILD_TESTING)
                           live-protocol-cancel-open-rtmp live-protocol-cancel-open-srt
                           live-protocol-cancel-read-rtmp live-protocol-cancel-read-srt
                           live-protocol-cancel-backoff-rtmp live-protocol-cancel-backoff-srt
-                          window-protocol-rtmp window-protocol-srt)
+                          window-protocol-rtmp window-protocol-srt
+                          window-local-av window-local-audio window-local-video
+                          window-local-eof-av window-local-eof-audio window-local-eof-video
+                          window-integration-stable window-integration-low)
         set(test_name MediaStudio.Session.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES
@@ -361,6 +365,10 @@ if(BUILD_TESTING)
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
         )
         # 无默认音频端点的机器不能真实提交 PCM；其他错误保持测试失败。
+        if(test_case MATCHES "^window-local-" OR test_case MATCHES "^window-integration-")
+            set_tests_properties(${test_name} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 65
+                FAIL_REGULAR_EXPRESSION "MediaStudioSecret[0-9A-Za-z]+")
+        endif()
         if(test_case MATCHES "^live-protocol-" OR test_case MATCHES "^window-protocol-")
             set_tests_properties(${test_name} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
                 FAIL_REGULAR_EXPRESSION "MediaStudioSecret[0-9A-Za-z]+")
