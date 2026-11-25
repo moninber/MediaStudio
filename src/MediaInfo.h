@@ -28,6 +28,7 @@ struct VideoStreamInfo {
     int bit_rate = 0;           // 视频码率（bps）
     double duration = 0.0;      // 视频时长（秒）
     int total_frames = 0;       // 总帧数
+    bool frame_rate_known = false; // 区分媒体提供的帧率与内部 25 fps 回退；直播可由首帧补齐。
 };
 
 // ============================================================

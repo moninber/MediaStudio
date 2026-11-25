@@ -1,6 +1,7 @@
 #include "MediaDecoder.h"
 #include "PlaybackSnapshot.h"
 #include "RtspBlackhole.h"
+#include "LiveProtocolServer.h"
 
 #include <cerrno>
 #include <chrono>
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <mutex>
 #include <random>
@@ -115,7 +117,7 @@ void testPresetContracts()
             config.audio_buffer.fallback == (low ? std::optional{350ms} : std::nullopt) &&
             config.rtsp_udp.max_delay == std::chrono::microseconds{low ? 100000 : 500000} &&
             config.rtsp_udp.reorder_packets == (low ? 128 : 512) &&
-            config.rtsp_fps_probe_frames == (low ? std::optional{8} : std::nullopt), "audio/UDP/probe preset or microsecond unit mismatch");
+            config.fps_probe_frames == (low ? std::optional{8} : std::nullopt), "audio/UDP/probe preset or microsecond unit mismatch");
         require(config.backlog.has_value() == low && (!low || (config.backlog->lag_threshold == 1500ms &&
             config.backlog->progress_limit == .8 && config.backlog->sustained_for == 3s &&
             config.backlog->minimum_observations == 3 && config.backlog->max_dts_age == 3s && config.backlog->warmup == 2s)),
@@ -129,7 +131,7 @@ void testPresetContracts()
             require(policy.rtsp_udp.has_value() == (transport == RtspTransport::Udp) &&
                 policy.audio_buffer.duration == config.audio_buffer.duration &&
                 policy.audio_buffer.fallback == config.audio_buffer.fallback &&
-                policy.rtsp_fps_probe_frames == config.rtsp_fps_probe_frames &&
+                policy.fps_probe_frames == config.fps_probe_frames &&
                 policy.initial_output_timeout == config.initial_output_timeout &&
                 policy.output_stall_timeout == config.output_stall_timeout, "source did not select its complete preset");
             if (policy.rtsp_udp) require(policy.rtsp_udp->max_delay == config.rtsp_udp.max_delay &&
@@ -137,13 +139,13 @@ void testPresetContracts()
         }
         for (const auto* url : {"rtmp://example.test/live", "srt://example.test:9000"}) {
             const auto other = playbackPolicy(PlaybackSource::networkLive(url, {RtspTransport::Udp, preset}));
-            require(!other.rtsp_udp && !other.rtsp_fps_probe_frames,
-                "RTSP options leaked into RTMP/SRT");
+            require(!other.rtsp_udp && other.fps_probe_frames == (low ? std::optional{8} : std::nullopt),
+                "RTMP/SRT inherited UDP options or lost low-latency probe settings");
         }
     }
     for (const auto& source : {PlaybackSource::localFile("fixture.wav"), PlaybackSource::networkVod("https://example.test/file")}) {
         const auto policy = playbackPolicy(source);
-        require(policy.audio_buffer.duration == 350ms && !policy.audio_buffer.fallback && !policy.rtsp_udp && !policy.rtsp_fps_probe_frames,
+        require(policy.audio_buffer.duration == 350ms && !policy.audio_buffer.fallback && !policy.rtsp_udp && !policy.fps_probe_frames,
             "network preset changed file/VoD audio defaults");
     }
     require(!PlaybackSource::networkLive("rtsp://example.test/live", {RtspTransport::Tcp, static_cast<LivePreset>(999)}).isValid(),
@@ -592,6 +594,147 @@ void testRtspPresets()
     require(decoder.open(wave.path().u8string()) && !decoder.udpReceiveSettings(), "UDP configuration persisted into a local source");
 }
 
+// 公开直播入口与 FFmpeg 的参数解释对齐；模式、数字、重复/伪装键及原始编码均先在无网络下验证。
+void testLiveAddresses()
+{
+    for (const auto* raw : {"rtmp://user:MediaStudioSecretPassword@example.test/live/key?token=a%2Fb",
+        "SRT://example.test:9002?mode=caller&streamid=%23!::r=live%2Flolm", "srt://[::1]:9002?latency=0",
+        "srt://example.test:9002?latency=-1"}) {
+        const auto result = createLiveSource(raw);
+        require(result.source && result.source->address() == raw && result.source->displayName().find("MediaStudioSecret") == std::string::npos,
+            "generic live validation changed encoded URL or exposed its credentials");
+    }
+    for (const auto* raw : {"srt://example.test", "srt://example.test:0", "srt://example.test:9002/path",
+        "srt://u:p@example.test:9002", "srt://example.test:9002?mode=listener", "srt://example.test:9002?mode=rendezvous",
+        "srt://example.test:9002?transtype=file", "srt://example.test:9002?mode=caller&mode=listener",
+        "srt://example.test:9002?MODE=listener", "srt://example.test:9002?%6dode=caller", "srt://example.test:9002?latency=",
+        "srt://example.test:9002?latency=100ms", "srt://example.test:9002?latency=-2", "srt://example.test:9002?latency=+100",
+        "srt://example.test:9002?latency=2147483648000", "srt://example.test:9002?latency=99999999999999999999",
+        "srt://example.test:9002?latency=100&latency=200", "srt://example.test:9002?latency=100&tsbpddelay=200",
+        "srt://example.test:9002?latency=1%30", "srt://example.test:9002?streamid=bad%0a",
+        "rtmp://example.test:99999/live", "rtmp://example.test/live#fragment", "rtmps://example.test/live",
+        "https://example.test/live", "rtmp://"}) {
+        require(!createLiveSource(raw).source && !PlaybackSource::networkLive(raw).isValid(), "invalid live URL bypassed one entry point");
+    }
+    require(createLiveSource("srt://example.test:9002?mode=listener").error == LiveSourceError::UnsupportedSrtMode,
+        "unsupported SRT role did not have a safe structured reason");
+    require(!createRtspSource("rtmp://example.test/live").source, "RTSP compatibility factory widened unexpectedly");
+    std::cout << "live_addresses=RTSP,RTMP,SRT caller_live_only=1 raw_URL_preserved=1 duplicates_overflow_disguised_keys_rejected=1\n";
+}
+
+// 任一显式 SRT 延迟都禁止补入另一套预设；只复制已验证的数值，不携带密钥或 streamid。
+void testLiveOptions()
+{
+    using namespace std::chrono_literals;
+    for (const auto preset : {LivePreset::Stable, LivePreset::LowLatency}) {
+        const bool low = preset == LivePreset::LowLatency;
+        const auto rtmp = playbackPolicy(*createLiveSource("rtmp://example.test/live", {RtspTransport::Udp,preset}).source);
+        require(rtmp.rtmp_buffer == (low ? 200ms : 1000ms) && !rtmp.srt && !rtmp.rtsp_udp && rtmp.fps_probe_frames == (low ? std::optional{8} : std::nullopt),
+            "RTMP buffer units or protocol isolation incorrect");
+        require(rtmp.stream_probe_analysis==(low?250000us:1000000us),"FLV probe analysis bound differs from profile");
+        const auto srt = playbackPolicy(*createLiveSource("srt://example.test:9002", {RtspTransport::Udp,preset}).source);
+        require(srt.srt && srt.srt->latency == (low ? 400000us : 1500000us) && !srt.srt->latency_from_url &&
+            !srt.srt->receive_latency && !srt.srt->peer_latency && !srt.rtmp_buffer && !srt.rtsp_udp && srt.fps_probe_frames == (low ? std::optional{8} : std::nullopt),
+            "SRT preset default was not in microseconds");
+        require(srt.stream_probe_analysis==rtmp.stream_probe_analysis,"TS probe analysis bound differs from profile");
+        for (const auto* key : {"latency", "rcvlatency", "peerlatency", "tsbpddelay"}) {
+            const auto source = createLiveSource(std::string("srt://example.test:9002?")+key+"=700001", {RtspTransport::Tcp,preset});
+            const auto explicit_value = playbackPolicy(*source.source).srt;
+            require(explicit_value && explicit_value->latency_from_url &&
+                explicit_value->latency.has_value() == (std::string_view(key)=="latency" || std::string_view(key)=="tsbpddelay") &&
+                explicit_value->receive_latency.has_value() == (std::string_view(key)=="rcvlatency") &&
+                explicit_value->peer_latency.has_value() == (std::string_view(key)=="peerlatency"), "explicit SRT option acquired a conflicting default");
+        }
+        const auto combined = playbackPolicy(*createLiveSource("srt://example.test:9002?latency=800000&rcvlatency=600000&peerlatency=200000",
+            {RtspTransport::Tcp,preset}).source).srt;
+        require(combined && combined->latency==800000us && combined->receive_latency==600000us && combined->peer_latency==200000us,
+            "explicit SRT options lost individual values");
+    }
+    std::cout << "RTMP_buffer_ms=1000,200 SRT_default_us=1500000,400000 explicit_each_or_combined_no_mixed_default=1\n";
+}
+
+// 在进程实际加载的 FFmpeg 上完成真实 RTMP/SRT 连接、解码及 AVOption 核对，不依赖外部服务程序。
+void testLiveProtocolInput(bool srt)
+{
+    const auto protocol = srt ? PlaybackProtocol::Srt : PlaybackProtocol::Rtmp;
+    for (const auto preset : {LivePreset::Stable,LivePreset::LowLatency}) {
+        const std::vector<std::string> queries = srt
+            ? std::vector<std::string>{"", "&latency=600000", "&rcvlatency=500000", "&peerlatency=300000", "&tsbpddelay=450000", "&latency=-1"}
+            : std::vector<std::string>{""};
+        for (const auto& query : queries) {
+            LiveProtocolServer server(protocol,1,18s);
+            auto raw = server.url();
+            if (srt) raw += "?streamid=MediaStudioSecretStreamId"+query;
+            else { raw.insert(7,"user:MediaStudioSecretPassword@"); raw += "?token=MediaStudioSecretRtmpQuery"; }
+            const auto source = createLiveSource(raw,{RtspTransport::Udp,preset,false});
+            require(source.source.has_value(), "fixture live source was rejected");
+            MediaDecoder decoder;
+            const auto opened = decoder.open(*source.source);
+            require(opened.status==MediaOpenStatus::Opened && decoder.hasAudio() && decoder.hasVideo(), "real live protocol did not open both tracks");
+            const auto report=decoder.liveInputReport();
+            require(report && (srt ? report->srt.has_value() : report->rtmp_buffer.has_value()) && !decoder.udpReceiveSettings(),
+                "actual protocol option report absent or mixed with RTSP");
+            if (srt) require(report->srt->latency_from_url == !query.empty(), "actual SRT report lost URL priority");
+            else require(report->rtmp_buffer==(preset==LivePreset::Stable?1000ms:200ms), "actual RTMP buffer differs");
+            const auto& info=decoder.getMediaInfo();
+            require(info.file_path.empty() && info.file_name==(srt?"SRT":"RTMP"), "private live address reached media information");
+            auto packet=makePacket(); bool pcm=false,video=false;
+            for(int i=0;i<120 && (!pcm || !video);++i) {
+                require(decoder.readPacketResult(packet.get()).status==MediaReadStatus::Packet,"real live protocol stopped before decoding");
+                std::vector<DecodedFrame> frames;
+                if(decoder.isAudioPacket(packet.get())) { decoder.decodeAudioPacket(packet.get(),frames); for(const auto& f:frames) pcm|=f.samples>0; }
+                else if(decoder.isVideoPacket(packet.get())) { decoder.decodeVideoPacket(packet.get(),frames); for(const auto& f:frames) video|=f.width==32&&f.height==32; }
+                av_packet_unref(packet.get());
+            }
+            require(pcm&&video,"real live protocol produced no decoded PCM/video");
+            decoder.close(); require(!decoder.liveInputReport(),"closed decoder retained last protocol report");
+            std::cout << "actual_protocol="<<(srt?"SRT":"RTMP")<<" low="<<(preset==LivePreset::LowLatency)
+                <<" explicit_latency="<<!query.empty()<<" actual_PCM_video=1 AVOptions_checked=1\n";
+        }
+    }
+}
+
+// 真实连接失败/加密拒绝也经过进程级输出检查，覆盖 FFmpeg 与 libsrt 的错误路径。
+void testOtherLivePrivateFailures()
+{
+    RtspBlackhole absent(RtspBlackhole::StallAt::UnavailableEndpoint);
+    auto raw=absent.url(); raw.replace(0,4,"rtmp");
+    raw.insert(7,"MediaStudioSecretUser:MediaStudioSecretPassword@");raw+="?token=MediaStudioSecretFailure";
+    MediaDecoder decoder;
+    auto io=std::make_shared<MediaIoControl>();io->setRecoveryDeadline(Clock::now()+800ms);
+    auto result=decoder.open(*createLiveSource(raw).source,io);
+    require(result.status==MediaOpenStatus::Error || result.status==MediaOpenStatus::Timeout,"private RTMP failure did not reach network error");
+    LiveProtocolServer server(PlaybackProtocol::Srt,1,8s);
+    raw=server.url()+"?passphrase=MediaStudioSecretSrtPassword&streamid=MediaStudioSecretDeniedStream";
+    io=std::make_shared<MediaIoControl>();io->setRecoveryDeadline(Clock::now()+800ms);
+    result=decoder.open(*createLiveSource(raw).source,io);
+    require(result.status==MediaOpenStatus::Error || result.status==MediaOpenStatus::Timeout,"unencrypted SRT peer accepted a private encrypted caller");
+    require(!decoder.liveInputReport() && decoder.getMediaInfo().file_path.empty(),"failed private input retained report or raw path");
+    std::cout<<"other_live_private_errors=RTMP_connection,SRT_encryption safe_metadata=1\n";
+}
+
+// 已完成真实协议握手但不送媒体头；取消和总预算分别中断阻塞，不能把取消当成普通重试。
+void testLiveProtocolBlocked(bool srt, bool timeout)
+{
+    LiveProtocolServer server(srt?PlaybackProtocol::Srt:PlaybackProtocol::Rtmp,1,12s);
+    server.setMediaPaused(true);
+    auto io=std::make_shared<MediaIoControl>(); MediaDecoder decoder;
+    if(timeout) io->setRecoveryDeadline(Clock::now()+700ms);
+    auto opened=std::async(std::launch::async,[&]{return decoder.open(*createLiveSource(server.url()).source,io);});
+    const auto wait_end=Clock::now()+2s;
+    while(server.acceptedConnections()==0&&Clock::now()<wait_end&&opened.wait_for(0ms)!=std::future_status::ready)
+        std::this_thread::sleep_for(5ms);
+    if(!timeout) io->cancel();
+    const auto cancel_at=Clock::now();
+    require(opened.wait_for(2s)==std::future_status::ready,"blocked protocol ignored cancellation/deadline");
+    const auto result=opened.get();
+    require(server.acceptedConnections()==1 && result.status==(timeout?MediaOpenStatus::Timeout:MediaOpenStatus::Cancelled),
+        "blocked live protocol was not a typed post-handshake interruption");
+    decoder.close();
+    std::cout<<"blocked_protocol="<<(srt?"SRT":"RTMP")<<" timeout="<<timeout
+        <<" cancellation_or_deadline_ms="<<std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-cancel_at).count()<<'\n';
+}
+
 } // namespace
 
 // 每个 CTest 启动一个进程，夹具或解码器异常时仍由外层超时保护。
@@ -599,6 +742,13 @@ int main(int argc, char* argv[])
 {
     try {
         const std::string_view mode = argc > 1 ? argv[1] : "";
+        if (mode=="live-addresses") { testLiveAddresses(); return 0; }
+        if (mode=="live-options") { testLiveOptions(); return 0; }
+        if (mode=="live-private-failures") { testOtherLivePrivateFailures(); return 0; }
+        if (mode=="live-protocol-rtmp" || mode=="live-protocol-srt") { testLiveProtocolInput(mode=="live-protocol-srt"); return 0; }
+        if (mode=="live-cancel-rtmp" || mode=="live-cancel-srt" || mode=="live-timeout-rtmp" || mode=="live-timeout-srt") {
+            testLiveProtocolBlocked(mode.find("srt")!=std::string_view::npos,mode.find("timeout")!=std::string_view::npos); return 0;
+        }
         if (mode == "contracts" && argc == 2) {
             testSourcePolicies();
             testPresetContracts();

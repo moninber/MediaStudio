@@ -2,6 +2,7 @@
 #include "PlayerController.h"
 #include "LiveRecovery.h"
 #include "RtspBlackhole.h"
+#include "LiveProtocolServer.h"
 #include "VideoWidget.h"
 
 #include <QApplication>
@@ -124,6 +125,14 @@ struct MainWindowNetworkTestAccess {
     static void openListed(MainWindow& window, const PlaybackSource& source)
     {
         window.openPlaylistEntry(window.appendPlaylistEntry(source));
+    }
+    // 新协议仍只在内部播放项保存地址；Qt 列表和媒体库路由都不能携带凭据。
+    static bool safeProtocolRow(const MainWindow& w, const std::string& raw, bool srt)
+    {
+        if(w.playlist_.size()!=1 || w.list_playlist_->count()!=1 || w.playlist_[0].address()!=raw) return false;
+        const auto* item=w.list_playlist_->item(0);
+        return item->text().startsWith(srt?"SRT/caller":"RTMP") && !item->text().contains("MediaStudioSecret") &&
+            item->toolTip().isEmpty() && !item->data(Qt::UserRole).isValid() && w.library_request_id_==0;
     }
     // 删除列表项后活动会话仍可暂停/重新接入，不应读错变动后的行号。
     static void removeSelected(MainWindow& window) { window.removeFromPlaylist(); }
@@ -1845,6 +1854,96 @@ void testWindowReceiveDetails()
     std::cout << "window_payload_units=1 relative_lag_not_end_to_end=1 unavailable_reason=1 compact_summary=1 file_UI_preserved=1\n";
 }
 
+// RTMP/SRT 两预设复用同一控制器生命周期；真实 PCM、视频提交及协议报告均须跟随新请求/尝试。
+int testOtherLiveProtocol(std::string_view mode)
+{
+    if(!hasDefaultRenderEndpoint()) return 77;
+    const bool srt=mode.find("srt")!=std::string_view::npos;
+    const auto preset=mode.find("low")!=std::string_view::npos?LivePreset::LowLatency:LivePreset::Stable;
+    const bool late_video=mode.find("late-video")!=std::string_view::npos;
+    LiveProtocolServer server(srt?PlaybackProtocol::Srt:PlaybackProtocol::Rtmp,5,55s,
+        mode.find("10fps")!=std::string_view::npos?10:25,late_video?1000ms:0ms);
+    VideoWidget widget; PlayerController player; player.setVideoWidget(&widget);
+    player.setVolume(.17f);player.setEffect(VideoEffect::Grayscale);
+    const auto source=createLiveSource(server.url(),{RtspTransport::Udp,preset,true});
+    require(source.source.has_value(),"other live fixture source rejected");
+    const auto request=player.requestOpen(*source.source);
+    if(late_video) waitInQt([&]{const auto s=player.getPlaybackSnapshot();return s.state==PlaybackState::Buffering&&s.media_info.has_video&&
+        s.media_info.video_info.width==0&&!s.network_stats->first_video_submit_seconds;},5s,"late SPS fixture did not expose pending video metadata");
+    const auto ready=[&](std::uint64_t wanted, std::uint64_t attempt){const auto s=player.getPlaybackSnapshot();
+        return s.request_id==wanted&&s.connection_attempt_id==attempt&&s.state==PlaybackState::Playing&&s.has_current_video_output&&
+            s.media_info.video_info.width==32&&s.media_info.video_info.height==32&&s.media_info.video_info.frame_rate_known&&
+            s.network_stats->first_pcm_seconds&&s.network_stats->first_video_submit_seconds&&s.audio_output&&
+            s.network_stats->last_audio_output_age_seconds.value_or(10)<.25&&s.network_stats->last_video_output_age_seconds.value_or(10)<.25;
+    };
+    waitInQt([&]{return ready(request,1);},10s,"other live protocol did not start actual WASAPI/video");
+    const auto first=player.getPlaybackSnapshot();
+    require(first.network_stats->preset==preset&&!first.rtsp_transport&&!first.network_stats->udp_receive&&
+        first.network_stats->input_settings&&(srt?first.network_stats->input_settings->srt.has_value():first.network_stats->input_settings->rtmp_buffer.has_value())&&
+        first.audio_output->requested==(preset==LivePreset::LowLatency?100ms:350ms)&&!first.capabilities.can_seek&&first.capabilities.can_return_to_live,
+        "other live protocol lost preset/options/capabilities or inherited RTSP transport");
+    remainsInQt([&]{const auto s=player.getPlaybackSnapshot();return ready(request,1)&&s.network_stats->reconnect_attempts==0&&s.network_stats->queue_full_events==0;},
+        1200ms,"normal other live protocol retried or stopped output");
+    auto at=Clock::now();player.pause();require(Clock::now()-at<100ms,"other live pause blocked command thread");
+    waitInQt([&]{const auto s=player.getPlaybackSnapshot();return s.state==PlaybackState::Paused&&!s.is_session_active&&server.activeConnections()==0;},
+        2s,"other live pause left device, worker or fixture connection");
+    remainsInQt([&]{return server.acceptedConnections()==1&&player.getPlaybackSnapshot().state==PlaybackState::Paused;},
+        1100ms,"paused other live protocol reopened itself");
+    const auto continued=player.play();require(continued>request,"other live continue did not create new user request");
+    waitInQt([&]{return ready(continued,1);},10s,"other live continue did not rejoin latest media");
+    const auto manual=player.returnToLive();require(manual>continued,"other live manual rejoin did not replace request");
+    waitInQt([&]{return ready(manual,1)&&server.acceptedConnections()==3;},10s,"other live manual rejoin failed");
+    server.disconnectCurrent();
+    waitInQt([&]{return ready(manual,2)&&server.acceptedConnections()==4;},12s,"other live server restart did not restore actual output");
+    const auto recovered=player.getPlaybackSnapshot();
+    require(recovered.network_stats->preset==preset&&recovered.network_stats->reconnect_attempts==1&&
+        recovered.network_stats->queue_full_events==0&&recovered.network_stats->input_settings&&
+        std::abs(player.getVolume()-.17f)<.001f&&player.getEffect()==VideoEffect::Grayscale,
+        "other live automatic recovery lost settings or mixed retry counts");
+    at=Clock::now();player.stopAsync();require(Clock::now()-at<100ms,"other live stop blocked command thread");
+    waitInQt([&]{return !player.getPlaybackSnapshot().is_session_active&&server.activeConnections()==0;},2s,"other live stop did not release output/connection");
+    player.shutdown();
+    std::cout<<"other_live="<<mode<<" PCM_video=1 pause_continue_manual=1 restart_attempt=2 retries=1 Full=0 stop_released=1\n";
+    return 0;
+}
+
+// 分别在已握手待媒体头、读包阻塞和自动退避阶段停止；UI 命令不等待网络线程，取消不复活。
+int testOtherLiveCancellation(std::string_view mode)
+{
+    if(!hasDefaultRenderEndpoint()) return 77;
+    const bool srt=mode.find("srt")!=std::string_view::npos;
+    const bool opening=mode.find("open")!=std::string_view::npos,backoff=mode.find("backoff")!=std::string_view::npos;
+    LiveProtocolServer server(srt?PlaybackProtocol::Srt:PlaybackProtocol::Rtmp,3,25s);
+    server.setMediaPaused(opening);
+    VideoWidget widget;PlayerController player;player.setVideoWidget(&widget);
+    const auto request=player.requestOpen(*createLiveSource(server.url(),{RtspTransport::Tcp,LivePreset::LowLatency,true}).source);
+    if(opening) waitInQt([&]{return server.acceptedConnections()==1&&player.getPlaybackSnapshot().state==PlaybackState::Opening;},
+        3s,"other live open cancellation did not reach actual handshake");
+    else {
+        waitInQt([&]{const auto s=player.getPlaybackSnapshot();return s.state==PlaybackState::Playing&&s.network_stats->first_pcm_seconds&&s.has_current_video_output;},
+            10s,"other live cancellation source never produced output");
+        if(backoff) {
+            server.disconnectCurrent();
+            waitInQt([&]{const auto s=player.getPlaybackSnapshot();return s.state==PlaybackState::Reconnecting&&s.network_stats->reconnect_attempts==0;},
+                3s,"other live cancellation never reached backoff");
+        } else {
+            server.setMediaPaused(true);
+            waitInQt([&]{const auto s=player.getPlaybackSnapshot();return s.network_stats->receive.last_packet_age_seconds.value_or(0)>.25&&
+                s.connection_attempt_id==1&&s.state!=PlaybackState::Reconnecting;},4s,"other live read was not blocked on actual media");
+        }
+    }
+    const auto at=Clock::now();player.stopAsync();require(Clock::now()-at<100ms,"other live cancel blocked GUI command");
+    waitInQt([&]{return !player.getPlaybackSnapshot().is_session_active;},2s,"other live cancelled worker/input still active");
+    // 解除夹具的主动停送，让其通过写入观察已由客户端关闭的连接，不以强制断开冒充客户端取消。
+    server.setMediaPaused(false);
+    waitInQt([&]{return server.activeConnections()==0;},2s,"other live cancelled client left fixture connection active");
+    remainsInQt([&]{return server.acceptedConnections()==1&&!player.getPlaybackSnapshot().is_session_active;},
+        1300ms,"other live cancelled operation opened another connection");
+    player.shutdown();
+    std::cout<<"other_live_cancel="<<mode<<" request="<<request<<" UI_under100ms=1 cleanup_under2s=1 no_reopen=1\n";
+    return 0;
+}
+
 // 同一组短暂慢送对照两预设/两传输：低延迟先真实建立候选，恢复实时后必须撤销而不重接。
 // 稳定模式具有相同接收滞后证据，但从始至终不启用主动策略；纯视频避免声卡差异影响时间边界。
 void testPresetJitterWithdrawal(std::string_view mode)
@@ -2066,6 +2165,45 @@ void testWindowLowLatency()
     closeWindow(window.view, MainWindowCloseTestAccess::snapshot(view).request_id, "low-latency-dialog", {});
     waitInQt([&] { return server.acceptedConnections() == 3 && server.activeRemoteSessions() == 0; }, 1s, "public low-latency close leaked sessions");
     std::cout << "public_low_latency_UDP=1 stable_default=1 actual_candidate_pause=1 continue_and_return_preserve_mode=1 close_released=1\n";
+}
+
+// 新协议走真实公开对话框；非法 SRT 角色留在对话框中，地址、密钥、streamid 不进入 Qt 展示字段。
+int testWindowOtherLiveProtocol(bool srt)
+{
+    if(!hasDefaultRenderEndpoint()) return 77;
+    LiveProtocolServer server(srt?PlaybackProtocol::Srt:PlaybackProtocol::Rtmp,2,25s);
+    TestWindow window;auto& view=*window.view;
+    auto raw=server.url();
+    if(srt) raw+="?mode=caller&streamid=MediaStudioSecretWindowStream&rcvlatency=250000";
+    else {raw.insert(7,"user:MediaStudioSecretWindowPassword@");raw+="?token=MediaStudioSecretWindowQuery";}
+    bool submitted=false,disabled=false,rejected=!srt;
+    QTimer timer;timer.setSingleShot(true);timer.start(1500);
+    QObject::connect(&timer,&QTimer::timeout,&view,[&]{if(auto* d=qobject_cast<QDialog*>(QApplication::activeModalWidget()))d->reject();});
+    QTimer::singleShot(0,&view,[&]{
+        auto* d=view.findChild<QDialog*>("networkMediaDialog");if(!d)return;
+        auto* input=d->findChild<QLineEdit*>("networkUrlInput");auto* transport=d->findChild<QComboBox*>("rtspTransportSelector");
+        auto* preset=d->findChild<QComboBox*>("livePresetSelector");auto* error=d->findChild<QLabel*>("networkUrlError");
+        auto* buttons=d->findChild<QDialogButtonBox*>("networkDialogButtons");
+        if(!input||!transport||!preset||!error||!buttons){d->reject();return;}
+        if(srt){input->setText("srt://127.0.0.1:9002?mode=listener&streamid=MediaStudioSecretRejectedRole");buttons->button(QDialogButtonBox::Open)->click();
+            rejected=d->isVisible()&&!error->text().isEmpty()&&!error->text().contains("MediaStudioSecret")&&MainWindowCloseTestAccess::snapshot(view).request_id==0;}
+        input->setText(QString::fromStdString(raw));disabled=!transport->isEnabled()&&input->echoMode()==QLineEdit::Password;
+        preset->setCurrentIndex(preset->findData(static_cast<int>(LivePreset::LowLatency)));
+        buttons->button(QDialogButtonBox::Open)->click();submitted=true;
+    });
+    require(QMetaObject::invokeMethod(&view,"openNetworkMedia",Qt::DirectConnection),"other live dialog slot absent");timer.stop();
+    require(submitted&&disabled&&rejected&&MainWindowNetworkTestAccess::safeProtocolRow(view,raw,srt),"other live dialog did not isolate transport, role or private address");
+    waitInQt([&]{const auto s=MainWindowCloseTestAccess::snapshot(view);const auto panel=MainWindowNetworkTestAccess::controls(view).metadata;
+        return s.state==PlaybackState::Playing&&s.audio_output&&s.network_stats->input_settings&&s.has_current_video_output&&
+            panel.contains(srt?"caller/live":"rtmp_buffer")&&!panel.contains("MediaStudioSecret");},10s,"other live actual UI did not render protocol settings/output");
+    const auto s=MainWindowCloseTestAccess::snapshot(view);const auto& settings=*s.network_stats->input_settings;
+    require(s.network_stats->preset==LivePreset::LowLatency&&!s.rtsp_transport&&
+        (srt?(settings.srt&&settings.srt->latency_from_url&&!settings.srt->latency&&settings.srt->receive_latency==250000us)
+            :settings.rtmp_buffer==200ms),"other live UI options did not reach actual FFmpeg");
+    closeWindow(window.view,s.request_id,"other-live-protocol",{});
+    waitInQt([&]{return server.activeConnections()==0;},2s,"other live GUI close left protocol connection");
+    std::cout<<"window_other_protocol="<<(srt?"SRT":"RTMP")<<" public_low=1 transport_disabled=1 masked_private_fields=1 actual_options_PCM_video=1 close_released=1\n";
+    return 0;
 }
 
 // 检查已接到关窗命令的快照中不再有旧源标记或可显示内容。
@@ -2604,6 +2742,9 @@ int main(int argc, char* argv[])
         QApplication app(argc, argv);
         app.setQuitOnLastWindowClosed(false);
         if (mode == "controller-local") testControllerLocal();
+        else if (mode.find("live-protocol-cancel-")==0) return testOtherLiveCancellation(mode);
+        else if (mode.find("live-protocol-")==0) return testOtherLiveProtocol(mode);
+        else if (mode=="window-protocol-rtmp" || mode=="window-protocol-srt") return testWindowOtherLiveProtocol(mode=="window-protocol-srt");
         else if (mode.find("live-preset-jitter-") == 0) testPresetJitterWithdrawal(mode);
         else if (mode == "window-low-latency") testWindowLowLatency();
         else if (mode.substr(0, 13) == "live-backlog-") testLiveBacklog(mode);

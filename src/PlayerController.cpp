@@ -85,6 +85,18 @@ std::uint64_t PlayerController::requestOpen(const PlaybackSource& source)
     return requestOpenLocked(source, false);
 }
 
+// 调用者已持快照锁且核对当前标签；解码线程只发布值，不修改 supervisor 的打开期元信息。
+void PlayerController::publishLiveVideoInfoLocked(const DecodedFrame& frame)
+{
+    auto& info = snapshot_.media_info.video_info;
+    if (frame.width > 0 && frame.height > 0) { info.width = frame.width; info.height = frame.height; }
+    if (!frame.source_pixel_format.empty()) info.pixel_format = frame.source_pixel_format;
+    if (!info.frame_rate_known && frame.codec_frame_rate) {
+        info.frame_rate = *frame.codec_frame_rate;
+        info.frame_rate_known = true;
+    }
+}
+
 // 调用者已经持有命令锁。按值接收源，避免继续操作时引用被自身的状态替换失效。
 std::uint64_t PlayerController::requestOpenLocked(PlaybackSource source, bool retain_frame)
 {
@@ -555,6 +567,7 @@ std::optional<PlaybackError> PlayerController::runRequest(const OpenRequest& req
             receive_monitor_.reset(connection_started_at_, snapshot_.media_info.has_video
                 ? LiveReferenceTrack::Video : LiveReferenceTrack::Audio);
             snapshot_.network_stats->udp_receive = decoder_.udpReceiveSettings();
+            snapshot_.network_stats->input_settings = decoder_.liveInputReport();
             snapshot_.network_stats->input_ready_seconds =
                 std::chrono::duration<double>(now - connection_started_at_).count();
             request.io->beginInitialOutputDeadline(now + policy.initial_output_timeout);
@@ -974,7 +987,9 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
     std::thread video_worker;
     if (use_video) {
         const double nominal_frame_seconds = 1.0 / decoder_.getMediaInfo().video_info.frame_rate;
-        video_worker = std::thread([&, nominal_frame_seconds] {
+        const bool initial_rate_unknown = !decoder_.getMediaInfo().video_info.frame_rate_known;
+        video_worker = std::thread([&, nominal_frame_seconds, initial_rate_unknown] {
+            double frame_seconds = nominal_frame_seconds;
             auto playback_anchor = Clock::now();
             auto window_start = playback_anchor;
             double anchor_pts = current_time_.load();
@@ -1003,6 +1018,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                 }
                 if (!live && frame.pts + 0.0001 < min_valid_pts.load()) return;
                 ++decoded_frames;
+                if (live && initial_rate_unknown && frame.codec_frame_rate) frame_seconds = 1.0 / *frame.codec_frame_rate;
                 auto audio = read_audio_clock(epoch);
                 double presentation_pts = frame.pts;
                 if (live) {
@@ -1033,7 +1049,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                         last_live_video_pts = frame.pts;
                     } else {
                         presentation_pts = last_live_presentation
-                            ? *last_live_presentation + nominal_frame_seconds : fallback;
+                            ? *last_live_presentation + frame_seconds : fallback;
                     }
                     if (!audio.position && (!last_live_presentation || first_valid_pts || clock_jump)) {
                         // 纯视频首帧贴合本地单调时钟，后续只等待相对差，避免按绝对 PTS 等待。
@@ -1087,6 +1103,7 @@ std::optional<MediaReadResult> PlayerController::demuxAndPlay(const OpenRequest&
                     if (accepted) {
                         snapshot_.has_current_video_output = true;
                         if (live) {
+                            publishLiveVideoInfoLocked(frame);
                             last_video_output_at_ = submitted_at;
                             request.io->noteVideoOutput(submitted_at + policy.output_stall_timeout);
                             record_live_output(snapshot_.network_stats->first_video_submit_seconds, submitted_at);

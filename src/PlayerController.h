@@ -74,6 +74,7 @@ private:
     std::uint64_t requestOpenLocked(PlaybackSource source, bool retain_frame);
     void cancelCurrentLocked();
     void cancelBacklogLocked(LiveBacklogReason reason);
+    void publishLiveVideoInfoLocked(const DecodedFrame& frame);
     void resetSnapshotLocked(std::uint64_t request_id, PlaybackState state);
     std::uint64_t setPausedLocked(bool paused);
     PlaybackEpoch currentEpochLocked() const;

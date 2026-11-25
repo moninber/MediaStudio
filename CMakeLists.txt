@@ -161,6 +161,7 @@ if(BUILD_TESTING)
     add_executable(MediaStudioPlaybackTests
         tests/PlaybackTests.cpp
         tests/RtspBlackhole.cpp
+        tests/LiveProtocolServer.cpp
         ${MEDIASTUDIO_PLAYBACK_SOURCES}
     )
     set_target_properties(MediaStudioPlaybackTests PROPERTIES
@@ -179,14 +180,22 @@ if(BUILD_TESTING)
     )
     if(WIN32)
         target_compile_definitions(MediaStudioPlaybackTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-        target_link_libraries(MediaStudioPlaybackTests PRIVATE ws2_32)
+        target_link_libraries(MediaStudioPlaybackTests PRIVATE ws2_32 iphlpapi)
     endif()
 
     # 测试可直接从构建目录运行，不依赖播放器部署步骤或已配置的全局 PATH。
     get_filename_component(mediastudio_compiler_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
-    foreach(test_case IN ITEMS contracts local-file rtsp-cancel rtsp-timeout rtsp-stable rtsp-presets rtsp-recovery-deadline)
+    foreach(test_case IN ITEMS contracts local-file rtsp-cancel rtsp-timeout rtsp-stable rtsp-presets rtsp-recovery-deadline
+                          live-addresses live-options live-protocol-rtmp live-protocol-srt
+                          live-cancel-rtmp live-cancel-srt live-timeout-rtmp live-timeout-srt live-private-failures)
         add_test(NAME MediaStudio.Playback.${test_case} COMMAND MediaStudioPlaybackTests ${test_case})
         set_tests_properties(MediaStudio.Playback.${test_case} PROPERTIES TIMEOUT 18)
+        if(test_case STREQUAL "live-protocol-srt")
+            set_property(TEST MediaStudio.Playback.${test_case} PROPERTY TIMEOUT 80)
+        endif()
+        if(test_case MATCHES "^live-")
+            set_property(TEST MediaStudio.Playback.${test_case} PROPERTY FAIL_REGULAR_EXPRESSION "MediaStudioSecret[0-9A-Za-z]+")
+        endif()
         if(WIN32)
             set_property(TEST MediaStudio.Playback.${test_case} PROPERTY ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:${MEDIASTUDIO_FFMPEG_ROOT}/bin"
@@ -282,6 +291,7 @@ if(BUILD_TESTING)
     add_executable(MediaStudioSessionTests
         tests/ControllerTests.cpp
         tests/RtspBlackhole.cpp
+        tests/LiveProtocolServer.cpp
         ${MEDIASTUDIO_PLAYBACK_SOURCES}
         ${MEDIASTUDIO_SESSION_SOURCES}
         src/MainWindow.cpp
@@ -305,7 +315,7 @@ if(BUILD_TESTING)
     target_compile_definitions(MediaStudioSessionTests PRIVATE MEDIASTUDIO_ENABLE_MYSQL=0)
     if(WIN32)
         target_compile_definitions(MediaStudioSessionTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-        target_link_libraries(MediaStudioSessionTests PRIVATE ole32 uuid winmm ws2_32)
+        target_link_libraries(MediaStudioSessionTests PRIVATE ole32 uuid winmm ws2_32 iphlpapi)
     endif()
 
     foreach(test_case IN ITEMS controller-local controller-supersede controller-blocked-read packet-epochs widget-epochs
@@ -334,7 +344,15 @@ if(BUILD_TESTING)
                           live-backlog-stable live-backlog-disabled live-backlog-budget
                           live-backlog-cancel-candidate live-backlog-cancel-backoff window-low-latency
                           live-preset-jitter-stable-tcp live-preset-jitter-stable-udp
-                          live-preset-jitter-low-tcp live-preset-jitter-low-udp live-backlog-budget-udp)
+                          live-preset-jitter-low-tcp live-preset-jitter-low-udp live-backlog-budget-udp
+                          live-protocol-rtmp-stable live-protocol-rtmp-low live-protocol-srt-stable live-protocol-srt-low
+                          live-protocol-rtmp-stable-10fps live-protocol-rtmp-low-10fps
+                          live-protocol-srt-stable-10fps live-protocol-srt-low-10fps
+                          live-protocol-srt-low-late-video
+                          live-protocol-cancel-open-rtmp live-protocol-cancel-open-srt
+                          live-protocol-cancel-read-rtmp live-protocol-cancel-read-srt
+                          live-protocol-cancel-backoff-rtmp live-protocol-cancel-backoff-srt
+                          window-protocol-rtmp window-protocol-srt)
         set(test_name MediaStudio.Session.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES
@@ -343,6 +361,10 @@ if(BUILD_TESTING)
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
         )
         # 无默认音频端点的机器不能真实提交 PCM；其他错误保持测试失败。
+        if(test_case MATCHES "^live-protocol-" OR test_case MATCHES "^window-protocol-")
+            set_tests_properties(${test_name} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+                FAIL_REGULAR_EXPRESSION "MediaStudioSecret[0-9A-Za-z]+")
+        endif()
         if(test_case MATCHES "^live-start-(av|audio)-" OR test_case MATCHES "^live-pause-av-" OR
            test_case MATCHES "^live-cycle-audio-" OR test_case MATCHES "^mixed-switch-" OR
            test_case MATCHES "^live-recover-(av|audio)-" OR test_case MATCHES "^live-stall-" OR

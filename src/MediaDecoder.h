@@ -67,6 +67,8 @@ struct DecodedFrame {
     double pts = 0.0;
     bool has_valid_pts = false; // pts 来自解码器时间戳，而非缺失时的回退值。
     bool corrupt = false;      // FFmpeg 明确标记损坏；直播只传回标记，不复制数据。
+    std::optional<double> codec_frame_rate; // 视频 worker 从自己所属的解码器取得，不跨线程读 AVStream。
+    std::string source_pixel_format;
 };
 
 class MediaDecoder {
@@ -123,6 +125,7 @@ public:
     AVRational videoPacketTimeBase() const noexcept { return video_time_base_; }
     // 打开时核对运行中 FFmpeg 实际采用的 UDP 参数；GUI 只取副本，不访问格式上下文。
     std::optional<RtspUdpReceiveSettings> udpReceiveSettings() const noexcept { return udp_receive_settings_; }
+    std::optional<LiveInputReport> liveInputReport() const noexcept { return live_input_report_; }
     int getOutputAudioSampleRate() const { return TARGET_SAMPLE_RATE; }
     int getOutputAudioChannels() const { return TARGET_CHANNELS; }
 
@@ -145,6 +148,7 @@ private:
     std::shared_ptr<MediaIoControl> io_; // FFmpeg 回调使用的对象，在关闭封装后释放。
     std::chrono::milliseconds read_timeout_{0};
     std::optional<RtspUdpReceiveSettings> udp_receive_settings_;
+    std::optional<LiveInputReport> live_input_report_;
     bool network_input_ = false;
     bool read_deadline_active_ = false; // Again 和跳过非选中包沿用同一次读取的期限。
     AVCodecContext* video_codec_ctx_; // 视频解码器上下文

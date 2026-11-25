@@ -841,6 +841,28 @@ GUI 每 200 ms 调用 `getPlaybackSnapshot()`。所需轨道超过约 1 秒没�
 
 ---
 
+### 4.20 RTMP / SRT 适配、探测缓存与首帧元信息（5.1）
+
+公开入口 `openNetworkMedia()` 在确认时调用 `createLiveSource()`；原始 URL 仅进入内存中的 `PlaybackSource`。RTSP 继续保留兼容工厂，RTMP 和 SRT 走相同的播放请求、supervisor、解复用、分轨解码和输出流程。界面禁用不适用的 TCP/UDP 控件，安全标签由协议/预设枚举生成；HTML、播放列表和错误不会拼回主机、streamid 或口令。网络源仍不进入数据库，点播尚未接入。
+
+`parseSrtOptions()` 按原始 `&` 查询项识别 `mode/transtype/latency/rcvlatency/peerlatency` 及旧别名 `tsbpddelay`，与 FFmpeg 8 的大小写敏感键匹配一致。百分号解码及小写仅用于发现伪装键，不用于重写 URL；受控键的非原名、重复及别名冲突直接拒绝。模式只接受 caller/live，延迟用 `from_chars` 要求完整十进制且允许 FFmpeg 的未指定值 -1；在微秒转换到 libsrt 有符号 int 毫秒前检查范围。未知参数保持原字节，由 FFmpeg 处理。源对象缓存校验后的纯数值，`playbackPolicy()` 在音频/快照路径只复制配置，不重新解析或分配查询字符串。
+
+`livePresetSettings()` 仍是整组预设的唯一数值来源。RTMP 稳定/低延迟缓冲为 1000/200 ms；SRT 默认 latency 为 1500000/400000 µs。任一显式 URL 延迟会使整组预设延迟失效，而非只覆盖同名一项；例如只写 rcvlatency 时，policy 不再附加 latency。RTSP UDP 重排、RTMP 缓冲和 SRT 延迟分别适用，不相互叠加。三协议继续共用声卡 350/100 ms、队列维度、I/O 期限、积压判断和三次/45 秒恢复预算。
+
+`MediaDecoder::open()` 在当前运行库中枚举 RTMP/SRT 输入协议，固定使用 FLV/MPEG-TS demuxer，再设置最小协议白名单。RTMP 固定 `rtmp_live=live` 和 `listen=0`，不设置会隐式启用监听的 RTMP `timeout`；SRT 固定 caller/live，只有 URL 未指定延迟时才传预设 latency。打开后使用公开 `av_opt_get_int(pb, ..., AV_OPT_SEARCH_CHILDREN)` 检查实际 buffer、mode、transtype 和 latency 数值，不依赖 FFmpeg 私有 URLContext；核对失败按打开错误收尾。`LiveInputReport` 仅含数字，`runRequest()` 在当前 epoch 检查及既有快照锁内发布副本。
+
+真实样片首次四组接入均因起播 Full 失败：仅减少低延迟帧率采样仍不足，FLV/TS 的默认分析把超过队列跨度的音频保存在探测缓存，之后集中交给生产队列。修正为只对这两种容器设置 `max_analyze_duration`：稳定 1 s、低延迟 250 ms；低延迟的 `fps_probe_size=8` 也统一用于三种直播。分析媒体时长不等于五秒墙钟探测期限，不开启 nobuffer、不丢探测包、不跳参考帧，也不扩大队列上限。本地文件、HTTP 契约和 RTSP 的分析媒体时长设置保持原行为。新增两协议/两预设 10 fps 回归，防止只用短 GOP/25 fps 测试流掩盖缓存问题。
+
+较早结束探测可能已识别 H.264 轨道，但 SPS 尚未来到，尺寸为零、帧率仅是内部回退。`extractMediaInfo()` 增加 `frame_rate_known`；`convertVideoFrame()` 只从视频 worker 所属 codec context 复制尺寸、像素格式和有效标称帧率，不在 worker 访问仍由 supervisor 管理的 AVStream。`demuxAndPlay()` 在实际帧被接受、标签仍有效且持有既有快照锁的发布闭包中调用 `publishLiveVideoInfoLocked()`，只更新快照副本，旧连接不能补写新源信息。视频时间戳缺失时，局部回退步长也改用后来取得的有效帧率；GUI 未确认前明确显示等待首帧。新增一秒延后视频、音频先到的真实 SRT 回归，必须先观察未知信息，再验证尺寸和已知帧率补齐及完整重接控制链。
+
+没有增加协议专属锁或恢复线程。用户操作和快照/标签仍由既有 `snapshot_mutex_` 串行化；取消先置 `MediaIoControl` 原子标记、abort 队列并唤醒条件变量，FFmpeg interrupt callback 中断 open/probe/read，退避条件变量被立即唤醒。supervisor 等待视频/音频 worker join 后关闭输入；WASAPI 客户端由音频线程释放。新输入选项在每次连接重建时重新核对，暂停/继续和手动回到直播建立新用户请求，自动恢复沿用原请求和共享预算。
+
+测试夹具 `LiveProtocolServer` 使用 FFmpeg 自带 listener **输出**、固定 H.264 和实时 AAC 构造可控服务；listener 仅在测试代码出现，产品仍是客户端。系统端口表确认监听不消耗单客户端连接；原子 pause/revision/deadline 控制慢送、中断及重建，析构置停止并 join，RAII 释放 packet、编码器、AVIO 和封装。测试覆盖 URL/单位/优先级、实际 AVOption、双轨解码、打开/读取期限、三阶段取消、控制器恢复及公开 GUI 脱敏；真实 MediaMTX 则补足用户样片、WASAPI、GL 和服务重启证据。最终 160 项 CTest 无失败/跳过；用户样片五组原生窗口均通过正常音画、暂停/继续/回到直播、服务重启恢复和健康三十秒预算恢复，额外 SRT 显式参数跨重接保持。原始失败记录与最终成功结果共同保存在项目外验证目录，完整网络整合及长时耐久仍按 5.2/5.3。
+
+单位、模式和 URL 解析约束依据 [FFmpeg 协议文档](https://ffmpeg.org/ffmpeg-protocols.html) 及 [FFmpeg 8 libsrt 实现](https://github.com/FFmpeg/FFmpeg/blob/n8.0.1/libavformat/libsrt.c)、[RTMP 实现](https://github.com/FFmpeg/FFmpeg/blob/n8.0.1/libavformat/rtmpproto.c)，最终以本机已加载运行库的 AVOption 核对和实际读流结果验证。
+
+---
+
 ## 5. OpenGL视频渲染
 
 ### 5.1 渲染管线

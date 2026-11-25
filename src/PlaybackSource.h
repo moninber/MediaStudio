@@ -19,6 +19,14 @@ struct LiveSourceOptions {
     bool auto_reconnect = true;
 };
 
+// SRT URL 的单位为微秒；只缓存可展示的数字，不持有 streamid、口令或原始查询。
+struct SrtInputSettings {
+    std::optional<std::chrono::microseconds> latency;
+    std::optional<std::chrono::microseconds> receive_latency;
+    std::optional<std::chrono::microseconds> peer_latency;
+    bool latency_from_url = false;
+};
+
 class PlaybackSource {
 public:
     // 本地文件保留原始路径；显示名缺省时取路径末段。
@@ -37,28 +45,35 @@ public:
     const std::string& displayName() const noexcept { return display_name_; }
     // 仅直播源提供直播选项，避免点播误读直播预设。
     const LiveSourceOptions* liveOptions() const noexcept;
+    // URL 只在建立播放项时解析；播放策略在各线程只复制已校验的数字。
+    const SrtInputSettings* srtOptions() const noexcept { return srt_options_ ? &*srt_options_ : nullptr; }
     // 返回创建时的地址验证结果，不再次解析或探测网络和文件。
     bool isValid() const noexcept { return valid_ && !address_.empty(); }
 
 private:
     // 由三种工厂构造，避免调用方自行拼装不一致的源类型和显示名。
     PlaybackSource(PlaybackSourceKind kind, std::string address, std::string display_name, bool valid,
-                   LiveSourceOptions options = {});
+                   LiveSourceOptions options = {}, std::optional<SrtInputSettings> srt_options = {});
 
     PlaybackSourceKind kind_;
     std::string address_;
     std::string display_name_;
     bool valid_;
     LiveSourceOptions live_options_;
+    std::optional<SrtInputSettings> srt_options_;
 };
 
-enum class RtspSourceError { None, UnsupportedProtocol, InvalidAddress };
+enum class LiveSourceError { None, UnsupportedProtocol, InvalidAddress, UnsupportedSrtMode, InvalidSrtOption };
 
 // 两套 RTSP 预设共用校验结果，错误由调用方翻译为不含地址的提示。
-struct RtspSourceValidation {
+struct LiveSourceValidation {
     std::optional<PlaybackSource> source;
-    RtspSourceError error;
+    LiveSourceError error;
 };
+// 保留 RTSP 兼容入口；公开直播入口共用校验，但不让旧 RTSP 工厂接受其他协议。
+using RtspSourceError = LiveSourceError;
+using RtspSourceValidation = LiveSourceValidation;
+LiveSourceValidation createLiveSource(std::string url, LiveSourceOptions options = {});
 RtspSourceValidation createRtspSource(std::string url, LiveSourceOptions options = {});
 
 RtspSourceValidation createStableRtspSource(std::string url, RtspTransport transport, bool auto_reconnect = true);
@@ -73,6 +88,13 @@ struct RtspUdpReceiveSettings {
     int reorder_packets = 0;
 };
 
+// 由 supervisor 在 FFmpeg 打开后核对 AVOption，按值交给 GUI；不是协商后延迟或全部链路缓冲。
+struct LiveInputReport {
+    std::optional<std::chrono::milliseconds> rtmp_buffer;
+    std::optional<SrtInputSettings> srt;
+    std::optional<std::chrono::microseconds> probe_analysis;
+};
+
 // 一套直播预设的唯一数值来源；传输层、队列和音频线程只消费按值配置。
 struct LivePresetSettings {
     std::chrono::milliseconds open_timeout;
@@ -84,9 +106,13 @@ struct LivePresetSettings {
     PacketQueueLimits video_queue;
     AudioBufferRequest audio_buffer;
     RtspUdpReceiveSettings rtsp_udp;
-    // RTSP 低延迟仅减少帧率估算的帧数，避免探测缓存集中吐包顶满 750 ms 队列；空值保留 FFmpeg 默认。
-    std::optional<int> rtsp_fps_probe_frames;
+    // 低延迟直播减少帧率估算帧数，避免探测缓存集中吐包顶满 750 ms 队列；仍保留轨道探测和探测包。
+    std::optional<int> fps_probe_frames;
     std::optional<LiveBacklogSettings> backlog;
+    std::chrono::milliseconds rtmp_buffer;
+    std::chrono::microseconds srt_latency;
+    // FLV/MPEG-TS 分析的媒体时长，与整个探测操作的五秒墙钟期限不同。
+    std::chrono::microseconds stream_probe_analysis;
 };
 
 const LivePresetSettings& livePresetSettings(LivePreset preset) noexcept;
@@ -108,8 +134,12 @@ struct PlaybackPolicy {
     std::chrono::milliseconds output_stall_timeout{0};
     // 仅 RTSP/UDP 使用，不把重排参数套给 TCP、RTMP、SRT 或本地文件。
     std::optional<RtspUdpReceiveSettings> rtsp_udp;
-    std::optional<int> rtsp_fps_probe_frames;
+    // 仅直播低延迟使用，三种直播协议共用；不改变文件或点播的探测设置。
+    std::optional<int> fps_probe_frames;
     std::optional<LiveBacklogSettings> backlog;
+    std::optional<std::chrono::milliseconds> rtmp_buffer;
+    std::optional<SrtInputSettings> srt;
+    std::optional<std::chrono::microseconds> stream_probe_analysis;
 };
 
 struct PlaybackCapabilities {

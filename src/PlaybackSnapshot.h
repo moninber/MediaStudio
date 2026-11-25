@@ -48,6 +48,7 @@ struct NetworkPlaybackStats {
     bool auto_reconnect_enabled = false;
     LivePreset preset = LivePreset::Stable;
     std::optional<RtspUdpReceiveSettings> udp_receive;
+    std::optional<LiveInputReport> input_settings;
     std::optional<LiveFailureReason> last_failure_reason;
     std::optional<RecoveryStopReason> recovery_stop_reason;
     std::optional<double> retry_in_seconds;

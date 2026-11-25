@@ -76,14 +76,19 @@ QString rtspLabel(RtspTransport transport, LivePreset preset = LivePreset::Stabl
         preset == LivePreset::LowLatency ? "低延迟" : "稳定");
 }
 
+// 所有直播标签均只用枚举，不拼入地址或查询参数；SRT 明确展示本版 caller 接收角色。
+QString liveLabel(PlaybackProtocol protocol, LivePreset preset, RtspTransport transport = RtspTransport::Tcp)
+{
+    if (protocol == PlaybackProtocol::Rtsp) return rtspLabel(transport, preset);
+    const auto name = protocol == PlaybackProtocol::Rtmp ? "RTMP" : protocol == PlaybackProtocol::Srt ? "SRT/caller" : "网络直播";
+    return QString("%1 · %2").arg(name, preset == LivePreset::LowLatency ? "低延迟" : "稳定");
+}
+
 QString playbackDisplayLabel(const PlaybackSnapshot& snapshot)
 {
     if (snapshot.source_kind == PlaybackSourceKind::NetworkLive) {
-        if (snapshot.protocol == PlaybackProtocol::Rtsp && snapshot.rtsp_transport) {
-            return rtspLabel(*snapshot.rtsp_transport,
-                snapshot.network_stats ? snapshot.network_stats->preset : LivePreset::Stable);
-        }
-        return "网络直播";
+        return liveLabel(snapshot.protocol, snapshot.network_stats ? snapshot.network_stats->preset : LivePreset::Stable,
+            snapshot.rtsp_transport.value_or(RtspTransport::Tcp));
     }
     return QString::fromStdString(snapshot.display_name);
 }
@@ -798,7 +803,7 @@ void MainWindow::openFile()
 
     const int row = appendPlaylistEntry(PlaybackSource::localFile(filename.toStdString()));
     if (row >= 0) openPlaylistEntry(row);
-    else statusBar()->showMessage("请选择本地文件；RTSP 地址请使用“打开网络媒体”。");
+    else statusBar()->showMessage("请选择本地文件；直播地址请使用“打开网络媒体”。");
 }
 
 // 输入框以密码模式保存完整连接地址。只有成功校验的源对象离开对话框。
@@ -814,16 +819,23 @@ void MainWindow::openNetworkMedia()
     auto* url_input = new QLineEdit(&dialog);
     url_input->setObjectName("networkUrlInput");
     url_input->setMinimumWidth(350);
-    url_input->setPlaceholderText("rtsp://主机:端口/流名");
+    url_input->setPlaceholderText("rtsp://…  /  rtmp://…  /  srt://主机:端口?streamid=…");
     url_input->setEchoMode(QLineEdit::Password);
     url_input->setInputMethodHints(Qt::ImhHiddenText | Qt::ImhSensitiveData | Qt::ImhNoPredictiveText);
-    form->addRow("RTSP 地址：", url_input);
+    form->addRow("直播地址：", url_input);
 
     auto* transport = new QComboBox(&dialog);
     transport->setObjectName("rtspTransportSelector");
     transport->addItem("TCP", static_cast<int>(RtspTransport::Tcp));
     transport->addItem("UDP", static_cast<int>(RtspTransport::Udp));
     form->addRow("传输方式：", transport);
+    // 仅按协议前缀更新控件适用性；原始输入不修剪或重新编码，真正校验在确认时进行。
+    connect(url_input, &QLineEdit::textChanged, &dialog, [=](const QString& text) {
+        const bool other = text.startsWith("rtmp://", Qt::CaseInsensitive) || text.startsWith("srt://", Qt::CaseInsensitive);
+        transport->setEnabled(!other);
+        if (auto* label = form->labelForField(transport)) label->setEnabled(!other);
+        transport->setToolTip(other ? "TCP/UDP 选项仅适用于 RTSP；RTMP 使用 TCP，SRT 使用 caller。" : "选择 RTSP TCP 或 UDP，不自动切换。");
+    });
     auto* preset = new QComboBox(&dialog);
     preset->setObjectName("livePresetSelector");
     preset->addItem("稳定", static_cast<int>(LivePreset::Stable));
@@ -852,10 +864,13 @@ void MainWindow::openNetworkMedia()
         if (isClosing()) { dialog.reject(); return; }
         const auto selected_transport = static_cast<RtspTransport>(transport->currentData().toInt());
         const auto selected_preset = static_cast<LivePreset>(preset->currentData().toInt());
-        auto result = createRtspSource(url_input->text().toStdString(), {selected_transport, selected_preset, automatic->isChecked()});
+        auto result = createLiveSource(url_input->text().toStdString(), {selected_transport, selected_preset, automatic->isChecked()});
         if (!result.source) {
-            error_label->setText(result.error == RtspSourceError::UnsupportedProtocol
-                ? "当前版本仅支持 RTSP 直播地址。" : "请输入有效的 RTSP 地址。");
+            const auto message = result.error == LiveSourceError::UnsupportedProtocol ? "当前支持 RTSP、RTMP 和 SRT 直播地址。"
+                : result.error == LiveSourceError::UnsupportedSrtMode ? "SRT 仅支持 caller/live 接收，不支持 listener、rendezvous 或 file 传输。"
+                : result.error == LiveSourceError::InvalidSrtOption ? "SRT 参数无效：延迟须为合法十进制微秒值，模式/延迟参数不可重复或改写名称。"
+                : "请输入有效直播地址；SRT 需要主机和端口，streamid 等选项放在查询中。";
+            error_label->setText(message);
             url_input->setFocus();
             return;
         }
@@ -1125,7 +1140,7 @@ void MainWindow::addToPlaylist()
     for (const QString& file : files) {
         if (appendPlaylistEntry(PlaybackSource::localFile(file.toStdString())) < 0) rejected = true;
     }
-    if (rejected) statusBar()->showMessage("非本地地址未添加；RTSP 请使用“打开网络媒体”。");
+    if (rejected) statusBar()->showMessage("非本地地址未添加；直播请使用“打开网络媒体”。");
 }
 
 void MainWindow::removeFromPlaylist()
@@ -1204,6 +1219,22 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
         if (stats.udp_receive) info_text += QString("<p>UDP 重排: %1 ms · %2 包</p>")
             .arg(std::chrono::duration<double, std::milli>(stats.udp_receive->max_delay).count(), 0, 'f', 0)
             .arg(stats.udp_receive->reorder_packets);
+        if (stats.input_settings) {
+            const auto& settings = *stats.input_settings;
+            if (settings.probe_analysis) info_text += QString("<p>直播流分析媒体时长参数: %1 ms</p>")
+                .arg(settings.probe_analysis->count()/1000.0,0,'f',0);
+            if (settings.rtmp_buffer) info_text += QString("<p>RTMP: 客户端直播 · rtmp_buffer 请求 %1 ms（FFmpeg 已核对）</p>")
+                .arg(settings.rtmp_buffer->count());
+            if (settings.srt) {
+                const auto value = [](const std::optional<std::chrono::microseconds>& duration) {
+                    return !duration || duration->count() < 0 ? QString("FFmpeg 默认") : QString("%1 µs").arg(duration->count());
+                };
+                const auto& srt = *settings.srt;
+                info_text += QString("<p>SRT: caller/live · 延迟来源 %1<br>latency: %2 · rcvlatency: %3 · peerlatency: %4"
+                                     "<br>以上为 FFmpeg 已核对的选项请求，不表示协商后的延迟或全部链路缓冲。</p>")
+                    .arg(srt.latency_from_url ? "URL" : "预设", value(srt.latency), value(srt.receive_latency), value(srt.peer_latency));
+            }
+        }
         info_text += QString("<p>连接尝试: %1 · 自动重试累计: %2<br>本轮已用: %3/3 · 自动重连: %4</p>")
             .arg(stats.reconnect_attempts + 1).arg(stats.reconnect_attempts).arg(stats.recovery_retries_used)
             .arg(stats.auto_reconnect_enabled ? "开" : "关");
@@ -1277,8 +1308,11 @@ void MainWindow::updateMediaInfoPanel(const PlaybackSnapshot& snapshot)
     if (info.has_video) {
         info_text += "<hr><h4>视频</h4>";
         info_text += QString("<p>编码: %1</p>").arg(QString::fromStdString(info.video_info.codec_name).toHtmlEscaped());
-        info_text += QString("<p>分辨率: %1x%2</p>").arg(info.video_info.width).arg(info.video_info.height);
-        info_text += QString("<p>帧率: %1 fps</p>").arg(info.video_info.frame_rate, 0, 'f', 1);
+        const bool live = snapshot.source_kind == PlaybackSourceKind::NetworkLive;
+        info_text += live && (info.video_info.width <= 0 || info.video_info.height <= 0) ? "<p>分辨率: 待首帧确认</p>"
+            : QString("<p>分辨率: %1x%2</p>").arg(info.video_info.width).arg(info.video_info.height);
+        info_text += live && !info.video_info.frame_rate_known ? "<p>帧率: 待首帧确认</p>"
+            : QString("<p>帧率: %1 fps</p>").arg(info.video_info.frame_rate, 0, 'f', 1);
         info_text += QString("<p>特效: %1</p>").arg(
             QString::fromStdString(videoEffectToString(player_->getEffect())));
     }
@@ -1490,8 +1524,8 @@ int MainWindow::appendPlaylistEntry(PlaybackSource source)
 {
     if (isClosing() || !source.isValid()) return -1;
     QString label;
-    if (source.kind() == PlaybackSourceKind::NetworkLive && source.protocol() == PlaybackProtocol::Rtsp) {
-        label = rtspLabel(source.liveOptions()->rtsp_transport, source.liveOptions()->preset) +
+    if (source.kind() == PlaybackSourceKind::NetworkLive) {
+        label = liveLabel(source.protocol(), source.liveOptions()->preset, source.liveOptions()->rtsp_transport) +
                 QString(" #%1").arg(next_network_playlist_number_++);
     } else {
         label = QString::fromStdString(source.displayName());

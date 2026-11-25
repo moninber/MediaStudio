@@ -3,6 +3,10 @@
 #include <QUrl>
 
 #include <algorithm>
+#include <charconv>
+#include <cstdint>
+#include <limits>
+#include <set>
 #include <string_view>
 #include <utility>
 
@@ -91,7 +95,7 @@ bool hasInvalidRtspEscape(std::string_view address) noexcept
 }
 
 // QUrl 负责 URL 结构检查；另外拒绝会被网络库省略或解释成其他字段的写法。
-bool isRtspAddress(const std::string& address)
+bool isLiveAddress(const std::string& address, PlaybackProtocol protocol)
 {
     if (hasRawControlOrSpace(address) || address.find_first_of("#\\") != std::string::npos ||
         hasInvalidRtspEscape(address)) {
@@ -112,7 +116,78 @@ bool isRtspAddress(const std::string& address)
     const auto encoded = QByteArray::fromStdString(address);
     if (!encoded.isValidUtf8()) return false;
     const auto url = QUrl::fromEncoded(encoded, QUrl::StrictMode);
-    return url.isValid() && url.scheme() == "rtsp" && !url.host().isEmpty() && url.port() != 0;
+    if (!url.isValid() || url.host().isEmpty() || url.port() == 0) return false;
+    if (protocol == PlaybackProtocol::Srt) {
+        return url.scheme() == "srt" && url.port() > 0 && url.userInfo().isEmpty() && url.path().isEmpty();
+    }
+    return url.scheme() == (protocol == PlaybackProtocol::Rtsp ? "rtsp" : "rtmp");
+}
+
+struct SrtUrlOptions {
+    LiveSourceError error = LiveSourceError::None;
+    SrtInputSettings settings;
+};
+
+// 与 FFmpeg 8 的逐项查询一致：键区分大小写，数字按十进制微秒；不解码/重写整个 URL。
+// 重复、伪装键和非法数字直接拒绝，防止“已显式设置”与 FFmpeg 实际忽略产生两个解释。
+SrtUrlOptions parseSrtOptions(std::string_view address)
+{
+    SrtUrlOptions result;
+    const auto question = address.find('?');
+    if (question == std::string_view::npos) return result;
+    auto query = address.substr(question + 1);
+    std::set<std::string> seen;
+    bool latency_alias = false;
+    while (!query.empty()) {
+        const auto end = query.find('&');
+        const auto item = query.substr(0, end);
+        const auto equals = item.find('=');
+        const auto raw_key = item.substr(0, equals);
+        const auto value = equals == std::string_view::npos ? std::string_view{} : item.substr(equals + 1);
+        auto key = QUrl::fromPercentEncoding(QByteArray(raw_key.data(), static_cast<int>(raw_key.size()))).toLower().toStdString();
+        const bool controlled = key == "mode" || key == "transtype" || key == "latency" || key == "tsbpddelay" ||
+            key == "rcvlatency" || key == "peerlatency";
+        if (controlled) {
+            if (raw_key != key || !seen.insert(key).second) {
+                result.error = LiveSourceError::InvalidSrtOption; return result;
+            }
+            if (key == "mode" || key == "transtype") {
+                if (value != (key == "mode" ? "caller" : "live")) {
+                    result.error = LiveSourceError::UnsupportedSrtMode; return result;
+                }
+            } else {
+                if (value.empty()) { result.error = LiveSourceError::InvalidSrtOption; return result; }
+                std::int64_t micros = 0;
+                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), micros);
+                // libsrt 最终用有符号 int 毫秒；在窄化之前拒绝溢出，不接受 strtoll 的部分数字。
+                if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                    micros < -1 || micros / 1000 > std::numeric_limits<int>::max()) {
+                    result.error = LiveSourceError::InvalidSrtOption; return result;
+                }
+                result.settings.latency_from_url = true;
+                const auto duration = std::chrono::microseconds{micros};
+                if (key == "rcvlatency") result.settings.receive_latency = duration;
+                else if (key == "peerlatency") result.settings.peer_latency = duration;
+                else {
+                    if (result.settings.latency || latency_alias) { result.error = LiveSourceError::InvalidSrtOption; return result; }
+                    result.settings.latency = duration;
+                    latency_alias = key == "tsbpddelay";
+                }
+            }
+        }
+        if (end == std::string_view::npos) break;
+        query.remove_prefix(end + 1);
+    }
+    return result;
+}
+
+LiveSourceError validateLiveAddress(const std::string& address)
+{
+    const auto protocol = protocolOf(address);
+    if (protocol != PlaybackProtocol::Rtsp && protocol != PlaybackProtocol::Rtmp && protocol != PlaybackProtocol::Srt)
+        return address.find("://") == std::string::npos ? LiveSourceError::InvalidAddress : LiveSourceError::UnsupportedProtocol;
+    if (!isLiveAddress(address, protocol)) return LiveSourceError::InvalidAddress;
+    return protocol == PlaybackProtocol::Srt ? parseSrtOptions(address).error : LiveSourceError::None;
 }
 
 // 其他协议保留已建模的契约，协议各自的连接约束在开放入口时再补齐。
@@ -130,9 +205,9 @@ bool hasNetworkAuthority(std::string_view address, bool allow_userinfo) noexcept
 
 // 保存工厂已经选定的源类型、地址和显示数据。
 PlaybackSource::PlaybackSource(PlaybackSourceKind kind, std::string address,
-                               std::string display_name, bool valid, LiveSourceOptions options)
+                               std::string display_name, bool valid, LiveSourceOptions options, std::optional<SrtInputSettings> srt_options)
     : kind_(kind), address_(std::move(address)), display_name_(std::move(display_name)),
-      valid_(valid), live_options_(options)
+      valid_(valid), live_options_(options), srt_options_(srt_options)
 {
 }
 
@@ -154,11 +229,12 @@ PlaybackSource PlaybackSource::localFile(std::string path, std::string display_n
 PlaybackSource PlaybackSource::networkLive(std::string url, LiveSourceOptions options)
 {
     const auto protocol = protocolOf(url);
-    const bool valid_address = protocol == PlaybackProtocol::Rtsp
-        ? isRtspAddress(url) && (options.rtsp_transport == RtspTransport::Tcp || options.rtsp_transport == RtspTransport::Udp)
-        : (protocol == PlaybackProtocol::Rtmp || protocol == PlaybackProtocol::Srt) && hasNetworkAuthority(url, true);
+    const bool valid_address = validateLiveAddress(url) == LiveSourceError::None &&
+        (protocol != PlaybackProtocol::Rtsp || options.rtsp_transport == RtspTransport::Tcp || options.rtsp_transport == RtspTransport::Udp);
     const bool valid = valid_address && (options.preset == LivePreset::Stable || options.preset == LivePreset::LowLatency);
-    return PlaybackSource(PlaybackSourceKind::NetworkLive, std::move(url), protocolDisplayName(protocol), valid, options);
+    const auto srt_options = valid && protocol == PlaybackProtocol::Srt
+        ? std::optional<SrtInputSettings>{parseSrtOptions(url).settings} : std::nullopt;
+    return PlaybackSource(PlaybackSourceKind::NetworkLive, std::move(url), protocolDisplayName(protocol), valid, options, srt_options);
 }
 
 // 点播不携带 RTSP 传输或直播预设。
@@ -180,6 +256,16 @@ PlaybackProtocol PlaybackSource::protocol() const noexcept
 const LiveSourceOptions* PlaybackSource::liveOptions() const noexcept
 {
     return kind_ == PlaybackSourceKind::NetworkLive ? &live_options_ : nullptr;
+}
+
+// 直播入口只校验结构和本版支持的模式；原始地址按字节保存，凭据不进入错误文案。
+LiveSourceValidation createLiveSource(std::string url, LiveSourceOptions options)
+{
+    const auto error = validateLiveAddress(url);
+    if (error != LiveSourceError::None) return {{}, error};
+    auto source = PlaybackSource::networkLive(std::move(url), options);
+    if (!source.isValid()) return {{}, LiveSourceError::InvalidAddress};
+    return {std::move(source), LiveSourceError::None};
 }
 
 // 两套预设共用结构化校验；原始地址只进入内存源，继续/手动重接沿用保存的整组选项。
@@ -206,10 +292,10 @@ const LivePresetSettings& livePresetSettings(LivePreset preset) noexcept
     using namespace std::chrono_literals;
     static const LivePresetSettings stable{5s, 5s, 5s, 10s, 10s,
         {512, 2 * 1024 * 1024, 2s}, {512, 16 * 1024 * 1024, 2s},
-        {350ms, {}}, {500ms, 512}, {}, {}};
+        {350ms, {}}, {500ms, 512}, {}, {}, 1000ms, 1500000us, 1000000us};
     static const LivePresetSettings low_latency{5s, 5s, 3s, 10s, 10s,
         {256, 1024 * 1024, 750ms}, {256, 8 * 1024 * 1024, 750ms},
-        {100ms, 350ms}, {100ms, 128}, 8, LiveBacklogSettings{}};
+        {100ms, 350ms}, {100ms, 128}, 8, LiveBacklogSettings{}, 200ms, 400000us, 250000us};
     return preset == LivePreset::LowLatency ? low_latency : stable;
 }
 
@@ -236,9 +322,17 @@ PlaybackPolicy playbackPolicy(const PlaybackSource& source) noexcept
             policy.video_queue_limits = settings.video_queue;
             policy.audio_buffer = settings.audio_buffer;
             policy.backlog = settings.backlog;
+            policy.fps_probe_frames = settings.fps_probe_frames;
             if (source.protocol() == PlaybackProtocol::Rtsp) {
-                policy.rtsp_fps_probe_frames = settings.rtsp_fps_probe_frames;
                 if (source.liveOptions()->rtsp_transport == RtspTransport::Udp) policy.rtsp_udp = settings.rtsp_udp;
+            } else if (source.protocol() == PlaybackProtocol::Rtmp) {
+                policy.rtmp_buffer = settings.rtmp_buffer;
+                policy.stream_probe_analysis = settings.stream_probe_analysis;
+            } else if (source.protocol() == PlaybackProtocol::Srt) {
+                policy.srt = source.srtOptions() ? *source.srtOptions() : SrtInputSettings{};
+                // 任一显式延迟（包括旧别名）都阻止混入预设，未给出的值保持 FFmpeg 自身默认。
+                if (!policy.srt->latency_from_url) policy.srt->latency = settings.srt_latency;
+                policy.stream_probe_analysis = settings.stream_probe_analysis;
             }
             break;
         }

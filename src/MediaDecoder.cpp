@@ -180,13 +180,26 @@ MediaOpenResult MediaDecoder::open(const PlaybackSource& source, std::shared_ptr
         return {MediaOpenStatus::Error, AVERROR(EINVAL), MediaOpenStage::Validation};
     }
     const bool local_file = source.kind() == PlaybackSourceKind::LocalFile;
-    if (!local_file && source.protocol() != PlaybackProtocol::Rtsp) {
+    const auto protocol = source.protocol();
+    const bool rtsp = !local_file && protocol == PlaybackProtocol::Rtsp;
+    const bool rtmp = !local_file && protocol == PlaybackProtocol::Rtmp;
+    const bool srt = !local_file && protocol == PlaybackProtocol::Srt;
+    if (!local_file && (source.kind() != PlaybackSourceKind::NetworkLive || (!rtsp && !rtmp && !srt))) {
         return {MediaOpenStatus::Error, AVERROR(ENOSYS), MediaOpenStage::Validation};
     }
 
-    const auto* input_format = local_file ? nullptr : av_find_input_format("rtsp");
+    // RTMP 的 FLV、SRT 的 MPEG-TS 与 RTSP 共用后续解码链路，不探测出嵌套网络清单。
+    const auto* input_format = local_file ? nullptr : av_find_input_format(rtsp ? "rtsp" : rtmp ? "flv" : "mpegts");
     if (!local_file && !input_format) {
         return {MediaOpenStatus::Error, AVERROR_DEMUXER_NOT_FOUND, MediaOpenStage::Validation};
+    }
+    if (rtmp || srt) {
+        void* cursor = nullptr;
+        bool available = false;
+        while (const char* name = avio_enum_protocols(&cursor, 0)) {
+            if (std::strcmp(name, rtmp ? "rtmp" : "srt") == 0) available = true;
+        }
+        if (!available) return {MediaOpenStatus::Error, AVERROR_PROTOCOL_NOT_FOUND, MediaOpenStage::Validation};
     }
 
     const PlaybackPolicy policy = playbackPolicy(source);
@@ -210,17 +223,32 @@ MediaOpenResult MediaDecoder::open(const PlaybackSource& source, std::shared_ptr
         return fail({MediaOpenStatus::Cancelled, AVERROR_EXIT, MediaOpenStage::OpenInput});
     }
 
-    // 本地源只启用文件协议，阻止容器间接打开网络；RTSP 只启用所选传输所需的协议。
+    // 各协议只放行自己的传输依赖；RTMP 始终为客户端，不设置会隐式打开监听的 timeout。
     AVDictionary* options = nullptr;
-    const bool udp = !local_file && source.liveOptions()->rtsp_transport == RtspTransport::Udp;
-    const char* allowed_protocols = local_file ? "file" : (udp ? "tcp,udp,rtp" : "tcp");
+    const bool udp = rtsp && source.liveOptions()->rtsp_transport == RtspTransport::Udp;
+    const char* allowed_protocols = local_file ? "file" : rtmp ? "rtmp,tcp" : srt ? "srt" : udp ? "tcp,udp,rtp" : "tcp";
     int options_result = av_dict_set(&options, "protocol_whitelist", allowed_protocols, 0);
-    if (options_result >= 0 && !local_file) {
+    if (options_result >= 0 && rtsp) {
         options_result = av_dict_set(&options, "rtsp_transport", udp ? "udp" : "tcp", 0);
     }
     if (options_result >= 0 && policy.rtsp_udp) {
         options_result = av_dict_set_int(&options, "max_delay", policy.rtsp_udp->max_delay.count(), 0);
         if (options_result >= 0) options_result = av_dict_set_int(&options, "reorder_queue_size", policy.rtsp_udp->reorder_packets, 0);
+    }
+    const auto put = [&](const char* name, const char* value) {
+        if (options_result >= 0) options_result = av_dict_set(&options, name, value, 0);
+    };
+    if (policy.rtmp_buffer) {
+        if (options_result >= 0) options_result = av_dict_set_int(&options, "rtmp_buffer", policy.rtmp_buffer->count(), 0);
+        put("rtmp_live", "live");
+        put("listen", "0");
+    }
+    if (policy.srt) {
+        put("mode", "caller");
+        put("transtype", "live");
+        // URL 已含任一延迟值时完全不混入预设；保持原始查询给 FFmpeg 按自身语义解析。
+        if (!policy.srt->latency_from_url && options_result >= 0)
+            options_result = av_dict_set_int(&options, "latency", policy.srt->latency->count(), 0);
     }
     if (options_result < 0) {
         av_dict_free(&options);
@@ -250,10 +278,36 @@ MediaOpenResult MediaDecoder::open(const PlaybackSource& source, std::shared_ptr
         }
         udp_receive_settings_ = RtspUdpReceiveSettings{std::chrono::microseconds{format_ctx_->max_delay}, static_cast<int>(reorder_packets)};
     }
+    if (rtmp || srt) {
+        // 使用公开 AVOption 子对象搜索核对实际运行库；不依赖 FFmpeg 私有 URLContext 结构。
+        const auto matches = [&](const char* name, std::int64_t wanted) {
+            std::int64_t actual = 0;
+            return format_ctx_->pb && av_opt_get_int(format_ctx_->pb, name, AV_OPT_SEARCH_CHILDREN, &actual) >= 0 && actual == wanted;
+        };
+        LiveInputReport report;
+        if (rtmp) {
+            if (!matches("rtmp_buffer", policy.rtmp_buffer->count()) || !matches("rtmp_live", -1) || !matches("listen", 0))
+                return fail({MediaOpenStatus::Error, AVERROR(EINVAL), MediaOpenStage::OpenInput});
+            report.rtmp_buffer = policy.rtmp_buffer;
+        } else {
+            const auto expected = [](const std::optional<std::chrono::microseconds>& value) { return value ? value->count() : -1; };
+            if (!matches("mode", 0) || !matches("transtype", 0) || !matches("latency", expected(policy.srt->latency)) ||
+                !matches("rcvlatency", expected(policy.srt->receive_latency)) || !matches("peerlatency", expected(policy.srt->peer_latency)))
+                return fail({MediaOpenStatus::Error, AVERROR(EINVAL), MediaOpenStage::OpenInput});
+            report.srt = policy.srt;
+        }
+        live_input_report_ = report;
+    }
 
     // 探测可能继续读数据，独立于打开阶段重新计时。
-    // 仅减少低延迟 RTSP 的帧率估算样本；仍完整探测格式/轨道并保留探测包，不丢参考帧。
-    if (policy.rtsp_fps_probe_frames) format_ctx_->fps_probe_size = *policy.rtsp_fps_probe_frames;
+    // 低延迟三种直播均减少帧率估算样本；仍完整探测格式/轨道并保留探测包，不丢参考帧。
+    if (policy.fps_probe_frames) format_ctx_->fps_probe_size = *policy.fps_probe_frames;
+    // FLV/TS 的默认长分析会把数秒音频积存在探测缓存，随后瞬发顶满直播队列。
+    // 只约束这两个已选定容器的分析媒体时长，保留已读包和正常轨道探测，不改本地/RTSP。
+    if (policy.stream_probe_analysis) {
+        format_ctx_->max_analyze_duration = policy.stream_probe_analysis->count();
+        live_input_report_->probe_analysis = std::chrono::microseconds{format_ctx_->max_analyze_duration};
+    }
     io_->armDeadline(policy.probe_timeout);
     const int probe_ret = avformat_find_stream_info(format_ctx_, nullptr);
     const auto probe_result = classifyOpenResult(probe_ret, io_->stopReason(), MediaOpenStage::ProbeStreams);
@@ -422,6 +476,7 @@ void MediaDecoder::close()
     audio_stream_index_ = -1;
     video_time_base_ = {0, 1};
     udp_receive_settings_.reset();
+    live_input_report_.reset();
     audio_time_base_ = {0, 1};
     current_time_ = 0.0;
     playback_speed_ = 1.0f;
@@ -850,6 +905,14 @@ bool MediaDecoder::convertVideoFrame(AVFrame* frame, DecodedFrame& out_frame)
         out_frame.corrupt = true;
         return true;
     }
+    if (network_input_) {
+        const auto rate = video_codec_ctx_->framerate;
+        if (rate.num > 0 && rate.den > 0) {
+            const double value = av_q2d(rate);
+            if (std::isfinite(value) && value > 0 && value <= 120) out_frame.codec_frame_rate = value;
+        }
+        if (const auto* name = av_get_pix_fmt_name(video_codec_ctx_->pix_fmt)) out_frame.source_pixel_format = name;
+    }
 
     const double fps = media_info_.video_info.frame_rate > 0.0
         ? media_info_.video_info.frame_rate
@@ -1161,6 +1224,8 @@ void MediaDecoder::extractMediaInfo(bool localFile)
         const auto valid_fps = [](double fps) { return std::isfinite(fps) && fps > 0.0 && fps <= 120.0; };
         double fps = av_q2d(vstream->avg_frame_rate);
         if (!valid_fps(fps)) fps = av_q2d(vstream->r_frame_rate);
+        // 缺少 SPS 时即使库暂时给出一个猜测值，也等待实际解码后再确认直播元信息。
+        media_info_.video_info.frame_rate_known = valid_fps(fps) && video_codec_ctx_->width > 0 && video_codec_ctx_->height > 0;
         if (!valid_fps(fps)) fps = 25.0;
         media_info_.video_info.frame_rate = fps;
         if (localFile && media_info_.duration <= 0.0 && vstream->duration > 0 && hasValidTimeBase(vstream->time_base)) {
