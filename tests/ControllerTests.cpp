@@ -1845,6 +1845,67 @@ void testWindowReceiveDetails()
     std::cout << "window_payload_units=1 relative_lag_not_end_to_end=1 unavailable_reason=1 compact_summary=1 file_UI_preserved=1\n";
 }
 
+// 同一组短暂慢送对照两预设/两传输：低延迟先真实建立候选，恢复实时后必须撤销而不重接。
+// 稳定模式具有相同接收滞后证据，但从始至终不启用主动策略；纯视频避免声卡差异影响时间边界。
+void testPresetJitterWithdrawal(std::string_view mode)
+{
+    using Fixture = RtspBlackhole;
+    const bool udp = mode.find("udp") != std::string_view::npos;
+    const bool low = mode.find("-low-") != std::string_view::npos;
+    Fixture server(Fixture::StartupMedia::Video, testRtspAddress(),
+        udp ? Fixture::SetupTransport::Udp : Fixture::SetupTransport::Tcp,
+        Fixture::KeyVideo::Immediate, 0, 2, true, 30s);
+    server.setFramePeriod(80ms);
+    VideoWidget widget;
+    PlayerController player;
+    player.setVideoWidget(&widget);
+    const auto source = createRtspSource(server.url(), {udp ? RtspTransport::Udp : RtspTransport::Tcp,
+        low ? LivePreset::LowLatency : LivePreset::Stable, true});
+    require(source.source.has_value(), "preset comparison source was rejected");
+    const auto request = player.requestOpen(*source.source);
+    PlaybackSnapshot slow;
+    waitInQt([&] {
+        slow = player.getPlaybackSnapshot();
+        const auto& stats = *slow.network_stats;
+        return slow.state == PlaybackState::Playing && stats.receive.media_progress_rate.value_or(1) < .8 &&
+            stats.receive.relative_lag_seconds.value_or(0) > 1.5 &&
+            (!low || stats.backlog.state == LiveBacklogState::Candidate);
+    }, 12s, "preset comparison never obtained actual slow-input evidence");
+    require(slow.request_id == request && slow.connection_attempt_id == 1 &&
+        slow.network_stats->backlog_candidates == (low ? 1u : 0u) &&
+        slow.network_stats->backlog_reconnect_requests == 0 && slow.network_stats->reconnect_attempts == 0,
+        "short candidate was mistaken for an actual retry");
+    // 只恢复发送节奏，不换连接/时间戳域，也不注入策略状态，核对候选确由新输入撤销。
+    server.setFramePeriod(40ms);
+    waitInQt([&] {
+        const auto s = player.getPlaybackSnapshot();
+        require(s.connection_attempt_id == 1 && s.state != PlaybackState::Failed,
+            "transient slow input caused an unconditional reconnect");
+        const auto& stats = *s.network_stats;
+        return s.state == PlaybackState::Playing && stats.receive.media_progress_rate.value_or(0) >= .8 &&
+            stats.backlog.state == (low ? LiveBacklogState::Waiting : LiveBacklogState::Disabled) &&
+            (!low || stats.backlog_candidates_cleared == 1);
+    }, 2500ms, "real-time input did not withdraw the short candidate");
+    remainsInQt([&] {
+        const auto s = player.getPlaybackSnapshot();
+        return s.request_id == request && s.connection_attempt_id == 1 && s.state == PlaybackState::Playing &&
+            s.network_stats->backlog_reconnect_requests == 0 && s.network_stats->reconnect_attempts == 0 &&
+            s.network_stats->queue_full_events == 0 && s.network_stats->last_video_output_age_seconds.value_or(10) < .3;
+    }, 3200ms, "withdrawn candidate reconnected later or stopped producing video");
+    const auto restored = player.getPlaybackSnapshot();
+    const auto at = Clock::now();
+    player.stopAsync();
+    require(Clock::now() - at < 100ms, "preset comparison stop blocked the command thread");
+    waitInQt([&] { return !player.getPlaybackSnapshot().is_session_active && server.activeRemoteSessions() == 0; },
+        2s, "preset comparison left a worker or remote session");
+    require(server.acceptedConnections() == 1, "transient comparison opened an extra connection");
+    std::cout << "preset_jitter=" << mode << " actual_slow_rate=" << *slow.network_stats->receive.media_progress_rate
+        << " lag_s=" << *slow.network_stats->receive.relative_lag_seconds
+        << " candidates=" << restored.network_stats->backlog_candidates
+        << " withdrawn=" << restored.network_stats->backlog_candidates_cleared
+        << " same_connection=1 retries=0 Full=0 fresh_video=1 remote=0\n";
+}
+
 // 用实际 RTP 发送间隔产生 0.5x 接收推进，而不是向控制器注入“积压”布尔量。
 void testLiveBacklog(std::string_view mode)
 {
@@ -1854,7 +1915,7 @@ void testLiveBacklog(std::string_view mode)
     const bool disabled = mode == "live-backlog-disabled";
     const bool transient = mode == "live-backlog-transient";
     const bool invalid = mode == "live-backlog-invalid";
-    const bool budget = mode == "live-backlog-budget";
+    const bool budget = mode.find("live-backlog-budget") == 0;
     const bool cancel_candidate = mode == "live-backlog-cancel-candidate";
     const bool cancel_backoff = mode == "live-backlog-cancel-backoff";
     Fixture server(Fixture::StartupMedia::Video, testRtspAddress(), udp ? Fixture::SetupTransport::Udp : Fixture::SetupTransport::Tcp,
@@ -2543,6 +2604,7 @@ int main(int argc, char* argv[])
         QApplication app(argc, argv);
         app.setQuitOnLastWindowClosed(false);
         if (mode == "controller-local") testControllerLocal();
+        else if (mode.find("live-preset-jitter-") == 0) testPresetJitterWithdrawal(mode);
         else if (mode == "window-low-latency") testWindowLowLatency();
         else if (mode.substr(0, 13) == "live-backlog-") testLiveBacklog(mode);
         else if (mode == "live-receive-tcp" || mode == "live-receive-udp") testLiveReceiveObservations(mode.find("udp") != std::string_view::npos);

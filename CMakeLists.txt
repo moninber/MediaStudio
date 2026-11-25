@@ -332,7 +332,9 @@ if(BUILD_TESTING)
                           live-receive-auto-reset window-receive-details
                           live-backlog-recover-tcp live-backlog-recover-udp live-backlog-transient live-backlog-invalid
                           live-backlog-stable live-backlog-disabled live-backlog-budget
-                          live-backlog-cancel-candidate live-backlog-cancel-backoff window-low-latency)
+                          live-backlog-cancel-candidate live-backlog-cancel-backoff window-low-latency
+                          live-preset-jitter-stable-tcp live-preset-jitter-stable-udp
+                          live-preset-jitter-low-tcp live-preset-jitter-low-udp live-backlog-budget-udp)
         set(test_name MediaStudio.Session.${test_case})
         add_test(NAME ${test_name} COMMAND MediaStudioSessionTests ${test_case})
         set_tests_properties(${test_name} PROPERTIES
@@ -359,7 +361,10 @@ if(BUILD_TESTING)
         if(test_case STREQUAL "window-low-latency")
             set_property(TEST ${test_name} PROPERTY TIMEOUT 35)
         endif()
-        if(test_case STREQUAL "live-backlog-budget")
+        if(test_case MATCHES "^live-preset-jitter-")
+            set_property(TEST ${test_name} PROPERTY TIMEOUT 25)
+        endif()
+        if(test_case MATCHES "^live-backlog-budget")
             set_property(TEST ${test_name} PROPERTY TIMEOUT 65)
         endif()
         if(test_case MATCHES "^mixed-switch-")
